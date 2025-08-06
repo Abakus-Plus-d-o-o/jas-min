@@ -13,7 +13,7 @@ CFG_DIST="${2:-debian:latest}"
 CFG_RELEASE="${3:-release}"
 
 case $CFG_DIST in
-    debian*)
+    debian*|ubuntu*)
         cat <<EOF > Dockerfile
 FROM $CFG_DIST
 
