@@ -18,8 +18,14 @@ function proc_build() {
 
     git clone https://github.com/ora600pl/jas-min.git .
 
-    source ~/.bashrc
+    set +u
+    set +e
+    #source ~/.bashrc
+    source ~/.cargo/env
+    set -u
+    set -e
 
+    export WEBDRIVER_PATH=/usr/bin/chromedriver 
     if [ "$1" == 'release' ]
     then
         cargo build --release
