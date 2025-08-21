@@ -233,17 +233,21 @@ fn merge_ash_sqls_to_events(ash_event_sql_map: HashMap<String, HashSet<String>>,
 
     for (event, sqls) in ash_event_sql_map {
         let filename = get_safe_event_filename(&dirpath, event.clone(), true);
-        let mut event_html_content = "<h2>SQL IDs found in ASH</h2><br /><ul>".to_string();
+        let mut event_html_content = format!(
+            r#"
+                <h4 style="color:blue;font-weight:bold;">Wait Event found in ASH for following SQL IDs:</h4>
+                <ul>
+            "#);
         for sqlid in sqls {
-            event_html_content = format!("{}<li><a href=sqlid_{}.html target=_blank>{}</a></li>", event_html_content, sqlid, sqlid);
+            event_html_content = format!("{}<li><a href=sqlid_{}.html target=_blank style=\"color: black;\">{}</a></li>", event_html_content, sqlid, sqlid);
         }
         event_html_content = format!("{}</ul>", event_html_content);
         if Path::new(&filename).exists() {
             let mut event_file: String = fs::read_to_string(&filename)
                                             .expect(&format!("Failed to read file: {}", filename));
             event_file = event_file.replace(
-                                    "<body>",
-                                    &format!("<body>\n{}\n",event_html_content));
+                                    "</h2>",
+                                    &format!("</h2>\n{}\n",event_html_content));
 
             if let Err(e) = fs::write(&filename, event_file) {
                 eprintln!("Error writing file {}: {}", filename, e);
@@ -440,7 +444,7 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
         }
         
         let layout: Layout = Layout::new()
-            .title(&format!("'<b>{}</b>'", event))
+            //.title(&format!("'<b>{}</b>'", event))
             .height(1800)
             .bar_gap(0.0)
             .bar_mode(plotly::layout::BarMode::Overlay)
@@ -514,7 +518,7 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
             )
             .y_axis6(
                 Axis::new()
-                    .domain(&[0.65, 0.83])
+                    .domain(&[0.67, 0.83])
                     .anchor("x3")
                     .range(vec![0.,]),
             )
@@ -534,6 +538,13 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
         let path: &Path = Path::new(&file_name);
         //plot.save(path).expect("Failed to save plot to file");
         plot.write_html(path);
+        let mut event_file: String = fs::read_to_string(path).expect(&format!("Failed to read file: {}", file_name));
+        event_file = event_file.replace(
+            "<body>",
+            &format!("<style>\nbody {{ font-family: Arial, sans-serif; }}.content {{ font-size: 16px; }}\n</style>\n<body>\n\t<h2 style=\"width:100%;text-align:center;\">{}</h2>",event));
+        if let Err(e) = fs::write(&path, event_file) {
+            eprintln!("Error writing file {}: {}", file_name, e);
+        }
     }
     if is_fg {
         println!("Saved plots for Foreground events to '{}/fg_*'", dirpath);
@@ -1419,9 +1430,9 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
         let mut segment_summary: BTreeMap<(i64, u64, u64), SegmentSummary> = BTreeMap::new();
 
         //build unique set od object_id, data_object_id from all objects in current section
-        let all_ids: HashSet<(u64,u64)> = objects
+        let all_ids: HashSet<(u64,u64, String)> = objects
                                       .iter()
-                                      .map(|s| (s.obj, s.objd ))
+                                      .map(|s| (s.obj, s.objd, s.object_name.clone()))
                                       .collect(); 
                 
         for id in all_ids { //iterate over each object id
@@ -1430,14 +1441,14 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
             objects
             .iter()
             .for_each(|s| {
-                if s.obj == id.0 && s.objd == id.1 {
+                if s.obj == id.0 && s.objd == id.1 && s.object_name == id.2{
                     all_values.push(s.stat_vlalue);
                 }
             }); //build vector of statistic values 
 
             let segment_data = objects
                                          .iter()
-                                         .find(|s| s.obj == id.0 && s.objd == id.1)
+                                         .find(|s| s.obj == id.0 && s.objd == id.1 && s.object_name == id.2)
                                          .unwrap(); //get details of the given object id
 
             let avg = mean(all_values.clone()).unwrap();
@@ -1612,6 +1623,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     let mut y_user_rollbacks_s: Vec<u64> = Vec::new();
     let mut y_logical_reads_s: Vec<f64> = Vec::new();
     let mut y_block_changes_s: Vec<f64> = Vec::new();
+    let mut y_failed_parse_count: Vec<u64> = Vec::new();
 
     /*Variables used for statistics computations*/
     let mut y_vals_events_n: BTreeMap<String, Vec<f64>> = BTreeMap::new(); 
@@ -1804,13 +1816,16 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 let mut v: &mut Vec<f64> = instance_stats.get_mut(&activity.statname).unwrap();
                 v[x_vals.len()-1] = activity.total as f64;
 
-                // Plot additional stats if 'log file sync' is in top events
+                
                 if activity.statname == "user commits" {
                     y_user_commits_s.push(activity.total);
                 } else if activity.statname == "user rollbacks" {
                     y_user_rollbacks_s.push(activity.total);
-                };                    
-                    
+                } else if activity.statname == "parse count (failures)" {
+                    y_failed_parse_count.push(activity.total);
+                }
+                
+                // Plot additional stats if 'log file sync' is in top events
                 if is_logfilesync_high {
                 
                     if activity.statname == "user calls" {
@@ -2094,10 +2109,17 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                                                         .name("cleanouts only - consistent read gets")
                                                         .x_axis("x1")
                                                         .y_axis("y2");
+        let parse_failure_count = Scatter::new(x_vals.clone(), y_failed_parse_count)
+                                                        .mode(Mode::LinesText)
+                                                        .name("Failed Parses")
+                                                        .x_axis("x1")
+                                                        .y_axis("y2");
+        
         plot_main.add_trace(redo_switches);
         plot_main.add_trace(excessive_commits);
         plot_main.add_trace(cleanout_cr_only);
         plot_main.add_trace(cleanout_ktugct_calls);
+        plot_main.add_trace(parse_failure_count);
     }
     
     plot_main.add_trace(dbtime_trace);
@@ -2590,10 +2612,30 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         let avg_exec_t: f64 = mean(x.clone()).unwrap();
         let stddev_exec_t: f64 = std_deviation(x.clone()).unwrap();
 
+        /* Calculate STDDEV and AVG for sqls CPU time per execution */
+        let x_c: Vec<f64> = collection.awrs.iter()
+                                      .flat_map(|s| s.sql_cpu_time.clone())
+                                      .filter(|sql| sql.0 == key.1.clone())
+                                      .map(|sqls| sqls.1.cpu_time_exec_s)
+                                      .collect();
+
+        let avg_exec_t_cpu: f64 = mean(x_c.clone()).unwrap_or(0.0);
+        let stddev_exec_t_cpu: f64 = std_deviation(x_c.clone()).unwrap_or(0.0);
+
         /* Calculate STDDEV and AVG for sqls time */
         let x_s: Vec<f64> = y_vals_sqls_exec_s.get(&key.1.clone()).unwrap().clone();
-        let avg_exec_s: f64 = mean(x_s.clone()).unwrap();
-        let stddev_exec_s: f64 = std_deviation(x_s).unwrap();
+        let avg_exec_s: f64 = mean(x_s.clone()).unwrap_or(0.0);
+        let stddev_exec_s: f64 = std_deviation(x_s).unwrap_or(0.0);
+
+        /* Calculate STDDEV and AVG for sqls cpu time */
+        let x_s: Vec<f64> = collection.awrs.iter()
+                                      .flat_map(|s| s.sql_cpu_time.clone())
+                                      .filter(|sql| sql.0 == key.1.clone())
+                                      .map(|sqls| sqls.1.cpu_time_s)
+                                      .collect();
+
+        let avg_exec_cpu: f64 = mean(x_s.clone()).unwrap_or(0.0);
+        let stddev_exec_cpu: f64 = std_deviation(x_s).unwrap_or(0.0);
 
         let sql_type = collection.awrs.iter()
                                                 .flat_map(|a| a.sql_elapsed_time.clone())
@@ -2602,7 +2644,9 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
 
         make_notes!(&logfile_name, args.quiet, "{: >24}{:.2}% of probes\n", "Marked as TOP in ", (x.len() as f64 / x_vals.len() as f64 )* 100.0);
         make_notes!(&logfile_name, args.quiet, "{: >35} {: <16.2} \tSTDDEV Ela by Exec: {:.2}\n", "--- AVG Ela by Exec:", avg_exec_t, stddev_exec_t);
+        make_notes!(&logfile_name, args.quiet, "{: >35} {: <16.2} \tSTDDEV CPU by Exec: {:.2}\n", "--- AVG CPU by Exec:", avg_exec_t_cpu, stddev_exec_t_cpu);
         make_notes!(&logfile_name, args.quiet, "{: >36} {: <16.2} \tSTDDEV Ela Time   : {:.2}\n", "--- AVG Ela Time (s):", avg_exec_s, stddev_exec_s);
+        make_notes!(&logfile_name, args.quiet, "{: >36} {: <16.2} \tSTDDEV CPU Time   : {:.2}\n", "--- AVG CPU Time (s):", avg_exec_cpu, stddev_exec_cpu);
         make_notes!(&logfile_name, args.quiet, "{: >38} {: <14.2} \tSTDDEV No. executions:  {:.2}\n", "--- AVG No. executions:", avg_exec_n, stddev_exec_n);
         make_notes!(&logfile_name, args.quiet, "{: >23} {} \n", "MODULE: ", top_stats.sqls.get(&sql_id).unwrap().blue());
         if !sql_type.is_empty() {
@@ -2686,12 +2730,21 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 <td>{:.2}</td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
+                <td>{:.2}</td>
+                <td>{:.2}</td>
+                <td>{:.2}</td>
+                <td>{:.2}</td>
+                <td>{:.2}</td>
+                <td>{:.2}</td>
                 <td>{}</td>
             </tr>
             "#,
                 &sql_id, &sql_id,
-                avg_exec_t, stddev_exec_t,  // PCT of DB Time
-                avg_exec_n, stddev_exec_n,  // Execution times
+                avg_exec_t, stddev_exec_t,  //Time per exec
+                avg_exec_n, stddev_exec_n,  //Number of executions
+                avg_exec_s, stddev_exec_s,  //Total execution time
+                avg_exec_t_cpu, stddev_exec_t_cpu, //CPU Time by Exec 
+                avg_exec_cpu, stddev_exec_cpu, //Total CPU Time
                 corr,
                 (x.len() as f64 / x_vals.len() as f64 )* 100.0,
                 if anomalies_flag {
@@ -2831,7 +2884,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             </head>
             <body>
                 <div class="content">
-                    <p><span style="font-size:20px;font-weight:bold;width:100%;text-align:center;">{sql_id}</span></p>
+                    <p><h2 style="width:100%;text-align:center;">{sql_id}</h2></p>
                     <p><span style="color:blue;font-weight:bold;">Module:<br></span>{module}</p>
                     <p><span style="color:blue;font-weight:bold;">SQL Text:<br></span>{sql_txt}</p>
                     <p><span style="color:blue;font-weight:bold;">Other Top Sections:<br></span> {top_section}</p>
@@ -2870,9 +2923,15 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                     <th onclick="sortTable('sqls-table',2)" style="cursor: pointer;">STDDEV Ela by Exec</th>
                     <th onclick="sortTable('sqls-table',3)" style="cursor: pointer;">AVG No. executions</th>
                     <th onclick="sortTable('sqls-table',4)" style="cursor: pointer;">STDDEV No. executions</th>
-                    <th onclick="sortTable('sqls-table',5)" style="cursor: pointer;">Correlation of DBTime</th>
-                    <th onclick="sortTable('sqls-table',6)" style="cursor: pointer;">TOP in % Probes</th>
-                    <th onclick="sortTable('sqls-table',7)" style="cursor: pointer;">Anomalies</th>
+                    <th onclick="sortTable('sqls-table',5)" style="cursor: pointer;">AVG Total Execution Time</th>
+                    <th onclick="sortTable('sqls-table',6)" style="cursor: pointer;">STDDEV Total Execution Time</th>
+                    <th onclick="sortTable('sqls-table',7)" style="cursor: pointer;">AVG CPU Time by Exec</th>
+                    <th onclick="sortTable('sqls-table',8)" style="cursor: pointer;">STDDEV CPU Time by Exec</th>
+                    <th onclick="sortTable('sqls-table',9)" style="cursor: pointer;">AVG Total CPU Time</th>
+                    <th onclick="sortTable('sqls-table',10)" style="cursor: pointer;">STDDEV Total CPU Time</th>
+                    <th onclick="sortTable('sqls-table',11)" style="cursor: pointer;">Correlation of DBTime</th>
+                    <th onclick="sortTable('sqls-table',12)" style="cursor: pointer;">TOP in % Probes</th>
+                    <th onclick="sortTable('sqls-table',13)" style="cursor: pointer;">Anomalies</th>
                 </tr>
             </thead>
             <tbody>
@@ -3990,7 +4049,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             )
         }).collect::<Vec<String>>().join("\n"),
     );
-    // Inject HighLight section into Main HTML
+    // Inject Load Profile section into Main HTML
     plotly_html = plotly_html.replace(
         "<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">", 
         &format!("{}{}{}\n\t\t</script>\n{}\n\t\t</script>\n\t</div>\n{}\n{}<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">",
