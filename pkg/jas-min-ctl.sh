@@ -11,6 +11,19 @@ PKG_DESC='JSON AWR/STATSPACK Mining Tool.'
 PKG_VERS='-'
 PKG_FULL_NAME='-'
 
+function proc_build_rest() {
+    pushd /opt/jas-min-rest-src/
+
+    set +u
+    set +e
+    source ~/.cargo/env
+    set -u
+    set -e
+
+    cargo build
+
+    popd
+}
 
 function proc_build() {
     mkdir -p /opt/jas-min-src
@@ -20,18 +33,12 @@ function proc_build() {
 
     set +u
     set +e
-    #source ~/.bashrc
     source ~/.cargo/env
     set -u
     set -e
 
-    export WEBDRIVER_PATH=/usr/bin/chromedriver 
-    if [ "$1" == 'release' ]
-    then
-        cargo build --release
-    else
-        cargo build
-    fi
+    export WEBDRIVER_PATH=/usr/bin/chromedriver
+    cargo build
 
     popd
 }
@@ -66,9 +73,10 @@ function proc_deb() {
 }
 
 G_TYPE="$1"
-G_RELEASE="$2"
 
-proc_build "$G_RELEASE"
+proc_build_rest
+proc_build
+
 PKG_VERS="$(cat /opt/jas-min-src/Cargo.toml  | grep 'version' | head -n 1 | cut -d '=' -f2 | sed 's/\"//g' |  awk '{$1=$1; print}')"
 PKG_FULL_NAME="${PKG_NAME}-${PKG_VERS}"
 
@@ -84,6 +92,9 @@ else
     echo "jas-min is not yet built."
     exit 1
 fi
+
+cp -v /opt/jas-min-rest-src/debug/jasmin-rest "/opt/jas-min-pkg/${PKG_FULL_NAME}/opt/jas-min/"
+
 case "$G_TYPE" in
     deb)
         proc_deb
