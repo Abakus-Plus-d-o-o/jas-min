@@ -20,9 +20,10 @@ use std::thread;
 use std::time::Duration;
 use dashmap::DashMap;
 
-use crate::analyze::plot_to_file;
+use crate::analyze::main_report_builder;
 use crate::idleevents::is_idle;
 use crate::Args;
+use crate::reasonings::ReportForAI;
 
 #[derive(Default,Serialize, Deserialize, Debug, Clone)]
 pub struct LoadProfile {
@@ -31,6 +32,12 @@ pub struct LoadProfile {
 	per_transaction: f64,
 	//pub begin_snap_time: String,
 }
+#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+pub struct InstanceEfficiency{ //Target is 100%
+	pub eff_stat: String,
+	pub eff_pct: Option<f32>,
+}
+
 
 #[derive(Default,Serialize, Deserialize, Debug, Clone)]
 pub struct RedoLog {
@@ -166,7 +173,7 @@ pub struct SnapInfo {
 }
 
 #[derive(Default,Serialize, Deserialize, Debug, Clone)]
-pub struct KeyInstanceStats {
+pub struct InstanceStats {
 	pub statname: String,
 	pub total: u64,
 }
@@ -181,6 +188,21 @@ pub struct IOStats {
 	pub writes_data_s: f64,	// in MB
 	pub waits_count: u64,
 	pub avg_time: Option<f64>,		// in ms
+}
+
+#[derive(Default,Serialize, Deserialize, Debug)]
+pub struct GetStats {
+	pub samples: u64,
+	pub min: f64,
+	pub lower_fence: f64,
+	pub q1: f64,
+	pub mean: f64,
+	pub median: f64,
+	pub q3: f64,
+	pub upper_fence: f64,
+	pub max: f64,
+	pub variance: f64,
+	pub std_dev: f64,
 }
 
 #[derive(Default,Serialize, Deserialize, Debug, Clone)]
@@ -234,6 +256,7 @@ pub struct AWR {
 	pub snap_info: SnapInfo,
 	status: String,
 	pub load_profile: Vec<LoadProfile>,
+	pub instance_efficiency: Vec<InstanceEfficiency>,
 	pub redo_log: RedoLog,
 	wait_classes: Vec<WaitClasses>,
 	pub host_cpu: HostCPU,
@@ -246,7 +269,7 @@ pub struct AWR {
 	pub sql_gets: HashMap<String, SQLGets>,
 	pub sql_reads: HashMap<String, SQLReads>,
 	pub top_sql_with_top_events: HashMap<String, TopSQLWithTopEvents>,
-	pub key_instance_stats: Vec<KeyInstanceStats>,
+	pub instance_stats: Vec<InstanceStats>,
 	pub dictionary_cache: Vec<DictionaryCache>,
 	pub io_stats_byfunc: HashMap<String,IOStats>,
 	pub library_cache: Vec<LibraryCache>,
@@ -1245,8 +1268,8 @@ fn redo_log_switches_txt(line: &str) -> RedoLog {
  
 
 
-fn instance_activity_stats(table: ElementRef) -> Vec<KeyInstanceStats> {
-	let mut ias: Vec<KeyInstanceStats> = Vec::new();
+fn instance_activity_stats(table: ElementRef) -> Vec<InstanceStats> {
+	let mut ias: Vec<InstanceStats> = Vec::new();
 	let row_selector = Selector::parse("tr").unwrap();
 	let column_selector = Selector::parse("td").unwrap();
 
@@ -1259,21 +1282,21 @@ fn instance_activity_stats(table: ElementRef) -> Vec<KeyInstanceStats> {
 			let total = columns[1].text().collect::<Vec<_>>();
 			let total = u64::from_str(&total[0].trim().replace(",","")).unwrap_or(0);
 
-			ias.push(KeyInstanceStats { statname: stat_name.to_string(), total: total });
+			ias.push(InstanceStats { statname: stat_name.to_string(), total: total });
 
 		}
 	}
 	ias
 }
 
-fn instance_activity_stats_txt(inst_stats_section: Vec<&str>) -> Vec<KeyInstanceStats> {
-	let mut ias: Vec<KeyInstanceStats> = Vec::new();
+fn instance_activity_stats_txt(inst_stats_section: Vec<&str>) -> Vec<InstanceStats> {
+	let mut ias: Vec<InstanceStats> = Vec::new();
 	for line in inst_stats_section {
 		if line.len() >= 52 {
 			let statname = line[0..35].to_string().trim().to_string();
 			let total = i64::from_str(&line[35..52].trim().replace(",","")).unwrap_or(-1);
 			if total >= 0 {
-				ias.push(KeyInstanceStats{statname: statname.clone(), total: total as u64});
+				ias.push(InstanceStats{statname: statname.clone(), total: total as u64});
 			}
 		}
 	}
@@ -1656,6 +1679,38 @@ fn load_profile_txt(load_section: Vec<&str>) -> Vec<LoadProfile> {
 	lp
 }
 
+fn instance_efficiency(table: ElementRef) -> Vec<InstanceEfficiency> {
+	let row_selector = Selector::parse("tr").unwrap();
+    let column_selector = Selector::parse("td").unwrap();
+    let mut ie: Vec<InstanceEfficiency> = Vec::new();
+    for row in table.select(&row_selector) {
+        let columns = row.select(&column_selector).collect::<Vec<_>>();
+        // Each row usually has 4 <td> entries (two stat/value pairs)
+        // but the last row may have only 2 (one pair)
+        if columns.len() >= 2 {
+            // First pair
+            let stat_name_1 = columns[0].text().collect::<Vec<_>>()[0].trim().trim_end_matches(':').to_string();
+            let value_1 = columns[1].text().collect::<Vec<_>>()[0].trim().replace(",", "");
+            let value_1 = f32::from_str(&value_1).ok().filter(|v| *v >= 0.0);; //Doc ID 1604214.1
+            ie.push(InstanceEfficiency {
+                eff_stat: stat_name_1,
+                eff_pct: value_1,
+            });
+        }
+        if columns.len() >= 4 {
+            // Optional second pair in same row
+            let stat_name_2 = columns[2].text().collect::<Vec<_>>()[0].trim().trim_end_matches(':').to_string();
+            let value_2 = columns[3].text().collect::<Vec<_>>()[0].trim().replace(",", "");
+            let value_2 = f32::from_str(&value_2).ok().filter(|v| *v >= 0.0); //Doc ID 1604214.1
+            ie.push(InstanceEfficiency {
+                eff_stat: stat_name_2,
+                eff_pct: value_2,
+            });
+        }
+    }
+	ie
+}
+
 fn instance_info(table: ElementRef, table_type: &str) -> Option<DBInstance> {
     let th_selector = Selector::parse("th").unwrap();
     let tr_selector = Selector::parse("tr").unwrap();
@@ -1670,6 +1725,19 @@ fn instance_info(table: ElementRef, table_type: &str) -> Option<DBInstance> {
 				if cols.len() >= 7 {
 					let mut dbi = DBInstance::default();
 					dbi.db_id = u64::from_str(&cols[1]).unwrap_or(0);
+					dbi.release = cols[5].clone();
+					dbi.rac = cols[6].clone();
+					return Some(dbi);
+				}
+			}
+		} else if headers.len() == 7 {
+			if let Some(data_row) = table.select(&tr_selector).nth(1) {
+				let cols: Vec<String> = data_row.select(&td_selector).map(|td| td.text().collect::<String>().trim().to_string()).collect();
+				if cols.len() >= 7 {
+					let mut dbi = DBInstance::default();
+					dbi.db_id = u64::from_str(&cols[1]).unwrap_or(0);
+					dbi.instance_num = u8::from_str(&cols[3]).unwrap_or(0);
+					dbi.startup_time = cols[4].clone();
 					dbi.release = cols[5].clone();
 					dbi.rac = cols[6].clone();
 					return Some(dbi);
@@ -1785,18 +1853,22 @@ fn parse_db_instance_information(fname: String) -> DBInstance {
 					if let Some(block_size) = instance_info(table,"db_block_size") {
 						db_instance_information.db_block_size = block_size.db_block_size;
 					}
+				} else if summary == "This table displays name and value of init.ora parameters" {
+					if let Some(block_size) = instance_info(table,"db_block_size") {
+						db_instance_information.db_block_size = block_size.db_block_size;
+					}
 				}	
             }
         }
 	} else if fname.ends_with("txt") {
 		let awr_rep = fs::read_to_string(&fname).expect(&format!("Couldn't open awr file {}", fname));
     	let awr_lines = awr_rep.split("\n").collect::<Vec<&str>>();
-		let block_size = awr_lines.iter().find(|line| line.starts_with("db_block_size")).unwrap().split_whitespace().last().unwrap();
+		let block_size = awr_lines.iter().find(|line| line.starts_with("db_block_size")).and_then(|line| line.split_whitespace().last()).and_then(|val| val.parse::<u16>().ok()).unwrap_or(8192u16);   // default to 8192
 		let mut instance_info = find_section_boundries(awr_lines.clone(), "Database    DB Id", "Snapshot       Snap Id",&fname, None);
 		let mut instance_info_lines: Vec<&str> = Vec::new();
 		instance_info_lines.extend_from_slice(&awr_lines[instance_info.begin+2..instance_info.end]);
 		db_instance_information = instance_info_txt(instance_info_lines);
-		db_instance_information.db_block_size = block_size.parse().unwrap();
+		db_instance_information.db_block_size = block_size;
 	}
 	db_instance_information
 }
@@ -1819,6 +1891,8 @@ fn parse_awr_report_internal(fname: &str, args: &Args) -> (AWR, HashMap<String, 
 		for element in doc.select(&table_selector) {
 			if element.value().attr("summary").unwrap() == "This table displays load profile" {
 				awr.load_profile = load_profile(element);
+			} else if element.value().attr("summary").unwrap() == "This table displays instance efficiency percentages" {
+				awr.instance_efficiency = instance_efficiency(element);
 			} else if element.value().attr("summary").unwrap() == "This table displays foreground wait class statistics" {
 				awr.wait_classes = wait_classes(element);
 			} else if element.value().attr("summary").unwrap() == "This table displays system load statistics" {
@@ -1842,7 +1916,7 @@ fn parse_awr_report_internal(fname: &str, args: &Args) -> (AWR, HashMap<String, 
 			} else if element.value().attr("summary").unwrap() == "This table displays snapshot information" {
 				awr.snap_info = snap_info(element);
 			} else if element.value().attr("summary").unwrap() == "This table displays Instance activity statistics. For each instance, activity total, activity per second, and activity per transaction are displayed" {
-				awr.key_instance_stats = instance_activity_stats(element);
+				awr.instance_stats = instance_activity_stats(element);
 			} else if element.value().attr("summary").unwrap() == "This table displays the IO Statistics for different functions. IO stats includes amount of reads and writes, requests per second, data per second, wait count and average wait time" {
 				awr.io_stats_byfunc = io_stats_byfunc(element);
 			} else if element.value().attr("summary").unwrap() == "This table displays thread activity stats in the instance. For each activity , total number of activity and activity per hour are displayed" {
@@ -1991,7 +2065,7 @@ fn parse_awr_report_internal(fname: &str, args: &Args) -> (AWR, HashMap<String, 
 		let instance_act_index = find_section_boundries(awr_lines.clone(), &instance_activity_start, &instance_activity_end,&fname, None);
 		let mut inst_stats: Vec<&str> = Vec::new();
 		inst_stats.extend_from_slice(&awr_lines[instance_act_index.begin..instance_act_index.end+2]);
-		awr.key_instance_stats = instance_activity_stats_txt(inst_stats);
+		awr.instance_stats = instance_activity_stats_txt(inst_stats);
 
 		let iostats_summary_start = format!("{}{}", 12u8 as char, "IO Stat by Function - summary");
 		let iostats_summary_end = format!("{}{}", 12u8 as char, "IO Stat by Function - detail");
@@ -2069,7 +2143,7 @@ fn parse_awr_report_internal(fname: &str, args: &Args) -> (AWR, HashMap<String, 
 
 
 
-pub fn parse_awr_dir(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>>, file: &str) {
+pub fn parse_awr_dir(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>>, file: &str) -> ReportForAI {
 	println!("{}","\n==== PARSING DIRECTORY DATA ===".bright_cyan());
 	//let mut awr_vec: Vec<AWR> = Vec::new();
 	let mut file_collection: Vec<String> = Vec::new();
@@ -2085,7 +2159,6 @@ pub fn parse_awr_dir(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>
 			file_collection.push(fname.clone()); 
 		}
     }
-
 	let pb = ProgressBar::new(file_collection.len() as u64);
     pb.set_style(ProgressStyle::default_bar()
         .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
@@ -2177,12 +2250,9 @@ pub fn parse_awr_dir(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>
     };
     let json_str = serde_json::to_string_pretty(&collection).unwrap();
 	let mut f = fs::File::create(file).unwrap();
-		f.write_all(json_str.as_bytes()).unwrap();
-    if args.plot > 0 {
-        let html_fname = format!("{}.html", &args.directory);
-        plot_to_file(collection, html_fname, args.clone());
-    }
-    //Ok(json_str)
+	f.write_all(json_str.as_bytes()).unwrap();
+    let report_for_ai = main_report_builder(collection, args.clone());
+    report_for_ai
 }
 
 pub fn parse_awr_report(data: &str, json_data: bool, args: &Args) -> Result<String, std::io::Error> {
@@ -2208,15 +2278,15 @@ pub fn parse_awr_report(data: &str, json_data: bool, args: &Args) -> Result<Stri
 	Ok(awr_doc)
 }
 
-pub fn prarse_json_file(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>>) {
+pub fn prarse_json_file(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>>) -> ReportForAI {
 	println!("{}","\n==== PARSING JSON DATA ===".bright_cyan());
 	//fname: String, db_time_cpu_ratio: f64, filter_db_time: f64, snap_range: String
 	let json_file = fs::read_to_string(&args.json_file).expect(&format!("Something wrong with a file {} ", &args.json_file));
-	let mut collection: AWRSCollection = serde_json::from_str(&json_file).expect("Wrong JSON format");
+	let mut collection: AWRSCollection = serde_json::from_str(&json_file).expect("\nJAS-MIN JSON format not known\nConsider running jasmin -d <DIR> before using -j json\n\n");
 	collection.awrs.clone().sort_by_key(|a| a.snap_info.begin_snap_id);
 	println!("{} samples found",collection.awrs.len());
     let file_and_ext: Vec<&str> = args.json_file.split('.').collect();
-    let html_fname = format!("{}.html", file_and_ext[0]);
+    //let html_fname = format!("{}.html", file_and_ext[0]);
 	let fg_events: HashSet<String> = collection.awrs
 										.iter()
 										.flat_map(|a| a.foreground_wait_events.clone())
@@ -2238,5 +2308,6 @@ pub fn prarse_json_file(args: Args, events_sqls: &mut HashMap<&str, HashSet<Stri
 	events_sqls.insert("FG", fg_events);
 	events_sqls.insert("BG", bg_events);
 	events_sqls.insert("SQL", sqls);
-	plot_to_file(collection, html_fname, args.clone());
+	let report_for_ai = main_report_builder(collection, args.clone());
+	report_for_ai
 }

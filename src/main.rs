@@ -10,6 +10,8 @@ use dotenvy::from_path;
 use colored::*;
 use clap::Parser;
 use rayon::ThreadPoolBuilder;
+use serde::{Deserialize, Serialize};
+
 
 mod awr;
 mod analyze;
@@ -19,6 +21,10 @@ mod macros;
 mod anomalies;
 mod tools;
 use crate::reasonings::*;
+use crate::reasonings::{StatisticsDescription,TopPeaksSelected,MadAnomaliesEvents,MadAnomaliesSQL,TopForegroundWaitEvents,TopBackgroundWaitEvents,PctOfTimesThisSQLFoundInOtherTopSections,WaitEventsWithStrongCorrelation,WaitEventsFromASH,TopSQLsByElapsedTime,StatsSummary,IOStatsByFunctionSummary,LatchActivitySummary,Top10SegmentStats,InstanceStatisticCorrelation,LoadProfileAnomalies,AnomalyDescription,AnomlyCluster,ReportForAI,AppState};
+
+use toon::encode;
+
 
 ///This tool will parse STATSPACK or AWR report into JSON format which can be used by visualization tool of your choice.
 ///The assumption is that text file is a STATSPACK report and HTML is AWR, but it tries to parse AWR report also. 
@@ -35,10 +41,6 @@ struct Args {
 	#[clap(short, long, default_value="")]
     directory: String,
 
-	///Draw a plot? 
-	#[clap(short, long, default_value_t=1)]
-    plot: u8,
-
 	///Write output to nondefault file? Default is directory_name.json
 	#[clap(short, long, default_value="")]
 	outfile: String,
@@ -50,6 +52,11 @@ struct Args {
 	///Filter only for DBTIME greater than (if zero the filter is not effective)
 	#[clap(short, long, default_value_t=0.0)]
 	filter_db_time: f64,
+
+	///Include indicated SQL_IDs as TOP SQL in fomrat SQL_ID1, SQL_ID2,...
+	///This is experimental function
+	#[clap(short, long, default_value="")]
+	id_sqls: String,
 
 	///Analyze provided JSON file
 	#[clap(short, long, default_value="")]
@@ -74,7 +81,7 @@ struct Args {
 	token_count_factor: usize,
 
 	///Launches the backend agent used by the JASMIN Assistant.
-	///-b <openai>|<gemini:model>
+	///-b <openai>|<google:model>
 	/// Configuration details such as API keys and the selected PORT number are loaded from the .env file
 	#[clap(short, long, default_value="")]
 	backend_assistant: String,
@@ -101,6 +108,11 @@ struct Args {
 	///Check Google Documentation for more info: https://ai.google.dev/gemini-api/docs/url-context
 	#[clap(short, long, default_value="")]
 	url_context_file: String,
+
+	///Should AI perform a deep analyze of detail JSON statistics? 
+	/// By using this option, LLM will be asked to propose topN SNAPs to analyze all of the statistics from this period. 
+	#[clap(short = 'D', long, default_value_t=0)]
+	deep_check: usize,
 
 }
 
@@ -141,6 +153,8 @@ fn main() {
 	let args = Args::parse(); 
 	println!("{}{} (Running with parallel degree: {})","JAS-MIN v".bright_yellow(),env!("CARGO_PKG_VERSION").bright_yellow(), args.parallel);
 
+	let mut report_for_ai = ReportForAI::default();
+
 	//This creates a global pool configuration for rayon to limit threads for par_iter
 	ThreadPoolBuilder::new()
         .num_threads(args.parallel)
@@ -154,27 +168,47 @@ fn main() {
 		let awr_doc = awr::parse_awr_report(&args.file, false, &args).unwrap();
 		println!("{}", awr_doc);
 	} else if !args.directory.is_empty() {
-		let mut fname = format!("{}.json", &args.directory);
-		reportfile = format!("{}.txt", &args.directory);
-		if !args.outfile.is_empty() {
-			fname = args.outfile.clone();
+		if PathBuf::from(&args.directory).exists(){
+			let mut fname = PathBuf::from(&args.directory).with_extension("json").to_string_lossy().into_owned();
+			reportfile = PathBuf::from(&args.directory).with_extension("txt").to_string_lossy().into_owned();
+			if !args.outfile.is_empty() {
+				fname = args.outfile.clone();
+			}
+			report_for_ai = awr::parse_awr_dir(args.clone(), events_sqls, &fname);
+		} else {
+			eprintln!("ERROR: Directory: '{}' does not exists!",args.directory);
 		}
-		 awr::parse_awr_dir(args.clone(), events_sqls, &fname);
 		
 	} else if !args.json_file.is_empty() {
-		awr::prarse_json_file(args.clone(), events_sqls);
-		let file_and_ext: Vec<&str> = args.json_file.split('.').collect();
-    reportfile = format!("{}.txt", file_and_ext[0]);
+		if PathBuf::from(&args.json_file).exists(){
+			report_for_ai = awr::prarse_json_file(args.clone(), events_sqls);
+			//let file_and_ext: Vec<&str> = args.json_file.split('.').collect();
+			reportfile = match PathBuf::from(&args.json_file).file_stem() {
+				Some(stem) => 
+					PathBuf::from(stem).with_extension("txt").to_string_lossy().into_owned(),
+				None => {
+					eprintln!("Invalid filename: {}", args.json_file);
+					std::process::exit(10);
+				}
+			};
+		} else {
+			eprintln!("ERROR: JSON file: '{}' does not exists!",args.json_file);
+		}
 	}
 	if !args.ai.is_empty() {
         let vendor_model_lang = args.ai.split(":").collect::<Vec<&str>>();
+		let j = serde_json::to_value(&report_for_ai).unwrap();
+		let toon_str = encode(&j, None);
+		let mut f = fs::File::create("report_for_ai.toon").unwrap();
+		f.write_all(toon_str.as_bytes()).unwrap();
         if vendor_model_lang[0] == "openai" {
-            //chat_gpt(&reportfile, vendor_model_lang, args.token_count_factor, events_sqls.clone()).unwrap();
-			println!("For now only Google is supported vendor with this option :( Sorry for that. You can use OpenAI with backend assistant tho. We are waiting what GPT-5 will provide.");
+            openai_gpt(&reportfile, vendor_model_lang, args.token_count_factor, events_sqls.clone(), &args, &toon_str).unwrap();
         } else if vendor_model_lang[0] == "google" { 
-            gemini(&reportfile, vendor_model_lang, args.token_count_factor, events_sqls.clone(), &args).unwrap();
+            gemini(&reportfile, vendor_model_lang, args.token_count_factor, events_sqls.clone(), &args, &toon_str).unwrap();
+		} else if vendor_model_lang[0] == "openrouter" { 
+            openrouter(&reportfile, vendor_model_lang, args.token_count_factor, events_sqls.clone(), &args, &toon_str).unwrap();
 		} else {
-            println!("Unrecognized vendor. Supported vendors: openai, google");
+            println!("Unrecognized vendor. Supported vendors: openai, google, openrouter");
         }   
     }
 	if !args.backend_assistant.is_empty() {
@@ -193,9 +227,12 @@ fn main() {
 
 		println!("{}",r#"==== STARTING ASISTANT BACKEND ==="#.bright_cyan());
 		println!("🤖 Starting JAS-MIN Assistant Backend using: {}",args.backend_assistant);
-		println!("📁 Report File: {}",reportfile.clone());
-        
-		backend_ai(reportfile, backend_type, model_name);
+		println!("📁 Report File: {}",&reportfile);
+        let j = serde_json::to_value(&report_for_ai).unwrap();
+		let toon_str = encode(&j, None);
+		let mut f = fs::File::create("report_for_ai.toon").unwrap();
+		f.write_all(toon_str.as_bytes()).unwrap();
+		backend_ai(reportfile, backend_type, model_name, toon_str);
     }
 	
 }

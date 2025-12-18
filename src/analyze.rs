@@ -1,21 +1,23 @@
-use crate::awr::{AWRSCollection, HostCPU, IOStats, LoadProfile, SQLCPUTime, SQLGets, SQLIOTime, SQLReads, SegmentStats, WaitEvents, AWR};
+use crate::awr::{AWRSCollection, HostCPU, IOStats, LoadProfile, SQLCPUTime, SQLGets, SQLIOTime, SQLReads, SegmentStats, WaitEvents, AWR, GetStats};
 
-use axum::http::header;
+use serde::{Deserialize, Serialize};
+
+//use axum::http::header;
 use execute::generic_array::typenum::True;
 use plotly::color::NamedColor;
-use plotly::{Plot, Histogram, BoxPlot, Scatter, HeatMap, Image};
-use plotly::common::{ColorBar, Mode, Title, Visible, Line, Orientation, Anchor, Marker, ColorScale, ColorScalePalette};
+use plotly::{Plot, Histogram, BoxPlot, Scatter, HeatMap};
+use plotly::common::{ColorBar, Mode, Title, Visible, Line, Orientation, Anchor, Marker, ColorScale, ColorScalePalette, HoverInfo, MarkerSymbol};
 use plotly::box_plot::{BoxMean,BoxPoints};
 use plotly::layout::{Axis, GridPattern, Layout, LayoutGrid, Legend, RowOrder, TraceOrder, ModeBar, HoverMode, RangeMode};
-use plotly::plotly_static::ImageFormat;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::format;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path,PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use colored::*;
 use open::*;
@@ -29,6 +31,7 @@ use prettytable::{Table, Row, Cell, format, Attr};
 use rayon::prelude::*;
 
 use crate::tools::*;
+use crate::reasonings::{StatisticsDescription,TopPeaksSelected,MadAnomaliesEvents,MadAnomaliesSQL,TopForegroundWaitEvents,TopBackgroundWaitEvents,PctOfTimesThisSQLFoundInOtherTopSections,WaitEventsWithStrongCorrelation,WaitEventsFromASH,TopSQLsByElapsedTime,StatsSummary,IOStatsByFunctionSummary,LatchActivitySummary,Top10SegmentStats,InstanceStatisticCorrelation,LoadProfileAnomalies,AnomalyDescription,AnomlyCluster,ReportForAI,AppState};
 
 struct TopStats {
     events: BTreeMap<String, u8>,
@@ -59,23 +62,33 @@ fn parse_snap_range(snap_range: &str) -> Result<(u64, u64), String> {
 
 //We don't want to plot everything, because it would cause to much trouble 
 //we need to find only essential wait events and SQLIDs 
-fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, snap_range: &(u64,u64), logfile_name: &str, args: &Args) -> TopStats {
+fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, snap_range: &(u64,u64), logfile_name: &str, args: &Args, report_for_ai: &mut ReportForAI) -> TopStats {
     let mut event_names: BTreeMap<String, u8> = BTreeMap::new();
     let mut bgevent_names: BTreeMap<String, u8> = BTreeMap::new();
     let mut sql_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut stat_names: BTreeMap<String, u8> = BTreeMap::new();
+
+    let mut stats_description = StatisticsDescription::default();
+
     //so we scan the AWR data
-    make_notes!(&logfile_name, false, 
-        "==== DBCPU/DBTime ratio analysis ====\nPeaks are being analyzed based on specified ratio (default 0.666).\nThe ratio is beaing calculated as DB CPU / DB Time.\nThe lower the ratio the more sessions are waiting for resources other than CPU.\nIf DB CPU = 2 and DB Time = 8 it means that on AVG 8 actice sessions are working but only 2 of them are actively working on CPU.\nCurrent ratio used to find peak periods is {}\n\n", db_time_cpu_ratio);
+    make_notes!(&logfile_name, false, 1, "{}", "DBCPU/DBTIME RATIO ANALYSIS".bold().green());
+    make_notes!(&logfile_name, false, 0,
+        "\nPeaks are being analyzed based on specified ratio (default 0.666).\nThe ratio is beaing calculated as DB CPU / DB Time.\nThe lower the ratio the more sessions are waiting for resources other than CPU.\nIf DB CPU = 2 and DB Time = 8 it means that on AVG 8 actice sessions are working but only 2 of them are actively working on CPU.\nCurrent ratio used to find peak periods is {}\n\n", db_time_cpu_ratio);
         
+    stats_description.dbcpu_dbtime = format!("DBCPU/DBTIME RATIO ANALYSIS\nPeaks are being analyzed based on specified ratio (default 0.666).\nThe ratio is beaing calculated as DB CPU / DB Time.\nThe lower the ratio the more sessions are waiting for resources other than CPU.\nIf DB CPU = 2 and DB Time = 8 it means that on AVG 8 actice sessions are working but only 2 of them are actively working on CPU.\nCurrent ratio used to find peak periods is {}", db_time_cpu_ratio);
     
     let mut full_window_size = ((args.mad_window_size as f32 / 100.0 ) * awrs.len() as f32) as usize; // Default is 20% of probes
     if full_window_size % 2 == 1 {
         full_window_size = full_window_size + 1;
     }
-    make_notes!(&logfile_name, false, 
-                "==== Median Absolute Deviation ====\n\tMAD threshold = {}\n\tMAD window size={}% ({} of probes out of {})\n\n", args.mad_threshold, args.mad_window_size, full_window_size, awrs.len());
+    make_notes!(&logfile_name, false, 1, "{}", "MEDIAN ABSOLUTE DEVIATION".bold().green());
+    make_notes!(&logfile_name, false, 0, 
+        "\nMAD threshold = {}\nMAD window size={}% ({} of probes out of {})\n\n", args.mad_threshold, args.mad_window_size, full_window_size, awrs.len());
     
+    stats_description.median_absolute_deviation = format!("MAD threshold = {}\nMAD window size={}% ({} of probes out of {})\n\n", args.mad_threshold, args.mad_window_size, full_window_size, awrs.len());
+    
+    let mut top_spikes: Vec<TopPeaksSelected> = Vec::new();
+
     for awr in awrs {
         let (f_begin_snap,f_end_snap) = snap_range;
 
@@ -96,7 +109,10 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
 
             if dbtime > 0.0 && cputime > 0.0 && cputime/dbtime < db_time_cpu_ratio && (filter_db_time==0.0 || dbtime>filter_db_time){
                 //println!("Analyzing a peak in {} ({}) for ratio: [{:.2}/{:.2}] = {:.2}", awr.file_name, awr.snap_info.begin_snap_time, cputime, dbtime, (cputime/dbtime));
-                make_notes!(&logfile_name, false, "Analyzing a peak in {} ({}) for ratio: [{:.2}/{:.2}] = {:.2}\n", awr.file_name, awr.snap_info.begin_snap_time, cputime, dbtime, (cputime/dbtime));
+                make_notes!(&logfile_name, false, 0, "Analyzing a peak in {} ({}) for ratio: [{:.2}/{:.2}] = {:.2}\n", awr.file_name, awr.snap_info.begin_snap_time, cputime, dbtime, (cputime/dbtime));
+                
+                top_spikes.push(TopPeaksSelected { report_name: awr.file_name.clone(), report_date: awr.snap_info.begin_snap_time.clone(), snap_id: awr.snap_info.begin_snap_id, db_time_value: dbtime, db_cpu_value: cputime, dbcpu_dbtime_ratio: (cputime/dbtime) });
+
                 let mut events: Vec<WaitEvents> = awr.foreground_wait_events.clone();
                 let mut bgevents: Vec<WaitEvents> = awr.background_wait_events.clone();
                 //I'm sorting events by total wait time, to get the longest waits at the end
@@ -129,7 +145,7 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
                     }
                 }
             }
-            for stats in &awr.key_instance_stats {
+            for stats in &awr.instance_stats {
                 stat_names.entry(stats.statname.clone()).or_insert(1);
             }
         }
@@ -154,6 +170,14 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
         sql_ids.entry(a.0.to_string()).or_insert(String::new());
     }
 
+    if !args.id_sqls.is_empty(){
+        let sqlids: Vec<String> = args.id_sqls.split(',').map(|s| s.trim().to_string()).collect();
+        println!("Additional SQLs ID considered: {:?}", sqlids.clone());
+        for s in sqlids{
+            sql_ids.entry(s).or_insert(String::new());
+        }
+    }
+    
     let top: TopStats = TopStats {events: event_names, 
                                   bgevents: bgevent_names, 
                                   sqls: sql_ids, 
@@ -161,6 +185,10 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
                                   event_anomalies_mad: event_anomalies,
                                   bgevent_anomalies_mad: bgevent_anomalies,
                                   sql_elapsed_time_anomalies_mad: sql_anomalies,};
+
+    report_for_ai.top_spikes_marked = top_spikes;
+    report_for_ai.general_data = stats_description;
+
     top
 }
 
@@ -232,25 +260,61 @@ fn report_instance_stats_cor(instance_stats: HashMap<String, Vec<f64>>, dbtime_v
 fn merge_ash_sqls_to_events(ash_event_sql_map: HashMap<String, HashSet<String>>, dirpath: &str) {
 
     for (event, sqls) in ash_event_sql_map {
-        let filename = get_safe_event_filename(&dirpath, event.clone(), true);
+        let filename = get_safe_filename(event.clone(), "fg".to_string());
+        let path = Path::new(&dirpath).join(&filename);
         let mut event_html_content = format!(
             r#"
                 <h4 style="color:blue;font-weight:bold;">Wait Event found in ASH for following SQL IDs:</h4>
                 <ul>
             "#);
         for sqlid in sqls {
-            event_html_content = format!("{}<li><a href=sqlid_{}.html target=_blank style=\"color: black;\">{}</a></li>", event_html_content, sqlid, sqlid);
+            event_html_content = format!("{}<li><a href=../sqlid/sqlid_{}.html target=_blank style=\"color: black;\">{}</a></li>", event_html_content, sqlid, sqlid);
         }
         event_html_content = format!("{}</ul>", event_html_content);
-        if Path::new(&filename).exists() {
-            let mut event_file: String = fs::read_to_string(&filename)
-                                            .expect(&format!("Failed to read file: {}", filename));
+        if path.exists() {
+            let mut event_file: String = fs::read_to_string(&path)
+                                            .expect(&format!("Failed to read file: {}", &path.to_string_lossy()));
             event_file = event_file.replace(
                                     "</h2>",
                                     &format!("</h2>\n{}\n",event_html_content));
 
-            if let Err(e) = fs::write(&filename, event_file) {
-                eprintln!("Error writing file {}: {}", filename, e);
+            if let Err(e) = fs::write(&path, event_file) {
+                eprintln!("Error writing file {}: {}", &path.to_string_lossy(), e);
+            }
+        }
+        
+    }
+
+}
+
+//Add SQL_IDs found with strong correlation to event charts
+fn merge_correlated_sqls_to_events(crr_event_sql_map: HashMap<String, HashMap<String, f64>>, dirpath: &str) {
+
+    for (event, sqls) in crr_event_sql_map {
+        let filename = get_safe_filename( event.clone(), "fg".to_string());
+        let path = Path::new(&dirpath).join(&filename);
+        let mut event_html_content = format!(
+            r#"
+                <h4 style="color:blue;font-weight:bold;">SQL IDs with strong correlation with this wait event:</h4>
+                <ul>
+            "#);
+
+        let mut vec_sqls: Vec<_> = sqls.into_iter().collect();
+        vec_sqls.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        for (sqlid, crr) in vec_sqls {
+            event_html_content = format!("{}<li><a href=../sqlid/sqlid_{}.html target=_blank style=\"color: black;\">{:.2} | {}</a></li>", event_html_content, sqlid, crr, sqlid);
+        }
+        event_html_content = format!("{}</ul>", event_html_content);
+        if path.exists() {
+            let mut event_file: String = fs::read_to_string(&path)
+                                            .expect(&format!("Failed to read file: {}", &path.to_string_lossy()));
+            event_file = event_file.replace(
+                                    "</h2>",
+                                    &format!("</h2>\n{}\n",event_html_content));
+
+            if let Err(e) = fs::write(&path, event_file) {
+                eprintln!("Error writing file {}: {}", &path.to_string_lossy(), e);
             }
         }
         
@@ -273,23 +337,21 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
         "#8A2BE2", "#1E90FF"
     ];
     // Group Events by Name and by needed data (ename(db_time, total_wait, waits,histogram values by bucket, heatmap)
-    struct HeatmapEntry { //Group Events by Snap Time and histograms
-        snap_time: String,
-        histogram: BTreeMap<String, f32>,
-    }
+    let mut snap_time: Vec<String> = Vec::new();
     struct EventStats {
-        pct_dbtime: Vec<f64>,
-        total_wait_time_s: Vec<f64>,
-        waits: Vec<u64>,
-        histogram_by_bucket: BTreeMap<String, Vec<f32>>,
-        histogram_heatmap: Vec<HeatmapEntry>
+        pct_dbtime: Vec<Option<f64>>,
+        total_wait_time_s: Vec<Option<f64>>,
+        waits: Vec<Option<u64>>,
+        histogram_by_bucket: BTreeMap<String, Vec<Option<f32>>>,
+        heatmap: Vec<Option<BTreeMap<String,f32>>>
     }
+
     let mut data_by_event: HashMap<String, EventStats> = HashMap::new();
     let mut buckets_found: bool = false;
-    // Let's gather all needed data
+
     for awr in awrs {
         if awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap {
-            let snap_time: String = format!("{} ({})", awr.snap_info.begin_snap_time, awr.snap_info.begin_snap_id);
+            snap_time.push(format!("{} ({})", awr.snap_info.begin_snap_time, awr.snap_info.begin_snap_id));
         
             let events = if is_fg {
                 &awr.foreground_wait_events
@@ -298,6 +360,7 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
             };
 
             if events.is_empty(){
+                println!("   WARNING: generate_events_plotfiles found empty events {}",awr.snap_info.begin_snap_id);
                 continue;
             } else{
                 if !buckets_found{
@@ -310,34 +373,48 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
                     }
                     buckets_found = true;
                 }
-                for event in events {
-                    if !top_events.contains_key(&event.event) {
-                        continue;
+                for top_event in top_events {
+                    if let Some(event) = events.iter().find(|e| &e.event == top_event.0) {
+                        // Initilize events map
+                        let entry = data_by_event
+                            .entry(top_event.0.clone())
+                            .or_insert_with(|| EventStats {
+                                pct_dbtime: Vec::new(),
+                                total_wait_time_s: Vec::new(),
+                                waits: Vec::new(),
+                                histogram_by_bucket: BTreeMap::new(),
+                                heatmap: Vec::new()
+                            });
+                        // Gather data by Event Name
+                        entry.pct_dbtime.push(Some(event.pct_dbtime));
+                        entry.total_wait_time_s.push(Some(event.total_wait_time_s));
+                        entry.waits.push(Some(event.waits));
+                        for (bucket, value) in &event.waitevent_histogram_ms {
+                            entry.histogram_by_bucket
+                                .entry(bucket.clone())
+                                .or_insert_with(Vec::new)
+                                .push(Some(*value));
+                        }
+                        entry.heatmap.push(Some(event.waitevent_histogram_ms.clone()))
+                    } else { // Event does NOT exist in this snapshot → push gaps
+                        let entry = data_by_event
+                            .entry(top_event.0.clone())
+                            .or_insert_with(|| EventStats {
+                                pct_dbtime: Vec::new(),
+                                total_wait_time_s: Vec::new(),
+                                waits: Vec::new(),
+                                histogram_by_bucket: BTreeMap::new(),
+                                heatmap: Vec::new(),
+                            });
+
+                        entry.pct_dbtime.push(None);
+                        entry.total_wait_time_s.push(None);
+                        entry.waits.push(None);
+                        for vals in entry.histogram_by_bucket.values_mut() {
+                            vals.push(None);
+                        }
+                        entry.heatmap.push(None);
                     }
-                    // Initilize events map
-                    let entry = data_by_event
-                        .entry(event.event.clone())
-                        .or_insert_with(|| EventStats {
-                            pct_dbtime: Vec::new(),
-                            total_wait_time_s: Vec::new(),
-                            waits: Vec::new(),
-                            histogram_by_bucket: BTreeMap::new(),
-                            histogram_heatmap: Vec::new(),
-                        });
-                    // Gather data by Event Name
-                    entry.pct_dbtime.push(event.pct_dbtime);
-                    entry.total_wait_time_s.push(event.total_wait_time_s);
-                    entry.waits.push(event.waits);
-                    for (bucket, value) in &event.waitevent_histogram_ms {
-                        entry.histogram_by_bucket
-                            .entry(bucket.clone())
-                            .or_insert_with(Vec::new)
-                            .push(*value);
-                    }
-                    entry.histogram_heatmap.push(HeatmapEntry {
-                        snap_time: snap_time.clone(),
-                        histogram: event.waitevent_histogram_ms.clone(),
-                    });
                 }
             }
         }
@@ -348,49 +425,54 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
         let mut plot: Plot = Plot::new();
         let event_name = format!("{}", &event);
     
-        // Add HeatMap plot (from embedded heatmap entries)
-        if !entry.histogram_heatmap.is_empty() {
-            let x_labels: Vec<String> = entry.histogram_heatmap.iter().map(|e| e.snap_time.clone()).collect();
-    
-            let mut z_matrix: Vec<Vec<f32>> = Vec::new();
-            for bucket in &hist_buckets {
-                let row: Vec<f32> = entry.histogram_heatmap
-                    .iter()
-                    .map(|h| *h.histogram.get(bucket).unwrap_or(&0.0))
-                    .collect();
-                z_matrix.push(row);
-            }
-    
-            let heatmap = HeatMap::new(x_labels.clone(), hist_buckets.clone(), z_matrix)
-                .x_axis("x1")
-                .y_axis("y1")
-                .hover_on_gaps(true)
-                .show_legend(false)
-                .show_scale(false)
-                .color_scale(ColorScale::Palette(ColorScalePalette::Electric))
-                .reverse_scale(true)
-                .name("%");
-    
-            plot.add_trace(heatmap);
-        
-            //Add Total Wait Time trace
-            let event_total_wait = Scatter::new(x_labels.clone(), entry.total_wait_time_s.clone())
-                .mode(Mode::Lines)
-                .name("Total Wait Time (s)")
-                .x_axis("x1")
-                .y_axis("y2");
-
-            plot.add_trace(event_total_wait);
-
-            // Add Wait Count trace
-            let event_wait_count = Scatter::new(x_labels.clone(), entry.waits.clone())
-                .mode(Mode::Lines)
-                .name("Wait Count")
-                .x_axis("x1")
-                .y_axis("y3");
-
-            plot.add_trace(event_wait_count);
+        let mut z_matrix: Vec<Vec<Option<f32>>> = Vec::new();
+        for bucket in &hist_buckets {
+            let row: Vec<Option<f32>> = entry.heatmap
+                .iter()
+                .map(|snap_opt| {
+                    // For each snapshot, extract this bucket's value
+                    match snap_opt {
+                        Some(histogram) => {
+                            histogram.get(bucket).copied() // Snapshot has data
+                        }
+                        None => None, // Snapshot missing - no data for any bucket
+                    }
+                })
+                .collect();
+            z_matrix.push(row);
         }
+
+        let heatmap = HeatMap::new(snap_time.clone(), hist_buckets.clone(), z_matrix)
+            .x_axis("x1")
+            .y_axis("y1")
+            .hover_on_gaps(true)
+            .show_legend(false)
+            .show_scale(false)
+            .color_scale(ColorScale::Palette(ColorScalePalette::Electric))
+            .reverse_scale(true)
+            .name("%");
+
+        plot.add_trace(heatmap);
+    
+        //Add Total Wait Time trace
+        let event_total_wait = Scatter::new(snap_time.clone(), entry.total_wait_time_s.clone())
+            .mode(Mode::LinesMarkers)
+            .marker(Marker::new().opacity(0.5))
+            .name("Total Wait Time (s)")
+            .x_axis("x1")
+            .y_axis("y2");
+
+        plot.add_trace(event_total_wait);
+
+        // Add Wait Count trace
+        let event_wait_count = Scatter::new(snap_time.clone(), entry.waits.clone())
+            .mode(Mode::LinesMarkers)
+            .marker(Marker::new().opacity(0.5))
+            .name("Wait Count")
+            .x_axis("x1")
+            .y_axis("y3");
+
+        plot.add_trace(event_wait_count);
 
         //Add Event DBTime distribution
         let dbt_histogram = Histogram::new(entry.pct_dbtime.clone())
@@ -532,13 +614,13 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
             );
             plot.set_layout(layout);
         
-        let file_name = get_safe_event_filename(&dirpath, event.clone(), is_fg);
+        let file_name = get_safe_filename(event.clone(), if is_fg{"fg".to_string()}else{"bg".to_string()});
 
         // Save the plot as an HTML file
-        let path: &Path = Path::new(&file_name);
+        let path = Path::new(&dirpath).join(&file_name);
         //plot.save(path).expect("Failed to save plot to file");
-        plot.write_html(path);
-        let mut event_file: String = fs::read_to_string(path).expect(&format!("Failed to read file: {}", file_name));
+        plot.write_html(&path);
+        let mut event_file: String = fs::read_to_string(&path).expect(&format!("Failed to read file: {}", file_name));
         event_file = event_file.replace(
             "<body>",
             &format!("<style>\nbody {{ font-family: Arial, sans-serif; }}.content {{ font-size: 16px; }}\n</style>\n<body>\n\t<h2 style=\"width:100%;text-align:center;\">{}</h2>",event));
@@ -547,9 +629,9 @@ fn generate_events_plotfiles(awrs: &Vec<AWR>, top_events: &BTreeMap<String, u8>,
         }
     }
     if is_fg {
-        println!("Saved plots for Foreground events to '{}/fg_*'", dirpath);
+        println!("Saved plots for Foreground events to '{}/fg/fg_*'", &dirpath);
     } else {
-        println!("Saved plots for Background events to '{}/bg_*'", dirpath);
+        println!("Saved plots for Background events to '{}/bg/bg_*'", &dirpath);
     }
 }
 
@@ -572,7 +654,7 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         phy_r_exec: Vec<Option<f64>>,       // Number of Physical Reads per Execution
         phy_r_pct_total: Vec<Option<f64>>  // Physical Reads as a percentage of Total Disk Reads
     }
-    let mut sqls_by_stats: HashMap<String, SQLStats> = HashMap::new();
+    //let mut sqls_by_stats: HashMap<String, SQLStats> = HashMap::new();
 
     let colors = vec![
         "#1f77b4", // strong blue
@@ -711,7 +793,7 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_gets_per_exec = Scatter::new(x_vals.clone(), stats.gets_per_exec.clone())
             .mode(Mode::Markers)
             .name("# Buffer Gets")
-            .marker(Marker::new().color(colors[12]))
+            .marker(Marker::new().color(colors[12]).symbol(MarkerSymbol::StarDiamond).opacity(0.7))
             .x_axis("x1")
             .y_axis("y4")
             .visible(Visible::LegendOnly);
@@ -720,33 +802,33 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_phy_r_exec = Scatter::new(x_vals.clone(), stats.phy_r_exec.clone())
             .mode(Mode::Markers)
             .name("# Physical Reads")
-            .marker(Marker::new().color(colors[11]))
+            .marker(Marker::new().color(colors[11]).symbol(MarkerSymbol::DiamondTall).opacity(0.7))
             .x_axis("x1")
             .y_axis("y4")
             .visible(Visible::LegendOnly);
         sql_plot.add_trace(sql_phy_r_exec);
 
         let sql_ela_pct_total = Scatter::new(x_vals.clone(), stats.ela_pct_total.clone())
-            .mode(Mode::Lines)
+            .mode(Mode::LinesMarkers)
             .name("% Ela Time as DB Time")
-            .marker(Marker::new().color(colors[10]))
+            .marker(Marker::new().color(colors[10]).opacity(0.5))
             .x_axis("x1")
             .y_axis("y3");
         sql_plot.add_trace(sql_ela_pct_total);
 
         let sql_pct_cpu = Scatter::new(x_vals.clone(), stats.pct_cpu.clone())
-            .mode(Mode::Lines)
+            .mode(Mode::LinesMarkers)
             .name("% CPU of Ela")
-            .marker(Marker::new().color(colors[9]))
+            .marker(Marker::new().color(colors[9]).opacity(0.5))
             .x_axis("x1")
             .y_axis("y3");
         sql_plot.add_trace(sql_pct_cpu);
 
         // IO % of Ela
         let sql_pct_io = Scatter::new(x_vals.clone(), stats.pct_io.clone())
-            .mode(Mode::Lines)
+            .mode(Mode::LinesMarkers)
             .name("% IO of Ela")
-            .marker(Marker::new().color(colors[8]))
+            .marker(Marker::new().color(colors[8]).opacity(0.5))
             .x_axis("x1")
             .y_axis("y3");
         sql_plot.add_trace(sql_pct_io);
@@ -755,7 +837,7 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_cpu_t_pct_total = Scatter::new(x_vals.clone(), stats.cpu_t_pct_total.clone())
             .mode(Mode::Markers)
             .name("% CPU Time as DB CPU")
-            .marker(Marker::new().color(colors[7]))
+            .marker(Marker::new().color(colors[7]).symbol(MarkerSymbol::DiamondTall).opacity(0.7))
             .x_axis("x1")
             .y_axis("y3")
             .visible(Visible::LegendOnly);
@@ -765,7 +847,7 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_io_pct_total = Scatter::new(x_vals.clone(), stats.io_pct_total.clone())
             .mode(Mode::Markers)
             .name("% IO Time as DB IO Wait")
-            .marker(Marker::new().color(colors[6]))
+            .marker(Marker::new().color(colors[6]).symbol(MarkerSymbol::StarDiamond).opacity(0.7))
             .x_axis("x1")
             .y_axis("y3")
             .visible(Visible::LegendOnly);
@@ -775,7 +857,7 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_gets_pct_total = Scatter::new(x_vals.clone(), stats.gets_pct_total.clone())
             .mode(Mode::Markers)
             .name("% Gets as Total Gets")
-            .marker(Marker::new().color(colors[5]))
+            .marker(Marker::new().color(colors[5]).symbol(MarkerSymbol::Diamond).opacity(0.7))
             .x_axis("x1")
             .y_axis("y3")
             .visible(Visible::LegendOnly);
@@ -785,16 +867,16 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_phy_r_pct_total = Scatter::new(x_vals.clone(), stats.phy_r_pct_total.clone())
             .mode(Mode::Markers)
             .name("% Phys Reads as Total Disk Reads")
-            .marker(Marker::new().color(colors[4]))
+            .marker(Marker::new().color(colors[4]).symbol(MarkerSymbol::Square).opacity(0.7))
             .x_axis("x1")
             .y_axis("y3")
             .visible(Visible::LegendOnly);
         sql_plot.add_trace(sql_phy_r_pct_total);
 
         let sql_ela_exec_s = Scatter::new(x_vals.clone(), stats.ela_exec_s.clone())
-            .mode(Mode::Lines)
+            .mode(Mode::LinesMarkers)
             .name("(s) Elapsed Time per Exec")
-            .marker(Marker::new().color(colors[3]))
+            .marker(Marker::new().color(colors[3]).opacity(0.5))
             .x_axis("x1")
             .y_axis("y2");
         sql_plot.add_trace(sql_ela_exec_s);
@@ -802,7 +884,7 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_cpu_time_exec_s = Scatter::new(x_vals.clone(), stats.cpu_time_exec_s.clone())
             .mode(Mode::Markers)
             .name("(s) CPU Time")
-            .marker(Marker::new().color(colors[2]))
+            .marker(Marker::new().color(colors[2]).symbol(MarkerSymbol::DiamondTall).opacity(0.7))
             .x_axis("x1")
             .y_axis("y2")
             .visible(Visible::LegendOnly);
@@ -811,16 +893,16 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         let sql_io_time_exec_s = Scatter::new(x_vals.clone(), stats.io_time_exec_s.clone())
             .mode(Mode::Markers)
             .name("(s) User I/O Wait Time")
-            .marker(Marker::new().color(colors[1]))
+            .marker(Marker::new().color(colors[1]).symbol(MarkerSymbol::StarDiamond).opacity(0.7))
             .x_axis("x1")
             .y_axis("y2")
             .visible(Visible::LegendOnly);
         sql_plot.add_trace(sql_io_time_exec_s);
         
         let sql_exec = Scatter::new(x_vals.clone(), stats.execs.clone())
-            .mode(Mode::Lines)
+            .mode(Mode::LinesMarkers)
             .name("# Executions")
-            .marker(Marker::new().color(colors[0]))
+            .marker(Marker::new().color(colors[0]).opacity(0.5))
             .x_axis("x1")
             .y_axis("y1");
         sql_plot.add_trace(sql_exec);
@@ -878,11 +960,272 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
                     .range_mode(RangeMode::ToZero)
             );
             sql_plot.set_layout(sql_layout);
-            let file_name: String = format!("{}/sqlid_{}.html", dirpath, &sql);
+            let file_name: String = format!("{}/sqlid/sqlid_{}.html", dirpath, &sql);
             let path: &Path = Path::new(&file_name);
             sql_plot.write_html(path);
     }
-    println!("Saved plots for SQLs to '{}/sqlid_*'", dirpath);
+    println!("Saved plots for SQLs to '{}/sqlid/sqlid_*'", dirpath);
+
+}
+
+// Generate HTML for Instance Efficiency
+fn generate_instance_efficiency_plot(awrs: &Vec<AWR>, snap_range: &(u64,u64), dirpath: &str) -> String {    
+    let (f_begin_snap,f_end_snap) = snap_range;
+    struct InstEffStats{
+        stat_name: String,
+        stat_pct: Vec<Option<f32>>
+    }
+    let mut ie_stats_names: Vec<String> = awrs[0]
+            .instance_efficiency
+            .iter()
+            .map(|s| s.eff_stat.clone())
+            .collect();
+
+    let mut x_vals: Vec<String> = awrs
+            .iter()
+            .filter(|awr| awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap)
+            .map(|awr| format!("{} ({})", awr.snap_info.begin_snap_time, awr.snap_info.begin_snap_id))
+            .collect();
+
+    let inst_eff_stats: Vec<InstEffStats> = ie_stats_names.par_iter()
+        .map(|ie_name|{
+            // Collect values across all matching AWRs in range
+            let mut values: Vec<Option<f32>> = Vec::new();
+            for awr in awrs {
+                if awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap{
+                    for ie in &awr.instance_efficiency {
+                        if ie.eff_stat == *ie_name {
+                            values.push(ie.eff_pct);
+                        }
+                    }
+                }
+            }
+            InstEffStats {
+                stat_name: ie_name.clone(),
+                stat_pct: values,
+            }
+        }).collect();
+
+    // === Create the instance efficiency plot ===
+    let mut plot_instance_efficiency = Plot::new();
+    let color_palette = vec![
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+        "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+        "#bcbd22", "#17becf",
+        ];
+    for (i,ieplot) in inst_eff_stats.iter().enumerate() {
+        let color = color_palette[i % color_palette.len()];
+        let trace = Scatter::new(x_vals.clone(), ieplot.stat_pct.clone())
+            .mode(Mode::Lines)
+            .name(ieplot.stat_name.clone())
+            .x_axis("x1")
+            .y_axis("y1")
+            .marker(Marker::new().color(color))
+            .legend_group(&ieplot.stat_name)
+            .show_legend(false);
+        plot_instance_efficiency.add_trace(trace);
+
+        let histogram = Histogram::new(ieplot.stat_pct.clone())
+            .name(ieplot.stat_name.clone())
+            .x_axis("x2")
+            .y_axis("y2")
+            .legend_group(&ieplot.stat_name)
+            .marker(Marker::new().color(color).opacity(0.7))
+            .show_legend(true);
+        plot_instance_efficiency.add_trace(histogram);
+
+        let box_plot = BoxPlot::new_xy(ieplot.stat_pct.clone(),vec![ieplot.stat_name.clone();ieplot.stat_pct.clone().len()])
+            .name("")
+            .x_axis("x2")
+            .y_axis("y3")
+            .orientation(Orientation::Horizontal)
+            .legend_group(&ieplot.stat_name)
+            .box_mean(BoxMean::True)
+            .marker(Marker::new().color(color).opacity(0.7))
+            .show_legend(false);
+        plot_instance_efficiency.add_trace(box_plot);
+    }
+
+    // Add layout
+    let layout = Layout::new()
+        .title("Instance Efficiency %")
+        .height(1000)
+        .bar_gap(0.0)
+        .bar_mode(plotly::layout::BarMode::Overlay)
+        .hover_mode(HoverMode::X)
+        .grid(
+            LayoutGrid::new()
+                .rows(3)
+                .columns(1),
+        )
+        .x_axis(
+            Axis::new()
+                .domain(&[0.0, 1.0])
+                .anchor("y1")
+                .range(vec![0.,])
+                .show_grid(true)
+        )
+        .y_axis(
+            Axis::new()
+                .title("Efficiency (%)")
+                .domain(&[0.0, 0.3])
+                .anchor("x1")
+                .range(vec![0.,])
+                .zero_line(true)
+                .range_mode(RangeMode::ToZero)
+        )
+        .x_axis2(
+            Axis::new()
+                .title("Hit %")
+                .domain(&[0.0, 1.0])
+                .anchor("y2")
+                .range(vec![0.,])
+                .show_grid(true)
+        )
+        .y_axis2(
+            Axis::new()
+                .domain(&[0.35, 0.75])
+                .anchor("x2")
+                .range(vec![0.,]),
+        )
+        .y_axis3(
+            Axis::new()
+                .domain(&[0.8, 1.0])
+                .anchor("x2")
+                .range(vec![0.,])
+                .show_tick_labels(false),
+        );
+
+    plot_instance_efficiency.set_layout(layout);
+    plot_instance_efficiency.to_inline_html(Some("instance-efficiency-plot"))
+}
+
+fn generate_instance_stats_plotfiles(awrs: &Vec<AWR>, snap_range: &(u64,u64), dirpath: &str){    
+    let (f_begin_snap,f_end_snap) = snap_range;
+    struct InstStats{
+        stat_name: String,
+        stat_total: Vec<Option<u64>>
+    }
+    let mut i_stats_names: Vec<String> = awrs[0]
+            .instance_stats
+            .iter()
+            .map(|s| s.statname.clone())
+            .collect();
+
+    let mut x_vals: Vec<String> = awrs
+            .iter()
+            .filter(|awr| awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap)
+            .map(|awr| format!("{} ({})", awr.snap_info.begin_snap_time, awr.snap_info.begin_snap_id))
+            .collect();
+
+    let inst_stats: Vec<InstStats> = i_stats_names.par_iter()
+        .map(|i_name|{
+            // Collect values across all matching AWRs in range
+            let mut values: Vec<Option<u64>> = Vec::new();
+            for awr in awrs {
+                if awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap{
+                    for i in &awr.instance_stats {
+                        if i.statname == *i_name {
+                            values.push(Some(i.total));
+                        }
+                    }
+                }
+            }
+            InstStats {
+                stat_name: i_name.clone(),
+                stat_total: values,
+            }
+        }).collect();
+
+    // === Create the instance stats plots ===
+    for (i,iplot) in inst_stats.iter().enumerate() {
+        let mut plot_instance_stat = Plot::new();
+        let trace = Scatter::new(x_vals.clone(), iplot.stat_total.clone())
+            .mode(Mode::Lines)
+            .name(iplot.stat_name.clone())
+            .x_axis("x1")
+            .y_axis("y1")
+            .legend_group(&iplot.stat_name)
+            .show_legend(false);
+        plot_instance_stat.add_trace(trace);
+
+        let histogram = Histogram::new(iplot.stat_total.clone())
+            .name(iplot.stat_name.clone())
+            .x_axis("x2")
+            .y_axis("y2")
+            .legend_group(&iplot.stat_name)
+            .marker(Marker::new().opacity(0.7))
+            .show_legend(true);
+        plot_instance_stat.add_trace(histogram);
+
+        let box_plot = BoxPlot::new_xy(iplot.stat_total.clone(),vec![iplot.stat_name.clone();iplot.stat_total.clone().len()])
+            .name("")
+            .x_axis("x2")
+            .y_axis("y3")
+            .orientation(Orientation::Horizontal)
+            .legend_group(&iplot.stat_name)
+            .box_mean(BoxMean::True)
+            .marker(Marker::new().opacity(0.7))
+            .show_legend(false);
+        plot_instance_stat.add_trace(box_plot);
+
+        // Add layout
+        let layout = Layout::new()
+            .title(&iplot.stat_name)
+            .height(800)
+            .bar_gap(0.0)
+            .bar_mode(plotly::layout::BarMode::Overlay)
+            .hover_mode(HoverMode::X)
+            .grid(
+                LayoutGrid::new()
+                    .rows(3)
+                    .columns(1),
+            )
+            .x_axis(
+                Axis::new()
+                    .domain(&[0.0, 1.0])
+                    .anchor("y1")
+                    .range(vec![0.,])
+                    .show_grid(true)
+            )
+            .y_axis(
+                Axis::new()
+                    .title("Total Number")
+                    .domain(&[0.0, 0.3])
+                    .anchor("x1")
+                    .range(vec![0.,])
+                    .zero_line(true)
+                    .range_mode(RangeMode::ToZero)
+            )
+            .x_axis2(
+                Axis::new()
+                    .title("Total Number")
+                    .domain(&[0.0, 1.0])
+                    .anchor("y2")
+                    .range(vec![0.,])
+                    .show_grid(true)
+            )
+            .y_axis2(
+                Axis::new()
+                    .domain(&[0.35, 0.75])
+                    .anchor("x2")
+                    .range(vec![0.,]),
+            )
+            .y_axis3(
+                Axis::new()
+                    .domain(&[0.8, 1.0])
+                    .anchor("x2")
+                    .range(vec![0.,])
+                    .show_tick_labels(false),
+            );
+
+        plot_instance_stat.set_layout(layout);
+        // Save to HTML
+        let file_name = get_safe_filename(iplot.stat_name.clone(),"inst_stat".to_string());
+        let path = Path::new(&dirpath).join(&file_name);
+        plot_instance_stat.write_html(path);
+    }
+    println!("Saved plots for Instance Stats to '{}/stats/stats_*'", &dirpath);
 
 }
 
@@ -1298,7 +1641,7 @@ fn generate_iostats_plotfile(awrs: &Vec<AWR>, snap_range: &(u64,u64), dirpath: &
             );
         plot_iostats.set_layout(layout_iostats);
         let func_name = func.replace(" ","_");
-        let file_name: String = format!("{}/iostats_{}.html", dirpath,func_name);
+        let file_name: String = format!("{}/iostats/iostats_{}.html", dirpath,func_name);
         let path: &Path = Path::new(&file_name);
         plot_iostats.write_html(path);
     }
@@ -1364,16 +1707,135 @@ fn generate_iostats_plotfile(awrs: &Vec<AWR>, snap_range: &(u64,u64), dirpath: &
                     .range_mode(RangeMode::ToZero)
             );
             plot_iostats_main.set_layout(layout_io_stats_main);
-            let file_name: String = format!("{}/iostats_zMAIN.html", dirpath);
+            let file_name: String = format!("{}/iostats/iostats_zMAIN.html", dirpath);
             let path: &Path = Path::new(&file_name);
             plot_iostats_main.write_html(path);
 
-    println!("Saved plots for IO Stats to '{}/iostats_*'", dirpath);
+    println!("Saving plots for IO Stats to '{}/iostats_*'", dirpath);
     functions_to_plot.insert("zMAIN".to_string(),BTreeMap::new());
     functions_to_plot
 }
 
-fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir: &str) -> Vec<String> {
+// Get Requests – popularność latcha (jak często był używany).
+// Pct Get Miss – jak często proces się “odbijał” od latcha (wskazuje kontencję).
+// Avg Slps/Miss – czy procesy musiały iść spać (jeśli > 0 → latch contention naprawdę boli).
+// Wait Time (s) – łączny koszt dla systemu (sumaryczna strata czasu).
+// NoWait Requests / Pct NoWait Miss – zwykle mniej krytyczne, ale czasem pokazują krótkie zatory.
+fn generate_latchstats_plotfiles(awrs: &Vec<AWR>, snap_range: &(u64,u64), dirpath: &str, report_for_ai: &mut ReportForAI) -> Table {
+    let (f_begin_snap,f_end_snap) = snap_range;
+    #[derive(Default)]
+    struct LatchAgg {
+        get_requests_sum: u64,
+        weighted_miss_pct: f64, // sum(get_requests * get_pct_miss)
+        occurrences: f64,
+        wait_time_sum: f64,
+    }
+
+    let mut latch_stat_rows = String::new(); //for HTML
+    let mut latches: Vec<String> = Vec::new();       //latch names
+    for lname in &awrs[0].latch_activity{
+        latches.push(lname.statname.clone());
+    }
+
+    let latch_activity: HashMap<String, LatchAgg> = latches.par_iter()
+        .map(|lname| {
+            let mut agg: LatchAgg = LatchAgg::default();
+            for awr in awrs{
+                if awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap {
+                    for la in awr.latch_activity.iter().filter(|la| la.statname == *lname) {
+                        if la.get_requests > 0 { 
+                            agg.get_requests_sum = agg.get_requests_sum.saturating_add(la.get_requests);
+                            agg.weighted_miss_pct += (la.get_requests as f64) * la.get_pct_miss;
+                            agg.wait_time_sum += (la.get_requests as f64)*la.wait_time;
+                            agg.occurrences += 1.0; 
+                        }
+                    }
+                }
+            }
+            if agg.get_requests_sum > 0 {
+                agg.weighted_miss_pct = agg.weighted_miss_pct / (agg.get_requests_sum as f64);
+                agg.wait_time_sum = agg.wait_time_sum / (agg.get_requests_sum as f64);
+            } else {
+                agg.weighted_miss_pct = 0.0;
+                agg.wait_time_sum = 0.0;
+            }
+            (lname.clone(), agg)
+        }).collect();
+
+    let mut sorted_latches: Vec<(String, LatchAgg)> = latch_activity.into_iter().collect();
+    sorted_latches.sort_by(|a, b| b.1.weighted_miss_pct.partial_cmp(&a.1.weighted_miss_pct).unwrap());
+    
+    let mut latch_table: Table = Table::new();
+    latch_table.set_titles(Row::new(vec![
+        Cell::new("Latch").with_style(Attr::Bold),
+        Cell::new("Get Req avg").with_style(Attr::Bold),
+        Cell::new("Weighted Miss %").with_style(Attr::Bold),
+        Cell::new("Wait Time (s) wavg").with_style(Attr::Bold),
+        Cell::new("In AWR %").with_style(Attr::Bold),
+    ]));
+
+    for (lname, agg) in &sorted_latches {
+        let mut latch_activity = LatchActivitySummary::default();
+        if agg.weighted_miss_pct > 0.0 {
+            latch_table.add_row(Row::new(vec![
+                Cell::new(lname),
+                Cell::new(&format!("{:.2}",(agg.get_requests_sum as f64/agg.occurrences as f64))),
+                Cell::new(&format!("{:.4}",agg.weighted_miss_pct)),
+                Cell::new(&format!("{:.2}",agg.wait_time_sum)),
+                Cell::new(&format!("{:.2}",(agg.occurrences as f64*100.0/awrs.len() as f64))),
+            ]));
+            latch_activity.latch_name = lname.clone();
+            latch_activity.get_requests_avg = agg.get_requests_sum as f64/agg.occurrences as f64;
+            latch_activity.weighted_miss_pct = agg.weighted_miss_pct;
+            latch_activity.wait_time_weighted_avg_s = agg.wait_time_sum;
+            latch_activity.found_in_pct_of_probes = (agg.occurrences as f64*100.0/awrs.len() as f64);
+
+            report_for_ai.latch_activity_summary.push(latch_activity);
+
+            latch_stat_rows.push_str(&format!(
+                r#"<tr>
+                    <td>{}</td>
+                    <td>{:.2}</td>
+                    <td>{:.4}</td>
+                    <td>{:.2}</td>
+                    <td>{:.2}</td>
+                </tr>"#,
+                lname,(agg.get_requests_sum as f64/agg.occurrences as f64),agg.weighted_miss_pct,agg.wait_time_sum,(agg.occurrences as f64*100.0/awrs.len() as f64)
+            ));
+        }
+    }
+    let table_latch_stat: String = format!(
+        r#"
+        <table id="latchstat-table">
+            <thead>
+                <tr style="background-color: #f49758;">
+                    <th colspan="5" style="text-align: center; font-weight: bold; color: rgba(125, 0, 63, 10); font-size: 1.1em;">Latch Activity Summary</th>
+                </tr>
+                <tr style="background-color: #f49758;">
+                    <th onclick="sortTable('latchstat-table',0)" style="cursor: pointer;">Latch Name</th>
+                    <th onclick="sortTable('latchstat-table',1)" style="cursor: pointer;">Get Req avg</th>
+                    <th onclick="sortTable('latchstat-table',2)" style="cursor: pointer;">Weighted Miss %</th>
+                    <th onclick="sortTable('latchstat-table',3)" style="cursor: pointer;">Wait Time (s) wavg</th>
+                    <th onclick="sortTable('latchstat-table',4)" style="cursor: pointer;">In AWR %</th>
+                </tr>
+            </thead>
+            <tbody>
+            {}
+            </tbody>
+        </table>
+        "#,
+        latch_stat_rows
+    );
+    let latch_stats_filename: String = format!("{}/latches/latchstats_activity.html", dirpath);
+    if let Err(e) = fs::write(&latch_stats_filename, table_latch_stat) {
+        eprintln!("Error writing file {}: {}", latch_stats_filename, e);
+    }
+    //println!("Saved plots for Latch Activity Stats to '{}/latchstats_activity.html'", dirpath);
+    //println!("{}\n", latch_table);
+    latch_table
+}
+
+fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir: &str, raport_for_ai: &mut ReportForAI) -> Vec<String> {
 
     //It will contain section name and vector for all segment stats from the whole AWR collection
     let mut objects_in_section: BTreeMap<String, Vec<SegmentStats>> = BTreeMap::new();
@@ -1390,8 +1852,9 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
     let mut sections_toplot: Vec<String> = Vec::new();    
     for (section, objects) in objects_in_section {
         sections_toplot.push(objects[0].stat_name.replace(" ","_"));
-        let section_msg = format!("\n\nTOP 10 Segments by {} ordered by PCT of occuriance desc. Statstic values computed based on {}\n", section, objects[0].stat_name);
-        make_notes!(logfile_name, args.quiet, "{}", section_msg.bold().blue());
+        let section_msg = format!("TOP 10 Segments by {} ordered by PCT of occuriance desc. Statstic values computed based on {}\n", section, objects[0].stat_name);
+        make_notes!(logfile_name, args.quiet, 0, "\n");
+        make_notes!(logfile_name, args.quiet, 2, "{}", section_msg.yellow());
         let mut table = Table::new();
         let mut segment_stat_rows = String::new();
 
@@ -1428,7 +1891,6 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
         }
 
         let mut segment_summary: BTreeMap<(i64, u64, u64), SegmentSummary> = BTreeMap::new();
-
         //build unique set od object_id, data_object_id from all objects in current section
         let all_ids: HashSet<(u64,u64, String)> = objects
                                       .iter()
@@ -1467,10 +1929,40 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
                 stddev: format!("{:.3}", stddev),
                 pct: format!("{:.3}", pct),
             });
+            
         }
 
         //Iterate over top 10 segment statistics
         for (_, s) in segment_summary.iter().take(10) {
+
+            let segment_data = Top10SegmentStats {
+                    segment_name: s.segment_name.clone(),
+                    segment_type: s.segment_type.clone(),
+                    object_id: u64::from_str(&s.object_id).unwrap(),
+                    data_object_id: u64::from_str(&s.data_object_id).unwrap(),
+                    avg: f64::from_str(&s.avg).unwrap(),
+                    stddev: f64::from_str(&s.stddev).unwrap(),
+                    pct_of_occuriance: f64::from_str(&s.pct).unwrap(),
+                };
+
+            if section == "Buffer Busy Waits" {
+                raport_for_ai.top_10_segments_by_buffer_busy_waits.push(segment_data);
+            } else if section == "Direct Physical Reads" {
+                raport_for_ai.top_10_segments_by_direct_physical_reads.push(segment_data);
+            } else if section == "Direct Physical Writes" {
+                raport_for_ai.top_10_segments_by_direct_physical_writes.push(segment_data);
+            } else if section == "Logical Reads" {
+                raport_for_ai.top_10_segments_by_logical_reads.push(segment_data);
+            } else if section == "Physical Read Requests" {
+                raport_for_ai.top_10_segments_by_physical_read_requests.push(segment_data);
+            } else if section == "Physical Write Requests" {
+                raport_for_ai.top_10_segments_by_physical_write_requests.push(segment_data);
+            } else if section == "Physical Writes" {
+                raport_for_ai.top_10_segments_by_physical_writes.push(segment_data);
+            } else if section == "Row Lock Waits" {
+                raport_for_ai.top_10_segments_by_row_lock_waits.push(segment_data);
+            }
+
             if args.security_level > 0 {
                 table.add_row(Row::new(vec![
                     Cell::new(&s.segment_name),
@@ -1518,7 +2010,7 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
         }
 
         for table_line in table.to_string().lines() {
-            make_notes!(logfile_name, args.quiet, "{}\n", table_line);
+            make_notes!(logfile_name, args.quiet, 0, "{}\n", table_line);
         }
         
         if args.security_level > 0 {
@@ -1547,7 +2039,7 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
                 idname = objects[0].stat_name.replace(" ","_"),
                 rows = segment_stat_rows
             );
-            let segment_stats_filename: String = format!("{}/segstats_{}.html", dir, objects[0].stat_name.replace(" ","_"),);
+            let segment_stats_filename: String = format!("{}/segstats/segstats_{}.html", dir, objects[0].stat_name.replace(" ","_"),);
             if let Err(e) = fs::write(&segment_stats_filename, table_segment_stat) {
                 eprintln!("Error writing file {}: {}", segment_stats_filename, e);
             }
@@ -1576,7 +2068,7 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
                 idname = objects[0].stat_name.replace(" ","_"),
                 rows = segment_stat_rows
             );
-            let segment_stats_filename: String = format!("{}/segstats_{}.html", dir, objects[0].stat_name.replace(" ","_"),);
+            let segment_stats_filename: String = format!("{}/segstats/segstats_{}.html", dir, objects[0].stat_name.replace(" ","_"),);
             if let Err(e) = fs::write(&segment_stats_filename, table_segment_stat) {
                 eprintln!("Error writing file {}: {}", segment_stats_filename, e);
             }
@@ -1585,25 +2077,60 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
     sections_toplot   
 }
 
-pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
+pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForAI {
+    let mut plot_main: Plot = Plot::new();
+    let mut plot_highlight: Plot = Plot::new();
+    let mut plot_highlight2: Plot = Plot::new();
+    let mut global_statistics = BTreeMap::<String, Option<GetStats>>::new();
+
+    /* Struct filled for AI analyzes in JSON */
+    let mut report_for_ai: ReportForAI = ReportForAI::default();
+    /* ************************************* */
+    
     let db_time_cpu_ratio: f64 = args.time_cpu_ratio;
     let filter_db_time: f64 = args.filter_db_time;
     let snap_range: (u64,u64) = parse_snap_range(&args.snap_range).expect("Invalid snap-range argument");
     
-    let file_len = fname.len();
-    let logfile_name: String = format!("{}.txt", &fname[0..file_len-5]); //cut .html from file name and add .txt
+    //Filenames and Paths used to save JAS-MIN files
+    let mut logfile_name = PathBuf::from(&args.directory).with_extension("txt").to_string_lossy().into_owned();
+    if logfile_name.is_empty() && !&args.json_file.is_empty() {
+        if let Some(stem) = PathBuf::from(&args.json_file).file_stem() {
+            logfile_name = PathBuf::from(stem).with_extension("txt").to_string_lossy().into_owned();
+        } 
+    }
     let logfile_path = Path::new(&logfile_name);
     println!("Starting output capture to: {}", logfile_path.display() );
     if logfile_path.exists() { //remove logfile if it exists - the notes made by JAS-MIN has to be created each time
         fs::remove_file(&logfile_path).unwrap();
     }
 
+    let mut html_dir = PathBuf::from(&args.directory).with_extension("html_reports").to_string_lossy().into_owned();
+    if html_dir.is_empty() && !&args.json_file.is_empty() {
+        if let Some(stem) = PathBuf::from(&args.json_file).file_stem() {
+            html_dir = PathBuf::from(stem).with_extension("html_reports").to_string_lossy().into_owned();
+        } 
+    }
+    // Create main <PATH>.html_reports folder
+    if let Err(e) = fs::create_dir_all(&html_dir) {
+        eprintln!("⚠️ Failed to create base directory {:?}: {}", html_dir, e);
+    }
+    // Create all required subdirectories dir tree under html
+    let subdirs = ["fg", "bg", "latches", "iostats", "segstats", "sqlid", "stats","jasmin/anomalies"];
+    for sub in subdirs {
+        let path = Path::new(&html_dir).join(sub);
+        if let Err(e) = fs::create_dir_all(&path) {
+            eprintln!("⚠️ Failed to create directory {:?}: {}", path, e);
+        }
+    }
+    
+    // Y-axis
     let mut y_vals_dbtime: Vec<f64> = Vec::new();
     let mut y_vals_dbcpu: Vec<f64> = Vec::new();
     let mut y_vals_events: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_bgevents: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_sqls: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let mut y_vals_logons: Vec<f64> = Vec::new();
+    let mut y_vals_logons: Vec<u64> = Vec::new();
+    let mut y_vals_logouts: Vec<u64> = Vec::new();
     let mut y_vals_calls: Vec<f64> = Vec::new();
     let mut y_vals_execs: Vec<f64> = Vec::new();
     let mut y_vals_trans: Vec<f64> = Vec::new();
@@ -1619,12 +2146,11 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     let mut y_cleanout_cr: Vec<f64> = Vec::new();
     let mut y_read_mb: Vec<f64> = Vec::new();
     let mut y_write_mb: Vec<f64> = Vec::new();
-    let mut y_user_commits_s: Vec<u64> = Vec::new();
-    let mut y_user_rollbacks_s: Vec<u64> = Vec::new();
+    let mut y_user_commits: Vec<u64> = Vec::new();
+    let mut y_user_rollbacks: Vec<u64> = Vec::new();
     let mut y_logical_reads_s: Vec<f64> = Vec::new();
     let mut y_block_changes_s: Vec<f64> = Vec::new();
     let mut y_failed_parse_count: Vec<u64> = Vec::new();
-
     /*Variables used for statistics computations*/
     let mut y_vals_events_n: BTreeMap<String, Vec<f64>> = BTreeMap::new(); 
     let mut y_vals_events_t: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -1635,52 +2161,34 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     let mut y_vals_sqls_exec_t: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_sqls_exec_n: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_sqls_exec_s: BTreeMap<String, Vec<f64>> = BTreeMap::new(); //For Elapsed Time AVG STDDEV calculations
-     
-    /****************************************************/
     /*HashMap for calculating instance stats correlation*/
     let mut instance_stats: HashMap<String, Vec<f64>> = HashMap::new();
-    /****************************************************/
-
+    // X-axis -> snaps
     let mut x_vals: Vec<String> = Vec::new();
     
-    // === ANALYZING ===
-    println!("{}","\n==== ANALYZING ===".bright_cyan());
-    let top_stats: TopStats = find_top_stats(&collection.awrs, db_time_cpu_ratio, filter_db_time, &snap_range, &logfile_name, &args);
-    
+    println!("{}","\n==== ANALYZING ===".bold().bright_cyan());
+    let top_stats: TopStats = find_top_stats(&collection.awrs, db_time_cpu_ratio, filter_db_time, &snap_range, &logfile_name, &args, &mut report_for_ai);  
     let mut is_logfilesync_high: bool = false;
     
-    // Extract the parent directory and generate FG Events html plots
-
-    //This will be empty if -d or -j specified without whole path
-    let dir_path: &str = Path::new(&fname).parent().unwrap_or(Path::new("")).to_str().unwrap_or("");
-    let mut html_dir: String = String::new(); //variable for html files directory
-    let mut stripped_fname: &str = fname.as_str(); //without whole path to a file this will be just a file name
-    if dir_path.len() == 0 {
-        html_dir = format!("{}_reports", &fname); 
-    } else { //if the whole path was specified we are extracting file name and seting html_dir properly 
-        stripped_fname = Path::new(&fname).file_name().unwrap().to_str().unwrap();
-        html_dir = format!("{}/{}_reports", &dir_path, &stripped_fname);
-    }
-    
-    println!("{}","\n==== CREATING PLOTS ===".bright_cyan());
-    fs::create_dir(&html_dir).unwrap_or_default();
+    println!("{}","\n==== CREATING PLOTS ===".bold().bright_cyan()); 
     generate_events_plotfiles(&collection.awrs, &top_stats.events, true, &snap_range, &html_dir);
     generate_events_plotfiles(&collection.awrs, &top_stats.bgevents, false, &snap_range, &html_dir);
     generate_sqls_plotfiles(&collection.awrs, &top_stats, &snap_range, &html_dir);
+    let instance_eff_plot: String = generate_instance_efficiency_plot(&collection.awrs, &snap_range, &html_dir);
+    generate_instance_stats_plotfiles(&collection.awrs, &snap_range, &html_dir);
     let iostats = generate_iostats_plotfile(&collection.awrs, &snap_range, &html_dir);
+    let table_latch: Table = generate_latchstats_plotfiles(&collection.awrs, &snap_range, &html_dir, &mut report_for_ai);
     let fname: String = format!("{}/jasmin_main.html", &html_dir); //new file name path for main report
+    
+    println!("\n{}","==== PREPARING RESULTS ===".bold().bright_cyan());
 
-    /* ------ Preparing data ------ */
-    println!("\n{}","==== PREPARING RESULTS ===".bright_cyan());
     for awr in &collection.awrs {
         let (f_begin_snap,f_end_snap) = snap_range;
-
         if awr.snap_info.begin_snap_id >= f_begin_snap && awr.snap_info.end_snap_id <= f_end_snap {
-
             let xval: String = format!("{} ({})", awr.snap_info.begin_snap_time, awr.snap_info.begin_snap_id);
             x_vals.push(xval.clone());
-
             //We have to fill the whole data traces for stats, wait events and SQLs with 0 to be sure that chart won't be moved to one side
+            
             for (sql, _) in &top_stats.sqls {
                 y_vals_sqls.entry(sql.to_string()).or_insert(Vec::new());
                 y_vals_sqls_exec_t.entry(sql.to_string()).or_insert(Vec::new());
@@ -1767,8 +2275,6 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                         y_vals_dbcpu.push(lp.per_second);
                     } else if lp.stat_name.starts_with("User calls") {
                         y_vals_calls.push(lp.per_second);
-                    } else if lp.stat_name.starts_with("User logons") || (is_statspack && lp.stat_name.starts_with("Logons")) {
-                        y_vals_logons.push(lp.per_second*60.0*60.0);
                     } else if lp.stat_name.starts_with("Executes") {
                         y_vals_execs.push(lp.per_second);
                     } else if lp.stat_name.starts_with("Transactions") {
@@ -1791,8 +2297,6 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             }
 
             // IO Stats data gathering and preparing them for plotting
-
-
             // ----- Host CPU
             if awr.host_cpu.pct_user < 0.0 {
                 y_vals_cpu_user.push(0.0);
@@ -1812,17 +2316,21 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             let mut cleanout_cr: u64 = 0;
             let mut excessive_commit: f64 = 0.0;
 
-            for activity in &awr.key_instance_stats {
+            for activity in &awr.instance_stats {
                 let mut v: &mut Vec<f64> = instance_stats.get_mut(&activity.statname).unwrap();
                 v[x_vals.len()-1] = activity.total as f64;
 
                 
                 if activity.statname == "user commits" {
-                    y_user_commits_s.push(activity.total);
+                    y_user_commits.push(activity.total);
                 } else if activity.statname == "user rollbacks" {
-                    y_user_rollbacks_s.push(activity.total);
+                    y_user_rollbacks.push(activity.total);
                 } else if activity.statname == "parse count (failures)" {
                     y_failed_parse_count.push(activity.total);
+                } else if activity.statname == "user logons cumulative" {
+                    y_vals_logons.push(activity.total);
+                } else if activity.statname == "user logouts cumulative"{
+                    y_vals_logouts.push(activity.total);
                 }
                 
                 // Plot additional stats if 'log file sync' is in top events
@@ -1855,7 +2363,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         }
     }
 
-    //make_notes!(&logfile_name, false, "{}\n","Load Profile and Top Stats");
+    //make_notes!(&logfile_name, false, 0, "{}\n","Load Profile and Top Stats");
     //println!("{}","Load Profile and Top Stats");
     //I want to sort wait events by most heavy ones across the whole period
     let mut y_vals_events_sorted = BTreeMap::new();
@@ -1892,13 +2400,26 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         y_vals_sqls_sorted.insert((occuriance, sqlid.clone()), yv.clone());
         
     }
-
+    //Get Global Stats for Lod Profile
+    global_statistics.insert("CPU Load".to_string(), get_statistics(y_vals_cpu_load.clone()));
+    global_statistics.insert("AAS".to_string(), get_statistics(y_vals_dbtime.clone()));
+    global_statistics.insert("Executions/s".to_string(), get_statistics(y_vals_execs.clone()));
+    global_statistics.insert("Transactions/s".to_string(), get_statistics(y_vals_trans.clone()));
+    global_statistics.insert("Physical Reads MB/s".to_string(), get_statistics(y_read_mb.clone()));
+    global_statistics.insert("Physical Writes MB/s".to_string(), get_statistics(y_write_mb.clone()));
+    global_statistics.insert("Redo MB/s".to_string(), get_statistics(y_vals_redosize.clone()));
+    global_statistics.insert("User Commits/snap".to_string(), get_statistics(y_user_commits.iter().map(|v| *v as f64).collect()));
+    global_statistics.insert("User Rollbacks/snap".to_string(),get_statistics(y_user_rollbacks.iter().map(|v| *v as f64).collect()));
+    global_statistics.insert("Parses/s".to_string(), get_statistics(y_vals_parses.clone()));
+    global_statistics.insert("Hard Parses/s".to_string(), get_statistics(y_vals_hparses.clone()));
+    global_statistics.insert("Logical Reads MB/s".to_string(), get_statistics(y_logical_reads_s.clone()));
+    global_statistics.insert("Block Changes/s".to_string(), get_statistics(y_block_changes_s.clone()));
+    global_statistics.insert("User Calls/s".to_string(), get_statistics(y_vals_calls.clone()));
+    fs::write(format!("{}/stats/global_statistics.json",&html_dir),serde_json::to_string(&global_statistics).unwrap());
+    
     // ------ Ploting and reporting starts ----------
-    make_notes!(&logfile_name, args.quiet, "\n{}\n\n","==== Statistical Computation RESULTS ===".bright_cyan());
-
-    let mut plot_main: Plot = Plot::new();
-    let mut plot_highlight: Plot = Plot::new();
-    let mut plot_highlight2: Plot = Plot::new();
+    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
+    make_notes!(&logfile_name, false, 1, "{}\n","STATISTICAL COMPUTATION RESULTS".bold().green());
 
     let dbtime_trace = Scatter::new(x_vals.clone(), y_vals_dbtime.clone())
                                                     .mode(Mode::LinesText)
@@ -1912,29 +2433,74 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                                                     .y_axis("y1");
     let calls_trace = Scatter::new(x_vals.clone(), y_vals_calls.clone())
                                                     .mode(Mode::LinesText)
-                                                    .name("User Calls")
+                                                    .name("User Calls/s")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let transactions_trace = Scatter::new(x_vals.clone(), y_vals_trans.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("Transactions/s")
                                                     .x_axis("x1")
                                                     .y_axis("y2");
     let logons_trace = Scatter::new(x_vals.clone(), y_vals_logons)
                                                     .mode(Mode::LinesText)
-                                                    .name("Logons")
+                                                    .name("User Logons")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let logouts_trace = Scatter::new(x_vals.clone(), y_vals_logouts)
+                                                    .mode(Mode::LinesText)
+                                                    .name("User Logouts")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");                                            
+    let commits_trace = Scatter::new(x_vals.clone(), y_user_commits.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("User Commits")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let rollbacks_trace = Scatter::new(x_vals.clone(), y_user_rollbacks.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("User Rollbacks")
                                                     .x_axis("x1")
                                                     .y_axis("y2");
     let exec_trace = Scatter::new(x_vals.clone(), y_vals_execs.clone())
                                                     .mode(Mode::LinesText)
-                                                    .name("Executes")
+                                                    .name("Executes/s")
                                                     .x_axis("x1")
                                                     .y_axis("y2");
     let parses_trace = Scatter::new(x_vals.clone(), y_vals_parses.clone())
                                                     .mode(Mode::LinesText)
-                                                    .name("Parses")
+                                                    .name("Parses/s")
                                                     .x_axis("x1")
                                                     .y_axis("y2");
     let hparses_trace = Scatter::new(x_vals.clone(), y_vals_hparses.clone())
                                                     .mode(Mode::LinesText)
-                                                    .name("Hard Parses")
+                                                    .name("Hard Parses/s")
                                                     .x_axis("x1")
-                                                    .y_axis("y2");                                                 
+                                                    .y_axis("y2");
+    let blockchanges_trace = Scatter::new(x_vals.clone(), y_block_changes_s.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("Block changes/s")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let redosize_trace = Scatter::new(x_vals.clone(), y_vals_redosize.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("Redo MB/s")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let logicalread_trace = Scatter::new(x_vals.clone(), y_logical_reads_s.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("Logical Read MB/s")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let phyread_trace = Scatter::new(x_vals.clone(), y_read_mb.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("Physical Read MB/s")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
+    let phywrite_trace = Scatter::new(x_vals.clone(), y_write_mb.clone())
+                                                    .mode(Mode::LinesText)
+                                                    .name("Physical Write MB/s")
+                                                    .x_axis("x1")
+                                                    .y_axis("y2");
     let cpu_user = Scatter::new(x_vals.clone(), y_vals_cpu_user)
                                                     .mode(Mode::LinesText)
                                                     .name("CPU User")
@@ -2017,7 +2583,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                                                 .box_points(BoxPoints::All)
                                                 .whisker_width(0.2)
                                                 .marker(Marker::new().color("#ad247a".to_string()).opacity(0.7).size(2));
-    let user_commits_box_plot  = BoxPlot::new(y_user_commits_s)
+    let user_commits_box_plot  = BoxPlot::new(y_user_commits)
                                                 //.mode(Mode::LinesText)
                                                 .name("User Commits/snap")
                                                 .x_axis("x1")
@@ -2027,7 +2593,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                                                 .box_points(BoxPoints::All)
                                                 .whisker_width(0.2)
                                                 .marker(Marker::new().color("#fa3434".to_string()).opacity(0.7).size(2));
-    let user_rollbacks_box_plot  = BoxPlot::new(y_user_rollbacks_s)
+    let user_rollbacks_box_plot  = BoxPlot::new(y_user_rollbacks)
                                             //.mode(Mode::LinesText)
                                                 .name("User Rollbacks/snap")
                                                 .x_axis("x2")
@@ -2126,10 +2692,19 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     plot_highlight.add_trace(aas_box_plot);
     plot_main.add_trace(dbcpu_trace);
     plot_main.add_trace(calls_trace);
+    plot_main.add_trace(transactions_trace);
     plot_main.add_trace(logons_trace);
+    plot_main.add_trace(logouts_trace);
+    plot_main.add_trace(commits_trace);
+    plot_main.add_trace(rollbacks_trace);
     plot_main.add_trace(exec_trace);
     plot_highlight.add_trace(exec_box_plot);
     plot_highlight.add_trace(trans_box_plot);
+    plot_main.add_trace(blockchanges_trace);
+    plot_main.add_trace(redosize_trace);
+    plot_main.add_trace(logicalread_trace);
+    plot_main.add_trace(phyread_trace);
+    plot_main.add_trace(phywrite_trace);
     plot_main.add_trace(parses_trace);
     plot_main.add_trace(hparses_trace);
     plot_main.add_trace(cpu_user);
@@ -2173,8 +2748,12 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     let mut anomalies_summary: BTreeMap<(u64, String), BTreeMap<String, Vec<String>>> = BTreeMap::new();
 
     //println!("{}","Foreground Wait Events");
-    make_notes!(&logfile_name, false, "{}\n","Foreground Wait Events");
+    make_notes!(&logfile_name, false, 2, "\n{}\n","Foreground Wait Events".yellow());
+    let mut top_fg_events: Vec<TopForegroundWaitEvents> = Vec::new();
+    
     for (key, yv) in &y_vals_events_sorted {
+        let mut event_data = TopForegroundWaitEvents::default();
+
         let event_trace = Scatter::new(x_vals.clone(), yv.clone())
                                                         .mode(Mode::LinesText)
                                                         .name(key.1.clone())
@@ -2185,13 +2764,13 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         /* Correlation calc */
         let corr: f64 = pearson_correlation_2v(&y_vals_dbtime, &yv);
         // Print Correlation considered high enough to mark it
-        make_notes!(&logfile_name, args.quiet, "\t{: >5}\n", &event_name);
+        make_notes!(&logfile_name, args.quiet, 3, "\t{: >5}\n", &event_name.bold());
 
         let correlation_info: String = format!("--- Correlation with DB Time: {:.2}", &corr);
         if corr >= 0.4 || corr <= -0.4 { 
-            make_notes!(&logfile_name, args.quiet, "{: >50}", correlation_info.red().bold());
+            make_notes!(&logfile_name, args.quiet, 0, "{: >50}", correlation_info.red().bold());
         } else {
-            make_notes!(&logfile_name, args.quiet, "{: >50}", correlation_info);
+            make_notes!(&logfile_name, args.quiet, 0, "{: >50}", correlation_info);
         }
 
         /* STDDEV/AVG Calculations */
@@ -2211,21 +2790,34 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         let stddev_wait_per_exec_ms: f64 = (stddev_exec_s / stddev_exec_n) * 1000.0;
         // Print calculations:
         
-        make_notes!(&logfile_name, args.quiet, "\t\tMarked as TOP in {:.2}% of probes\n",  (x_n.len() as f64 / x_vals.len() as f64 )* 100.0);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG PCT of DB Time: {:>15.2}% \tSTDDEV PCT of DB Time: {:>15.2}%\n", &avg_exec_t, &stddev_exec_t);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG Wait Time (s): {:>16.2} \tSTDDEV Wait Time (s): {:>16.2}\n", &avg_exec_s, &stddev_exec_s);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG No. executions: {:>15.2} \tSTDDEV No. executions: {:>15.2}\n", &avg_exec_n, &stddev_exec_n);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG wait/exec (ms): {:>15.2} \tSTDDEV wait/exec (ms): {:>15.2}\n\n", &avg_wait_per_exec_ms, &stddev_wait_per_exec_ms);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\tMarked as TOP in {:.2}% of probes\n",  (x_n.len() as f64 / x_vals.len() as f64 )* 100.0);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG PCT of DB Time: {:>15.2}% \tSTDDEV PCT of DB Time: {:>15.2}%\n", &avg_exec_t, &stddev_exec_t);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG Wait Time (s): {:>16.2} \tSTDDEV Wait Time (s): {:>16.2}\n", &avg_exec_s, &stddev_exec_s);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG No. executions: {:>15.2} \tSTDDEV No. executions: {:>15.2}\n", &avg_exec_n, &stddev_exec_n);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG wait/exec (ms): {:>15.2} \tSTDDEV wait/exec (ms): {:>15.2}\n\n", &avg_wait_per_exec_ms, &stddev_wait_per_exec_ms);
         
+        event_data.event_name = event_name.clone();
+        event_data.correlation_with_db_time = corr;
+        event_data.marked_as_top_in_pct_of_probes = (x_n.len() as f64 / x_vals.len() as f64 )* 100.0;
+        event_data.avg_pct_of_dbtime = avg_exec_t; 
+        event_data.stddev_pct_of_db_time = stddev_exec_t;
+        event_data.avg_wait_time_s = avg_exec_s;
+        event_data.stddev_wait_time_s = stddev_exec_s;
+        event_data.avg_number_of_executions = avg_exec_n;
+        event_data.stddev_number_of_executions = stddev_exec_n;
+        event_data.avg_wait_for_execution_ms = avg_wait_per_exec_ms;
+        event_data.stddev_wait_for_execution_ms = stddev_wait_per_exec_ms;
+
         /* Print table of detected anomalies for given event_name (key.1)*/
         let safe_event_name: String = event_name.replace("/", "_").replace(" ", "_").replace(":","").replace("*","_");
         let anomaly_id = format!("mad_fg_{}", &safe_event_name);
         let mut anomalies_flag: bool = false;
 
         if let Some(anomalies) = top_stats.event_anomalies_mad.get(&key.1) {
-            let anomalies_detection_msg = "Detected anomalies using Median Absolute Deviation on the following dates:".to_string().bold().underline().blue();
+            let mut mad_events: MadAnomaliesEvents = MadAnomaliesEvents::default();
+            let anomalies_detection_msg = "Detected anomalies using Median Absolute Deviation on the following dates:".to_string().red();
             anomalies_flag = true;
-            make_notes!(&logfile_name, args.quiet, "\t\t{}\n",  anomalies_detection_msg);
+            make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n",  anomalies_detection_msg);
             
             let mut table = Table::new();
             table.set_titles(Row::new(vec![
@@ -2254,6 +2846,14 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 let c_avg_wait_ms = Cell::new(&format!("{:.3}", avg_wait_ms));
                 let c_dbtime_pct = Cell::new(&format!("{:.2}", wait_event.pct_dbtime));
 
+                mad_events.anomaly_date = a.0.clone();
+                mad_events.mad_score = a.1;
+                mad_events.total_wait_s = wait_event.total_wait_time_s;
+                mad_events.number_of_waits = wait_event.waits;
+                mad_events.avg_wait_time_for_execution_ms = avg_wait_ms;
+                mad_events.pct_of_db_time = wait_event.pct_dbtime;
+                event_data.median_absolute_deviation_anomalies.push(mad_events.clone());
+
                 table.add_row(Row::new(vec![c_event.clone(),c_mad_score.clone(),c_total_wait_s.clone(),c_waits.clone(), c_avg_wait_ms.clone(),c_dbtime_pct.clone()]));
                 table_anomalies.push_str(&format!(
                     r#"<tr>
@@ -2278,20 +2878,22 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 anomalies_join(&mut anomalies_summary, (begin_snap_id, a.0.clone()),"EVENT", &key.1);
             }
             for table_line in table.to_string().lines() {
-                make_notes!(&logfile_name, args.quiet, "\t\t{}\n", table_line);
+                make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n", table_line);
             }
         } else {
             let no_anomalies_txt = format!("\t\tNo anomalies detected based on MAD threshold: {}\n", args.mad_threshold);
             anomalies_flag = false;
-            make_notes!(&logfile_name, args.quiet, "{}", no_anomalies_txt.green().italic());
+            make_notes!(&logfile_name, args.quiet, 0, "{}", no_anomalies_txt.green().italic());
         }
-        make_notes!(&logfile_name, args.quiet,"\n");
+        make_notes!(&logfile_name, args.quiet, 0,"\n");
+
+        top_fg_events.push(event_data);
         
         /* FGEVENTS - Generate a row for the Main HTML table */
         table_events.push_str(&format!(
             r#"
             <tr>
-                <td><a href="fg_{}.html" target="_blank" class="nav-link" style="font-weight: bold">{}</a></td>
+                <td><a href="fg/fg_{}.html" target="_blank" class="nav-link" style="font-weight: bold">{}</a></td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
@@ -2376,8 +2978,12 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     );
 
     //println!("{}","Background Wait Events");
-    make_notes!(&logfile_name, false, "{}\n","Background Wait Events");
+    make_notes!(&logfile_name, false, 2, "{}\n","Background Wait Events".yellow());
+    let mut top_bg_events: Vec<TopBackgroundWaitEvents> = Vec::new();
+
     for (key, yv) in &y_vals_bgevents_sorted {
+        let mut event_data = TopBackgroundWaitEvents::default();
+
         let event_name: String = key.1.clone();
         /* Correlation calc */
         let corr: f64 = pearson_correlation_2v(&y_vals_dbtime, &yv);
@@ -2399,28 +3005,44 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         let stddev_wait_per_exec_ms: f64 = (stddev_exec_s / stddev_exec_n) * 1000.0;
 
         //Print calculations
-        make_notes!(&logfile_name, args.quiet, "\t{: >5}\n", &event_name);
+        make_notes!(&logfile_name, args.quiet, 3, "\t{: >5}\n", &event_name.bold());
 
         let correlation_info: String = format!("--- Correlation with DB Time: {:.2}", &corr);
         if corr >= 0.4 || corr <= -0.4 { 
-            make_notes!(&logfile_name, args.quiet, "{: >50}", correlation_info.red().bold());
+            make_notes!(&logfile_name, args.quiet, 0, "{: >50}", correlation_info.red().bold());
         } else {
-            make_notes!(&logfile_name, args.quiet, "{: >50}", correlation_info);
+            make_notes!(&logfile_name, args.quiet, 0, "{: >50}", correlation_info);
         }
-        make_notes!(&logfile_name, args.quiet, "\t\tMarked as TOP in {:.2}% of probes\n",  (x_n.len() as f64 / x_vals.len() as f64 )* 100.0);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG PCT of DB Time: {:>15.2}% \tSTDDEV PCT of DB Time: {:>15.2}%\n", &avg_exec_t, &stddev_exec_t);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG Wait Time (s): {:>16.2} \tSTDDEV Wait Time (s): {:>16.2}\n", &avg_exec_s, &stddev_exec_s);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG No. executions: {:>15.2} \tSTDDEV No. executions: {:>15.2}\n", &avg_exec_n, &stddev_exec_n);
-        make_notes!(&logfile_name, args.quiet, "\t\t--- AVG wait/exec (ms): {:>15.2} \tSTDDEV wait/exec (ms): {:>15.2}\n\n", &avg_wait_per_exec_ms, &stddev_wait_per_exec_ms);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\tMarked as TOP in {:.2}% of probes\n",  (x_n.len() as f64 / x_vals.len() as f64 )* 100.0);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG PCT of DB Time: {:>15.2}% \tSTDDEV PCT of DB Time: {:>15.2}%\n", &avg_exec_t, &stddev_exec_t);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG Wait Time (s): {:>16.2} \tSTDDEV Wait Time (s): {:>16.2}\n", &avg_exec_s, &stddev_exec_s);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG No. executions: {:>15.2} \tSTDDEV No. executions: {:>15.2}\n", &avg_exec_n, &stddev_exec_n);
+        make_notes!(&logfile_name, args.quiet, 0, "\t\t--- AVG wait/exec (ms): {:>15.2} \tSTDDEV wait/exec (ms): {:>15.2}\n\n", &avg_wait_per_exec_ms, &stddev_wait_per_exec_ms);
+        
+        event_data.event_name = event_name.clone();
+        event_data.correlation_with_db_time = corr;
+        event_data.marked_as_top_in_pct_of_probes = (x_n.len() as f64 / x_vals.len() as f64 )* 100.0;
+        event_data.avg_pct_of_dbtime = avg_exec_t;
+        event_data.stddev_pct_of_db_time = stddev_exec_t;
+        event_data.avg_wait_time_s = avg_exec_s;
+        event_data.stddev_wait_time_s = stddev_exec_s;
+        event_data.avg_number_of_executions = avg_exec_n;
+        event_data.stddev_number_of_executions = stddev_exec_n;
+        event_data.avg_wait_for_execution_ms = avg_wait_per_exec_ms;
+        event_data.stddev_wait_for_execution_ms = stddev_wait_per_exec_ms;
+
+        
          /* Print table of detected anomalies for given event_name (key.1)*/
         let safe_event_name: String = event_name.replace("/", "_").replace(" ", "_").replace(":","").replace("*","_");
         let anomaly_id = format!("mad_bg_{}", &safe_event_name);
         let mut anomalies_flag: bool = false;
 
         if let Some(anomalies) = top_stats.bgevent_anomalies_mad.get(&key.1) {
-            let anomalies_detection_msg = "Detected anomalies using Median Absolute Deviation on the following dates:".to_string().bold().underline().blue();
+            let mut mad_events: MadAnomaliesEvents = MadAnomaliesEvents::default();
+
+            let anomalies_detection_msg = "Detected anomalies using Median Absolute Deviation on the following dates:".to_string().red();
             anomalies_flag = true;
-            make_notes!(&logfile_name, args.quiet, "\t\t{}\n",  anomalies_detection_msg);
+            make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n",  anomalies_detection_msg);
 
             let mut table = Table::new();
             table.set_titles(Row::new(vec![
@@ -2448,6 +3070,15 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 let c_avg_wait_ms = Cell::new(&format!("{:.3}", wait_event.total_wait_time_s/(wait_event.waits as f64)*1000.0));
                 let c_dbtime_pct = Cell::new(&format!("{:.2}", wait_event.pct_dbtime));
 
+                mad_events.anomaly_date = a.0.clone();
+                mad_events.mad_score = a.1;
+                mad_events.total_wait_s = wait_event.total_wait_time_s;
+                mad_events.number_of_waits = wait_event.waits;
+                mad_events.avg_wait_time_for_execution_ms = wait_event.total_wait_time_s/(wait_event.waits as f64)*1000.0;
+                mad_events.pct_of_db_time = wait_event.pct_dbtime;
+                event_data.median_absolute_deviation_anomalies.push(mad_events.clone());
+                
+                
                 table.add_row(Row::new(vec![c_event.clone(),c_mad_score.clone(),c_total_wait_s.clone(),c_waits.clone(), c_avg_wait_ms.clone(), c_dbtime_pct.clone()]));
                 table_anomalies.push_str(&format!(
                     r#"<tr>
@@ -2473,20 +3104,22 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
 
             }
             for table_line in table.to_string().lines() {
-                make_notes!(&logfile_name, args.quiet, "\t\t{}\n", table_line);
+                make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n", table_line);
             }
         } else {
             let no_anomalies_txt = format!("\t\tNo anomalies detected based on MAD threshold: {}\n", args.mad_threshold);
             anomalies_flag = false;
-            make_notes!(&logfile_name, args.quiet, "{}", no_anomalies_txt.green().italic());
+            make_notes!(&logfile_name, args.quiet, 0, "{}", no_anomalies_txt.green().italic());
         }
-        make_notes!(&logfile_name, args.quiet,"\n");
+        make_notes!(&logfile_name, args.quiet, 0,"\n");
+
+        top_bg_events.push(event_data);
         
         /* BGEVENTS - Generate a row for the HTML table */
         table_bgevents.push_str(&format!(
             r#"
             <tr>
-                <td><a href="bg_{}.html" target="_blank" class="nav-link" style="font-weight: bold">{}</a></td>
+                <td><a href="bg/bg_{}.html" target="_blank" class="nav-link" style="font-weight: bold">{}</a></td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
@@ -2569,12 +3202,19 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         table_bgevents
     );
 
+    report_for_ai.top_foreground_wait_events = top_fg_events.clone();
+    report_for_ai.top_background_wait_events = top_bg_events.clone();
+
     //println!("{}","SQLs");
-    make_notes!(&logfile_name, false, "TOP SQLs by Elapsed time (SQL_ID or OLD_HASH_VALUE presented)");
+    make_notes!(&logfile_name, false, 2, "{}", "TOP SQLs by Elapsed time".yellow());
 
     let mut ash_event_sql_map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut crr_event_sql_map: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
+    let mut top_sqls: Vec<TopSQLsByElapsedTime> = Vec::new();
     for (key,yv) in y_vals_sqls_sorted {
+        let mut sql_data = TopSQLsByElapsedTime::default();
+
         let sql_trace = Scatter::new(x_vals.clone(), yv.clone())
                                                         .mode(Mode::LinesText)
                                                         .name(key.1.clone())
@@ -2583,13 +3223,13 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         plot_main.add_trace(sql_trace);
         
         let sql_id: String = key.1.clone();
+        let sql_id_disp = format!("SQL_ID: {}", key.1.clone());
         /* Correlation calc */
         let corr: f64 = pearson_correlation_2v(&y_vals_dbtime, &yv);
         // Print Correlation considered high enough to mark it
         let top_sections: HashMap<String, f64> = report_top_sql_sections(&sql_id, &collection.awrs);
-        make_notes!(&logfile_name, args.quiet,
-            "\n\t{: >5} \t {}\n",
-            &sql_id.bold(),
+        make_notes!(&logfile_name, args.quiet, 3, "\n\t{: >5}", &sql_id_disp.bold());
+        make_notes!(&logfile_name, args.quiet, 0, "\n\t {}\n",
             format!("Other Top Sections: {}",
                 &top_sections.iter().map(|(key, value)| format!("{} [{:.2}%]", key, value)).collect::<Vec<String>>().join(" | ")
             ).italic(),
@@ -2597,20 +3237,20 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
 
         let correlation_info: String = format!("--- Correlation with DB Time: {:.2}", &corr);
         if corr >= 0.4 || corr <= -0.4 { 
-            make_notes!(&logfile_name, args.quiet, "{: >49}", correlation_info.red().bold());
+            make_notes!(&logfile_name, args.quiet, 0, "{: >49}", correlation_info.red().bold());
         } else {
-            make_notes!(&logfile_name, args.quiet, "{: >49}", correlation_info);
+            make_notes!(&logfile_name, args.quiet, 0, "{: >49}", correlation_info);
         }
 
         /* Calculate STDDEV and AVG for sqls executions number */
         let x: Vec<f64> = y_vals_sqls_exec_n.get(&key.1.clone()).unwrap().clone();
-        let avg_exec_n: f64 = mean(x.clone()).unwrap();
-        let stddev_exec_n: f64 = std_deviation(x).unwrap();
+        let avg_exec_n: f64 = mean(x.clone()).unwrap_or(0.0);
+        let stddev_exec_n: f64 = std_deviation(x).unwrap_or(0.0);
 
         /* Calculate STDDEV and AVG for sqls time per execution */
         let x: Vec<f64> = y_vals_sqls_exec_t.get(&key.1.clone()).unwrap().clone();
-        let avg_exec_t: f64 = mean(x.clone()).unwrap();
-        let stddev_exec_t: f64 = std_deviation(x.clone()).unwrap();
+        let avg_exec_t: f64 = mean(x.clone()).unwrap_or(0.0);
+        let stddev_exec_t: f64 = std_deviation(x.clone()).unwrap_or(0.0);
 
         /* Calculate STDDEV and AVG for sqls CPU time per execution */
         let x_c: Vec<f64> = collection.awrs.iter()
@@ -2636,32 +3276,61 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
 
         let avg_exec_cpu: f64 = mean(x_s.clone()).unwrap_or(0.0);
         let stddev_exec_cpu: f64 = std_deviation(x_s).unwrap_or(0.0);
-
-        let sql_type = collection.awrs.iter()
-                                                .flat_map(|a| a.sql_elapsed_time.clone())
-                                                .find(|s| s.sql_id == sql_id)
-                                                .unwrap().sql_type;
-
-        make_notes!(&logfile_name, args.quiet, "{: >24}{:.2}% of probes\n", "Marked as TOP in ", (x.len() as f64 / x_vals.len() as f64 )* 100.0);
-        make_notes!(&logfile_name, args.quiet, "{: >35} {: <16.2} \tSTDDEV Ela by Exec: {:.2}\n", "--- AVG Ela by Exec:", avg_exec_t, stddev_exec_t);
-        make_notes!(&logfile_name, args.quiet, "{: >35} {: <16.2} \tSTDDEV CPU by Exec: {:.2}\n", "--- AVG CPU by Exec:", avg_exec_t_cpu, stddev_exec_t_cpu);
-        make_notes!(&logfile_name, args.quiet, "{: >36} {: <16.2} \tSTDDEV Ela Time   : {:.2}\n", "--- AVG Ela Time (s):", avg_exec_s, stddev_exec_s);
-        make_notes!(&logfile_name, args.quiet, "{: >36} {: <16.2} \tSTDDEV CPU Time   : {:.2}\n", "--- AVG CPU Time (s):", avg_exec_cpu, stddev_exec_cpu);
-        make_notes!(&logfile_name, args.quiet, "{: >38} {: <14.2} \tSTDDEV No. executions:  {:.2}\n", "--- AVG No. executions:", avg_exec_n, stddev_exec_n);
-        make_notes!(&logfile_name, args.quiet, "{: >23} {} \n", "MODULE: ", top_stats.sqls.get(&sql_id).unwrap().blue());
-        if !sql_type.is_empty() {
-            make_notes!(&logfile_name, args.quiet, "{: >23} {} \n", "  TYPE: ", sql_type.green());
+        let mut sql_type = "?".to_string();
+        let s = collection.awrs.iter()
+                                .flat_map(|a| a.sql_elapsed_time.clone())
+                                .find(|s| s.sql_id == sql_id);
+        if s.is_some() {
+            sql_type = s.unwrap().sql_type;
         }
 
-        
+        make_notes!(&logfile_name, args.quiet, 0, "{: >24}{:.2}% of probes\n", "Marked as TOP in ", (x.len() as f64 / x_vals.len() as f64 )* 100.0);
+        make_notes!(&logfile_name, args.quiet, 0, "{: >35} {: <16.2} \tSTDDEV Ela by Exec: {:.2}\n", "--- AVG Ela by Exec:", avg_exec_t, stddev_exec_t);
+        make_notes!(&logfile_name, args.quiet, 0, "{: >35} {: <16.2} \tSTDDEV CPU by Exec: {:.2}\n", "--- AVG CPU by Exec:", avg_exec_t_cpu, stddev_exec_t_cpu);
+        make_notes!(&logfile_name, args.quiet, 0, "{: >36} {: <16.2} \tSTDDEV Ela Time   : {:.2}\n", "--- AVG Ela Time (s):", avg_exec_s, stddev_exec_s);
+        make_notes!(&logfile_name, args.quiet, 0, "{: >36} {: <16.2} \tSTDDEV CPU Time   : {:.2}\n", "--- AVG CPU Time (s):", avg_exec_cpu, stddev_exec_cpu);
+        make_notes!(&logfile_name, args.quiet, 0, "{: >38} {: <14.2} \tSTDDEV No. executions:  {:.2}\n", "--- AVG No. executions:", avg_exec_n, stddev_exec_n);
+        make_notes!(&logfile_name, args.quiet, 0, "{: >23} {} \n", "MODULE: ", top_stats.sqls.get(&sql_id).unwrap().blue());
+        if !sql_type.is_empty() {
+            make_notes!(&logfile_name, args.quiet, 0, "{: >23} {}\n\n", "  TYPE: ", sql_type.green());
+        }
+
+        sql_data.sql_id = sql_id.clone();
+        sql_data.module = top_stats.sqls.get(&sql_id).unwrap().clone();
+        sql_data.sql_type = sql_type.clone();
+        sql_data.correlation_with_db_time = corr; 
+        sql_data.marked_as_top_in_pct_of_probes = (x.len() as f64 / x_vals.len() as f64 )* 100.0;
+        sql_data.avg_elapsed_time_by_exec = avg_exec_t;
+        sql_data.stddev_elapsed_time_by_exec = stddev_exec_t;
+        sql_data.avg_cpu_time_by_exec = avg_exec_t_cpu;
+        sql_data.stddev_cpu_time_by_exec = stddev_exec_t_cpu;
+        sql_data.avg_elapsed_time_cumulative_s = avg_exec_s;
+        sql_data.stddev_elapsed_time_cumulative_s = stddev_exec_s;
+        sql_data.avg_cpu_time_cumulative_s = avg_exec_cpu;
+        sql_data.stddev_cpu_time_cumulative_s = stddev_exec_cpu;
+        sql_data.avg_number_of_executions = avg_exec_n;
+        sql_data.stddev_number_of_executions = stddev_exec_n;
+
+        for (k,v) in &top_sections {
+            if k == "SQL CPU" {
+                sql_data.pct_of_time_sql_was_found_in_other_top_sections.sqls_by_cpu_time_pct = *v;
+            } else if k == "SQL I/O" {
+                sql_data.pct_of_time_sql_was_found_in_other_top_sections.sqls_by_user_io_pct = *v;
+            } else if k == "SQL READS" {
+                sql_data.pct_of_time_sql_was_found_in_other_top_sections.sqls_by_reads = *v;
+            } else if k == "SQL GETS" {
+                sql_data.pct_of_time_sql_was_found_in_other_top_sections.sqls_by_gets = *v;
+            }
+        }
+
         /* Print table of detected anomalies for given SQL_ID (key.1)*/
         let anomaly_id = format!("mad_{}", &sql_id);
         let mut anomalies_flag: bool = false;
 
         if let Some(anomalies) = top_stats.sql_elapsed_time_anomalies_mad.get(&key.1) {
-            let anomalies_detection_msg = "Detected anomalies using Median Absolute Deviation on the following dates:".to_string().bold().underline().blue();
+            let anomalies_detection_msg = "Detected anomalies using Median Absolute Deviation on the following dates:".to_string().red();
             anomalies_flag = true;
-            make_notes!(&logfile_name, args.quiet, "\t\t{}\n",  anomalies_detection_msg);
+            make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n",  anomalies_detection_msg);
 
             let mut table = Table::new();
             table.set_titles(Row::new(vec![
@@ -2673,6 +3342,8 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             ]));
 
             for (i,a) in anomalies.iter().enumerate() {
+                let mut mad_sql = MadAnomaliesSQL::default();
+
                 let c_event = Cell::new(&a.0);
                 
                 let c_mad_score: Cell = Cell::new(&format!("{:.3}", a.1));
@@ -2688,6 +3359,15 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 let c_elapsed_time_exec = Cell::new(&format!("{:.3}", sql_id.elpased_time_exec_s));
 
                 table.add_row(Row::new(vec![c_event.clone(),c_mad_score.clone(),c_elapsed_time.clone(), c_executions.clone(), c_elapsed_time_exec.clone()]));
+                
+                mad_sql.anomaly_date = a.0.clone();
+                mad_sql.mad_score= a.1;
+                mad_sql.elapsed_time_cumulative_s = sql_id.elapsed_time_s;
+                mad_sql.number_of_executions = sql_id.executions;
+                mad_sql.avg_exec_time_for_execution = sql_id.elpased_time_exec_s;
+                
+                sql_data.median_absolute_deviation_anomalies.push(mad_sql.clone());
+
                 table_anomalies.push_str(&format!(
                     r#"<tr>
                         <td>{}</td>
@@ -2710,20 +3390,21 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                 anomalies_join(&mut anomalies_summary, (begin_snap_id, a.0.clone()),"SQL", &key.1);
             }
             for table_line in table.to_string().lines() {
-                make_notes!(&logfile_name, args.quiet, "\t\t{}\n", table_line);
+                make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n", table_line);
             }
+            
         } else {
             let no_anomalies_txt = format!("\t\tNo anomalies detected based on MAD threshold: {}\n", args.mad_threshold);
             anomalies_flag = false;
-            make_notes!(&logfile_name, args.quiet, "{}", no_anomalies_txt.green().italic());
+            make_notes!(&logfile_name, args.quiet, 0, "{}", no_anomalies_txt.green().italic());
         }
-        make_notes!(&logfile_name, args.quiet,"\n");
-        
+        make_notes!(&logfile_name, args.quiet, 0,"\n");
+
         /* SQLs - Generate a row for the HTML table */
         table_sqls.push_str(&format!(
             r#"
             <tr>
-                <td><a href="sqlid_{}.html" target="_blank" class="nav-link" style="font-weight: bold">{}</a></td>
+                <td><a href="sqlid/sqlid_{}.html" target="_blank" class="nav-link" style="font-weight: bold">{}</a></td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
                 <td>{:.2}</td>
@@ -2791,11 +3472,12 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         let mut found_strong_events: bool = false;
 
         for (key,ev) in &y_vals_events_sorted {
+            let mut corr_events = WaitEventsWithStrongCorrelation::default();
             let crr = pearson_correlation_2v(&yv, &ev);
             let corr_text = format!("{: >32} | {: <32} : {:.2}", "+".to_string(), key.1.clone(), crr);
             if crr >= 0.333 || crr <= - 0.333 { //Correlation considered high enough to mark it
                 sql_corr_txt.push(format!(r#"<span style="color:red; font-weight:bold;">{}</span>"#, corr_text));
-                //make_notes!(&logfile_name, args.quiet, "{}\n", corr_text.red().bold());
+                //make_notes!(&logfile_name, args.quiet, 0, "{}\n", corr_text.red().bold());
                 let c_event_name = Cell::new(&key.1);
                 let c_corr_factor = Cell::new(&format!("{:.2}", crr));
                  table.add_row(Row::new(vec![
@@ -2803,14 +3485,18 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                         c_corr_factor,
                  ]));
                  found_strong_events = true;
+                 crr_event_sql_map.entry(key.1.clone()).or_insert_with(HashMap::new).insert(sql_id.clone(), crr);
+                 corr_events.event_name=key.1.clone();
+                 corr_events.correlation_value = crr;
+                 sql_data.wait_events_with_strong_pearson_correlation.push(corr_events);
             }
         }
         
         if found_strong_events {
             let sql_corr_txt_header = "\t\tWait events with strong Pearson correlation coefficient factor.\n".to_string();
-            make_notes!(&logfile_name, args.quiet, "{}", sql_corr_txt_header.bold().blue());
+            make_notes!(&logfile_name, args.quiet, 0, "{}", sql_corr_txt_header.bold().blue());
             for table_line in table.to_string().lines() {
-                make_notes!(&logfile_name, args.quiet, "\t\t{}\n", table_line);
+                make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n", table_line);
             }
         }
         
@@ -2828,8 +3514,9 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
 
         let mut ash_events_html = String::new();
         if !ash_events.is_empty() {
+            let mut sql_ash = WaitEventsFromASH::default();
             let sql_ash_txt_header = "Wait events actually found in ASH section of AWR reports:\n".to_string();
-            make_notes!(&logfile_name, args.quiet, "\n\n\t\t{}", sql_ash_txt_header.bold().blue());
+            make_notes!(&logfile_name, args.quiet, 0, "\n\t\t{}", sql_ash_txt_header.bold().blue());
 
             
             let mut table = Table::new();
@@ -2854,10 +3541,16 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                         c_stddev_pct,
                         c_count
                  ]));
+
+                sql_ash.event_name = evname.clone();
+                sql_ash.avg_pct_of_dbtime_in_sql = avg_pct;
+                sql_ash.stddev_pct_of_dbtime_in_sql = stddev_pct;
+                sql_ash.count=pctvalues.len() as u64;
+                sql_data.wait_events_found_in_ash_sections_for_this_sql.push(sql_ash.clone());
             }
 
             for table_line in table.to_string().lines() {
-                make_notes!(&logfile_name, args.quiet, "\t\t{}\n", table_line);
+                make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n", table_line);
             }
             
             ash_events_html = table_to_html_string(&table, &sql_ash_txt_header, &["Wait Event Name", "AVG % of DB Time in SQL", "STDDEV % of DB Time in SQL", "Count"]);
@@ -2867,6 +3560,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         if args.security_level >= 2 {
             sql_text = format!("<code><details><summary>FULL SQL TEXT</summary>{}</details></code>\n</body>",collection.sql_text.get(&sql_id).unwrap())
         }
+
         // Format the content as HTML
         let sqlid_html_content: String = format!(
             r#"<!DOCTYPE html>
@@ -2901,7 +3595,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         );
 
         // Insert this into already existing sqlid_*.html file
-        let filename: String = format!("{}/sqlid_{}.html", &html_dir,sql_id);
+        let filename: String = format!("{}/sqlid/sqlid_{}.html", &html_dir,sql_id);
         let mut sql_file: String = fs::read_to_string(&filename)
             .expect(&format!("Failed to read file: {}", filename));
         sql_file = sql_file.replace(
@@ -2911,7 +3605,11 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         if let Err(e) = fs::write(&filename, sql_file) {
             eprintln!("Error writing file {}: {}", filename, e);
         }
+
+        top_sqls.push(sql_data);
     }
+
+    report_for_ai.top_sqls_by_elapsed_time = top_sqls;
 
     let sqls_table_html: String = format!(
         r#"
@@ -2946,10 +3644,18 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     if !ash_event_sql_map.is_empty() {
         merge_ash_sqls_to_events(ash_event_sql_map, &html_dir);
     }
-    
 
+    if !crr_event_sql_map.is_empty() {
+        merge_correlated_sqls_to_events(crr_event_sql_map, &html_dir);
+    }
+
+
+    // STATISTICS Correltation to DBTime
+
+    //println!("\n{}","Statistics");
+    make_notes!(&logfile_name, false, 0, "\n");
     /* "IO Stats by Function" are goin into report */
-    make_notes!(&logfile_name, args.quiet,"\n\n{}\n",format!("IO STATS by Function - Summary").blue().underline());
+    make_notes!(&logfile_name, false, 2,"{}\n",format!("IO Statistics by Function - Summary").yellow());
     // Create the table
     let mut table_iostats = Table::new();
 
@@ -2974,11 +3680,16 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             _ => metric.to_string(), // fallback for unknown metrics
         }
     }
+
+    let mut iostat_summary: Vec<IOStatsByFunctionSummary> = Vec::new();
     // Add data rows
     for (function_name, stats) in &iostats {
         if function_name == "zMAIN"{
             continue;
         }
+        let mut iostat = IOStatsByFunctionSummary::default();
+        iostat.function_name = function_name.clone();
+
         let mut stat_metrics: Vec<String> = Vec::new();
         let mut stat_mean: Vec<String> = Vec::new();
         let mut stat_std_dev: Vec<String> = Vec::new();
@@ -2987,6 +3698,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             stat_metrics.push(format_metric_name(&metric_name));
             stat_mean.push(format!("{:.2}", mean));
             stat_std_dev.push(format!("{:.2}", std_dev));
+            iostat.statistics_summary.push(StatsSummary{statistic_name: format_metric_name(&metric_name), avg_value: *mean, stddev_value: *std_dev});
         }
         table_iostats.add_row(Row::new(vec![
             Cell::new(&function_name),
@@ -2994,89 +3706,20 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             Cell::new(&stat_mean.join("\n")),
             Cell::new(&stat_std_dev.join("\n")),
         ]));
+        iostat_summary.push(iostat);
     }
-    make_notes!(&logfile_name, args.quiet, "{}\n", table_iostats);
+    make_notes!(&logfile_name, args.quiet, 0, "{}\n", table_iostats);
 
+    make_notes!(&logfile_name, false, 2,"{}\n",format!("Latch Activity Statistics - Summary").yellow());
+    make_notes!(&logfile_name, args.quiet, 0, "{}\n", table_latch);
 
-    /* Load Profile Anomalies detection and report */
-    make_notes!(&logfile_name, args.quiet, "\nLoad Profile Anomalies detection using Median Absolute Deviation threshold: {}\n", args.mad_threshold);
-    make_notes!(&logfile_name, args.quiet, "-----------------------------------------------------------------------------------\n");
-    
-    let all_loadprofile: HashSet<String> = collection.awrs
-                                                .iter()
-                                                .flat_map(|awr| &awr.load_profile)
-                                                .map(|l| l.stat_name.clone())
-                                                .collect();
-    let profile_anomalies = detect_loadprofile_anomalies_mad(&collection.awrs, &args);
-    for l in all_loadprofile {
-        let stat_name = l.bold();
-        let per_second_v: Vec<f64>      = collection.awrs
-                                                .iter()
-                                                .flat_map(|awr| &awr.load_profile)
-                                                .filter(|lp| lp.stat_name == l)
-                                                .map(|flp| flp.per_second)
-                                                .collect();
-        let mean_per_s = mean(per_second_v).unwrap_or(0.0);
+    /******** Report Segment Statistics Summary */
+    let segstats = report_segments_summary(&collection.awrs, &args, &logfile_name, &html_dir, &mut report_for_ai);
+    /********************************************/
 
-        if let Some(anomalies) = profile_anomalies.get(&l) {
-            let mut table = Table::new();
-            table.set_titles(Row::new(vec![
-                Cell::new("Date"),
-                Cell::new("MAD Score"),
-                Cell::new("MAD Threshold"),
-                Cell::new("Per Second"),
-                Cell::new("AVG Per Second"),
-            ]));
-            
-            let anomalies_str = format!("\tAnomalies detected for \"{}\", AVG value per second is: {:.2}", stat_name, mean_per_s).red();
-            make_notes!(&logfile_name, args.quiet, "\n\n{}\n", anomalies_str);
-            for a in anomalies {
-                
-                let per_second_this_date = collection.awrs
-                                                            .iter()
-                                                            .find(|awr| awr.snap_info.begin_snap_time == a.0)
-                                                            .unwrap()
-                                                            .load_profile
-                                                            .iter()
-                                                            .find(|lp| lp.stat_name == l)
-                                                            .map(|lpf| lpf.per_second)
-                                                            .unwrap_or(0.0);
-
-                let c_date = Cell::new(&a.0);
-                let c_mad = Cell::new(&format!("{:.2}", a.1));
-                let c_per_second = Cell::new(&format!("{}",per_second_this_date));
-                let c_avg_per_second = Cell::new(&format!("{:.2}", mean_per_s));
-                let c_mad_threshold = Cell::new(&format!("{}", args.mad_threshold));
-                table.add_row(Row::new(vec![c_date, c_mad, c_mad_threshold, c_per_second, c_avg_per_second]));
-
-                let begin_snap_id = collection.awrs
-                                                    .iter()
-                                                    .find_map(|awr| {
-                                                        (awr.snap_info.begin_snap_time == a.0)
-                                                            .then(|| awr.snap_info.begin_snap_id)
-                                                    }).unwrap();
-
-                //anomalies_join(&mut anomalies_summary, (begin_snap_id, a.0.clone()), format!("LP:       {}", l.clone()));
-                anomalies_join(&mut anomalies_summary, (begin_snap_id, a.0.clone()),"LP", l.clone());
-
-            }
-            for table_line in table.to_string().lines() {
-                make_notes!(&logfile_name, args.quiet, "\t\t{}\n", table_line);
-            }
-        } else {
-            let no_anomalies_str = format!("\tNo anomalies detected for \"{}\", AVG value per second iss: {:.2}", stat_name, mean_per_s).green();
-            make_notes!(&logfile_name, args.quiet, "\n\n{}\n", no_anomalies_str);
-        }
-    }
-    /***********************************************/
-
-
-    // STATISTICS Correltation to DBTime
-
-    println!("\n{}","Statistics");
-    make_notes!(&logfile_name, args.quiet, "\n\n");
-    make_notes!(&logfile_name, args.quiet, "-----------------------------------------------------------------------------------\n");
-    make_notes!(&logfile_name, args.quiet, "Correlation of instance statatistics with DB Time for values >= 0.5 and <= -0.5\n\n\n");
+    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
+    make_notes!(&logfile_name, false, 2, "{}", "Instance Statistics: Correlation with DB Time for values >= 0.5 and <= -0.5".yellow());
+    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
     let mut sorted_correlation = report_instance_stats_cor(instance_stats, y_vals_dbtime);
     let mut stats_table_rows = String::new();
     for ((score, key), value) in sorted_correlation.iter().rev() { // Sort in descending order
@@ -3166,12 +3809,13 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     );
 
     // Write to the file
-    let stats_corr_filename: String = format!("{}/statistics_corr.html", &html_dir);
+    let stats_corr_filename: String = format!("{}/stats/statistics_corr.html", &html_dir);
     if let Err(e) = fs::write(&stats_corr_filename, table_stat_corr) {
         eprintln!("Error writing file {}: {}", stats_corr_filename, e);
     }
     for (k,v) in sorted_correlation {
-        make_notes!(&logfile_name, args.quiet, "\t{: >64} : {:.2}\n", &k.1, v);
+        make_notes!(&logfile_name, args.quiet, 0, "\t{: >64} : {:.2}\n", &k.1, v);
+        report_for_ai.instance_stats_pearson_correlation.push(InstanceStatisticCorrelation{stat_name: k.1.clone(), pearson_correlation_value: v});
     }
     /* Add information about stats anomalies to the summary */
     let stat_anomalies = detect_stats_anomalies_mad(&collection.awrs, &args);
@@ -3296,7 +3940,89 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     /********************************************************/
 
     /****************   Report anomalies summary ************/
-    println!("{}","Anomalies Summary");
+    //println!("{}","Anomalies Summary");
+    make_notes!(&logfile_name, false, 0, "\n\n");
+    make_notes!(&logfile_name, false, 1, "{}\n", "ANOMALIES".bold().green());
+     /* Load Profile Anomalies detection and report */
+    make_notes!(&logfile_name, false, 2, "\n{} {}\n", "Load Profile Anomalies detection using Median Absolute Deviation threshold:".yellow(), args.mad_threshold);
+    
+    let all_loadprofile: HashSet<String> = collection.awrs
+                                                .iter()
+                                                .flat_map(|awr| &awr.load_profile)
+                                                .map(|l| l.stat_name.clone())
+                                                .collect();
+    let profile_anomalies = detect_loadprofile_anomalies_mad(&collection.awrs, &args);
+    for l in all_loadprofile {
+        let stat_name = l.bold();
+        let per_second_v: Vec<f64>      = collection.awrs
+                                                .iter()
+                                                .flat_map(|awr| &awr.load_profile)
+                                                .filter(|lp| lp.stat_name == l)
+                                                .map(|flp| flp.per_second)
+                                                .collect();
+        let mean_per_s = mean(per_second_v).unwrap_or(0.0);
+
+        if let Some(anomalies) = profile_anomalies.get(&l) {
+            let mut table = Table::new();
+            table.set_titles(Row::new(vec![
+                Cell::new("Date"),
+                Cell::new("MAD Score"),
+                Cell::new("MAD Threshold"),
+                Cell::new("Per Second"),
+                Cell::new("AVG Per Second"),
+            ]));
+            
+            let anomalies_str = format!("\n\tAnomalies detected for \"{}\", AVG value per second is: {:.2}", stat_name, mean_per_s).red();
+            make_notes!(&logfile_name, args.quiet, 0, "{}\n", anomalies_str);
+            for a in anomalies {
+                
+                let per_second_this_date = collection.awrs
+                                                            .iter()
+                                                            .find(|awr| awr.snap_info.begin_snap_time == a.0)
+                                                            .unwrap()
+                                                            .load_profile
+                                                            .iter()
+                                                            .find(|lp| lp.stat_name == l)
+                                                            .map(|lpf| lpf.per_second)
+                                                            .unwrap_or(0.0);
+
+                let c_date = Cell::new(&a.0);
+                let c_mad = Cell::new(&format!("{:.2}", a.1));
+                let c_per_second = Cell::new(&format!("{}",per_second_this_date));
+                let c_avg_per_second = Cell::new(&format!("{:.2}", mean_per_s));
+                let c_mad_threshold = Cell::new(&format!("{}", args.mad_threshold));
+                table.add_row(Row::new(vec![c_date, c_mad, c_mad_threshold, c_per_second, c_avg_per_second]));
+
+                report_for_ai.load_profile_anomalies.push(LoadProfileAnomalies {
+                    load_profile_stat_name: l.clone(),
+                    anomaly_date: a.0.clone(),
+                    mad_score: a.1,
+                    mad_threshold: args.mad_threshold,
+                    per_second: per_second_this_date,
+                    avg_value_per_second: mean_per_s,
+                });
+
+                let begin_snap_id = collection.awrs
+                                                    .iter()
+                                                    .find_map(|awr| {
+                                                        (awr.snap_info.begin_snap_time == a.0)
+                                                            .then(|| awr.snap_info.begin_snap_id)
+                                                    }).unwrap();
+
+                //anomalies_join(&mut anomalies_summary, (begin_snap_id, a.0.clone()), format!("LP:       {}", l.clone()));
+                anomalies_join(&mut anomalies_summary, (begin_snap_id, a.0.clone()),"LP", l.clone());
+
+            }
+            for table_line in table.to_string().lines() {
+                make_notes!(&logfile_name, args.quiet, 0, "\t\t{}\n", table_line);
+            }
+        } else {
+            let no_anomalies_str = format!("\tNo anomalies detected for \"{}\", AVG value per second iss: {:.2}", stat_name, mean_per_s).green();
+            make_notes!(&logfile_name, args.quiet, 0, "\n{}\n", no_anomalies_str);
+        }
+    }
+    /***********************************************/
+    
     let anomalies_summary_html: String = format!(
         r#"
         <table id="anomalies-sum-table">
@@ -3313,8 +4039,9 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             </tbody>
         </table>
         "#,
-        report_anomalies_summary(&mut anomalies_summary, &args, &logfile_name)
+        report_anomalies_summary(&mut anomalies_summary, &args, &logfile_name, &mut report_for_ai)
     );
+    
     let mut snap_dates: Vec<String> = Vec::new();
     let mut anomaly_types: BTreeMap<String, usize> = BTreeMap::new();
     let mut heat_data: HashMap<(String, String), usize> = HashMap::new();
@@ -3658,21 +4385,14 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                     .show_grid(false),
         );
 
-    /******** Report Segment Statistics Summary */
-    let segstats = report_segments_summary(&collection.awrs, &args, &logfile_name, &html_dir);
-    /********************************************/
-    println!("{}","Generating Plots");
+
+    println!("\n{}","==== GENERATING PLOTS ====".bold().bright_cyan());
     plot_main.set_layout(layout_main);
     plot_highlight.set_layout(layout_highlight);
     plot_highlight2.set_layout(layout_highlight2);
-    // plot_main.use_local_plotly();
-    // plot_highlight.use_local_plotly();
     plot_main.write_html(fname.clone());
-    plot_highlight.write_html(format!("{}/jasmin_highlight.html", &html_dir));
-    plot_highlight2.write_html(format!("{}/jasmin_highlight2.html", &html_dir));
-    plot_highlight.write_image(format!("{}/jasmin_highlight.png", &html_dir), ImageFormat::PNG, 1024, 768, 1.0);
-    plot_highlight2.write_image(format!("{}/jasmin_highlight2.png", &html_dir), ImageFormat::PNG, 1024, 768, 1.0);
-    
+    plot_highlight.write_html(format!("{}/stats/jasmin_highlight.html", &html_dir));
+    plot_highlight2.write_html(format!("{}/stats/jasmin_highlight2.html", &html_dir));
     
     let first_snap_time: String = collection.awrs.first().unwrap().snap_info.begin_snap_time.clone();
     let last_snap_time: String = collection.awrs.last().unwrap().snap_info.end_snap_time.clone();
@@ -3923,7 +4643,9 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         document.addEventListener('DOMContentLoaded', function() {{
             toggleElement('show-iostats-button','iostat_zMAIN-html-element','iocheckbox-container');
             toggleElement('show-segstats-button',null,'segcheckbox-container');
+            toggleElement('show-insteff-button','instance-efficiency-plot','');
             toggleElement('show-lpmore-button','highlight2-html-element','');
+            toggleTable('show-latchstats-button','latchstat-table');
             const iocheckboxes = document.querySelectorAll('input[type="checkbox"][id$="-iocheckbox"]');
             iocheckboxes.forEach(checkbox => {{
                 const checkboxId = checkbox.id;
@@ -3964,30 +4686,8 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     );
     // Open plot_main HTML to inject Additional sections - Buttons, Tables, etc
     let mut plotly_html: String = fs::read_to_string(&fname)
-        .expect("Failed to read Main JAS-MIN HTML file");
-    let mut highlight_html: String = fs::read_to_string(format!("{}/jasmin_highlight.html", &html_dir))
-        .expect("Failed to read HighLight JAS-MIN HTML file");
-    let mut highlight2_html: String = fs::read_to_string(format!("{}/jasmin_highlight2.html", &html_dir))
-        .expect("Failed to read HighLight JAS-MIN HTML file");
+        .expect("Failed to read jasmin-html file");
     
-    //Prepare HighLight Section to be pasted into Main HTML file
-    highlight_html = highlight_html.replace("plotly-html-element","highlight-html-element");
-    fs::write(format!("{}/jasmin_highlight.html", &html_dir),&highlight_html);
-    highlight_html = highlight_html
-                    .lines() // Iterate over lines
-                    .skip_while(|line| !line.contains("<div id=\"highlight-html-element\"")) // Skip lines until found
-                    .take_while(|line| !line.contains("</script>")) // Keep only lines before `</script>`
-                    .collect::<Vec<&str>>() // Collect remaining lines into a Vec
-                    .join("\n"); // Convert back into a String
-    highlight2_html = highlight2_html.replace("plotly-html-element","highlight2-html-element");
-    fs::write(format!("{}/jasmin_highlight2.html", &html_dir),&highlight2_html);
-    highlight2_html = highlight2_html
-                    .lines() // Iterate over lines
-                    .skip_while(|line| !line.contains("<div id=\"highlight2-html-element\"")) // Skip lines until found
-                    .take_while(|line| !line.contains("</script>")) // Keep only lines before `</script>`
-                    .collect::<Vec<&str>>() // Collect remaining lines into a Vec
-                    .join("\n"); // Convert back into a String
-    // Inject CSS styles into Main HTML
     const STYLE_CSS: &str = include_str!("../src/style.css");
     plotly_html = plotly_html.replace(
         "<head>",
@@ -4009,7 +4709,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
             format!(
                 "<a href=\"{}\" target=\"_blank\" style=\"text-decoration: none;\">
                     <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">STATS Correlation</span><span>STATS Correlation</span></button>
-                </a>", "statistics_corr.html"
+                </a>", "stats/statistics_corr.html"
             ),
             if !args.backend_assistant.is_empty() { 
                 format!("{}","<button id=\"show-JASMINAI-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">JAS-MIN Assistant</span><span>JAS-MIN Assistant</span></button>")
@@ -4026,10 +4726,12 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     let explorer_title = "<div><h4 style=\"margin-top: 40px;margin-bottom: 0px; width: 100%; text-align: center;\">Stats Explorer</h4></div>\n";
     let insight_title = "<div><h4 style=\"margin-top: 40px;margin-bottom: 0px; width: 100%; text-align: center;\">Performance Insight</h4></div>\n";
     let explorer_button = format!(
-        "\n\t{}\t{}\n\t<div id=\"iocheckbox-container\" style=\"margin-top: 10px; display: none;\">{}\n\t</div>
+        "\n\t{}\t{}\t{}\t{}\n\t<div id=\"iocheckbox-container\" style=\"margin-top: 10px; display: none;\">{}\n\t</div>
     <div id=\"segcheckbox-container\" style=\"margin-top: 10px; display: none;\">\n{}\n\t</div>\n",
         "<button id=\"show-iostats-button\" class=\"button-JASMIN-small\" role=\"button\"><span class=\"text\">IO Stats</span><span>IO Stats</span></button>",
         "<button id=\"show-segstats-button\" class=\"button-JASMIN-small\" role=\"button\"><span class=\"text\">SEGMENTS Stats</span><span>SEGMENTS Stats</span></button>",
+        "<button id=\"show-latchstats-button\" class=\"button-JASMIN-small\" role=\"button\"><span class=\"text\">LATCH Stats</span><span>LATCH Stats</span></button>",
+        "<button id=\"show-insteff-button\" class=\"button-JASMIN-small\" role=\"button\"><span class=\"text\">INSTANCE Efficiency</span><span>INSTANCE Efficiency</span></button>",
         iostats
             .keys()
             .filter(|&func| func != "zMAIN")
@@ -4055,8 +4757,8 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
         &format!("{}{}{}\n\t\t</script>\n{}\n\t\t</script>\n\t</div>\n{}\n{}<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">",
         highlight_title, 
         "<button id=\"show-lpmore-button\" class=\"button-JASMIN-small\" role=\"button\"><span class=\"text\">LP More</span><span>LP More</span></button>",
-        highlight_html,
-        highlight2_html,
+        plot_highlight.to_inline_html(Some("highlight-html-element")),
+        plot_highlight2.to_inline_html(Some("highlight2-html-element")),
         explorer_title,
         explorer_button)
     );
@@ -4064,10 +4766,10 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     // Inject Explorer Sections into Main HTML
     for func in iostats.keys(){
         let func_name = func.replace(" ","_");
-        let mut stats_explorer_html: String = fs::read_to_string(format!("{}/iostats_{}.html", &html_dir,func_name))
+        let mut stats_explorer_html: String = fs::read_to_string(format!("{}/iostats/iostats_{}.html", &html_dir,func_name))
             .expect("Failed to read iostats file");
         stats_explorer_html = stats_explorer_html.replace("plotly-html-element",&format!("iostat_{}-html-element",func_name));
-        fs::write(format!("{}/iostats_{}.html", &html_dir,func_name),&stats_explorer_html);
+        fs::write(format!("{}/iostats/iostats_{}.html", &html_dir,func_name),&stats_explorer_html);
         stats_explorer_html = stats_explorer_html
                         .lines() // Iterate over lines
                         .skip_while(|line| !line.contains(&format!("<div id=\"iostat_{}-html-element\"",func_name))) // Skip lines until found
@@ -4081,7 +4783,7 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                     );
     }
     for func in segstats {
-        let mut stats_explorer_html: String = fs::read_to_string(format!("{}/segstats_{}.html", &html_dir,func))
+        let mut stats_explorer_html: String = fs::read_to_string(format!("{}/segstats/segstats_{}.html", &html_dir,func))
             .expect("Failed to read iostats file");
         plotly_html = plotly_html.replace(
                         "<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">", 
@@ -4089,6 +4791,18 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
                         stats_explorer_html)
                     );
     }
+
+    plotly_html = plotly_html.replace(
+        "<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">", 
+        &format!("{}\n\t\t\t\t</script><div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">",
+        fs::read_to_string(format!("{}/latches/latchstats_activity.html", &html_dir)).expect("Failed to read iostats file"))
+    );
+
+    plotly_html = plotly_html.replace(
+        "<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">", 
+        &format!("{}\n\t\t\t\t</script><div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">",
+        instance_eff_plot)
+    );
     
     plotly_html = plotly_html.replace(
         "<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">", 
@@ -4099,8 +4813,9 @@ pub fn plot_to_file(collection: AWRSCollection, fname: String, args: Args) {
     // Write the updated HTML back to the file
     fs::write(&fname, plotly_html)
         .expect("Failed to write updated Plotly HTML file");
-    println!("{}","\n==== DONE ===".bright_cyan());
+    println!("{}","\n==== DONE ===".bold().bright_cyan());
     println!("{}{}\n","JAS-MIN Report saved to: ",&fname);
 
     open::that(fname);
+    report_for_ai
 }
