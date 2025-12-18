@@ -93,7 +93,7 @@ else
     exit 1
 fi
 
-cp -v /opt/jas-min-rest-src/debug/jasmin-rest "/opt/jas-min-pkg/${PKG_FULL_NAME}/opt/jas-min/"
+cp -v /opt/jas-min-rest-src/target/debug/jasmin-rest "/opt/jas-min-pkg/${PKG_FULL_NAME}/opt/jas-min/"
 
 case "$G_TYPE" in
     deb)

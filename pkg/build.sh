@@ -36,7 +36,8 @@ esac
 mkdir -p ./tmp/
 case "$CFG_TYPE" in
     deb)
-        docker build -t jasmin-build .
+        # apt-get install docker-buildx-plugin
+        docker buildx build -t jasmin-build .
         docker run -v "$(pwd)/tmp:/opt/jas-min-pkg/" -it jasmin-build /opt/jas-min-ctl.sh "$CFG_TYPE" "$CFG_RELEASE"
         ;;
 esac
