@@ -14,12 +14,12 @@ struct AppState {
 #[derive(Deserialize)]
 struct RunParams {
     directory: Option<String>,
-    plot: Option<i32>, // 1 or 0
-    time_cpu_ratio: Option<f64>,
-    mad_threshold: Option<i32>,
-    mad_window_size: Option<i32>,
-    security_level: Option<i32>,
-    parallelism: Option<i32>,
+    plot: Option<String>, // 1 or 0
+    time_cpu_ratio: Option<String>,
+    mad_threshold: Option<String>,
+    mad_window_size: Option<String>,
+    security_level: Option<String>,
+    parallel: Option<String>,
 }
 
 #[get("/jas-min/status")]
