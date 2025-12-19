@@ -13,8 +13,13 @@ struct AppState {
 
 #[derive(Deserialize)]
 struct RunParams {
-    param1: Option<String>,
-    param2: Option<String>,
+    directory: Option<String>,
+    plot: Option<i32>, // 1 or 0
+    time_cpu_ratio: Option<f64>,
+    mad_threshold: Option<i32>,
+    mad_window_size: Option<i32>,
+    security_level: Option<i32>,
+    parallelism: Option<i32>,
 }
 
 #[get("/jas-min/status")]
@@ -38,8 +43,16 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
     }
 
     let mut cmd = Command::new(BINARY_PATH);
-    if let Some(ref v) = query.param1 { cmd.arg("--param1").arg(v); }
-    if let Some(ref v) = query.param2 { cmd.arg("--param2").arg(v); }
+    if let Some(ref v) = query.directory { cmd.arg("--directory").arg(v); }
+    if let Some(ref v) = query.plot { cmd.arg("--plot").arg(v); }
+    if let Some(ref v) = query.time_cpu_ratio { cmd.arg("--time-cpu-ratio").arg(v); }
+    if let Some(ref v) = query.mad_threshold { cmd.arg("--mad-threshold").arg(v); }
+    if let Some(ref v) = query.mad_window_size { cmd.arg("--mad-window-size").arg(v); }
+    if let Some(ref v) = query.parallel { cmd.arg("--parallel").arg(v); }
+    if let Some(ref v) = query.security_level { cmd.arg("--security-level").arg(v); }
+
+    println!("{:?}", cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
+
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
     let state = data.get_ref().clone();
