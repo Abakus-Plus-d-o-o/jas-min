@@ -1,5 +1,7 @@
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use serde::Deserialize;
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -42,6 +44,36 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
         *is_running = true;
     }
 
+    // Resolve directory to one folder higher
+    let resolved_dir = if let Some(ref dir) = query.directory {
+        PathBuf::from(dir).parent().unwrap_or(PathBuf::from(dir).as_path()).to_path_buf()
+    } else {
+        PathBuf::from(".")
+    };
+
+    // Create output.log file in the resolved directory
+    let log_path = resolved_dir.join("output.log");
+    let log_file = match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            *data.is_running.lock().await = false;
+            return HttpResponse::InternalServerError().body(format!("error opening log file: {}", e));
+        }
+    };
+
+    let stdout_file = match log_file.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            *data.is_running.lock().await = false;
+            return HttpResponse::InternalServerError().body(format!("error cloning log file: {}", e));
+        }
+    };
+
     let mut cmd = Command::new(BINARY_PATH);
     if let Some(ref v) = query.directory { cmd.arg("--directory").arg(v); }
     if let Some(ref v) = query.plot { cmd.arg("--plot").arg(v); }
@@ -51,9 +83,9 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
     if let Some(ref v) = query.parallel { cmd.arg("--parallel").arg(v); }
     if let Some(ref v) = query.security_level { cmd.arg("--security-level").arg(v); }
 
-    println!("{:?}", cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
+    println!("Running: {:?}", cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
 
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdout(Stdio::from(stdout_file)).stderr(Stdio::from(log_file));
 
     let state = data.get_ref().clone();
 
@@ -75,7 +107,7 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let state = Arc::new(AppState { is_running: Mutex::new(false) });
-    println!("JAS-MIN Rest running at http://0.0.0.0:8080");
+    println!("JAS-MIN Rest running at http://0.0.0.0:8080/");
 
     HttpServer::new(move || {
         App::new()
