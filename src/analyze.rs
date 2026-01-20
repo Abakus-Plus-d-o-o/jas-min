@@ -1,4 +1,5 @@
 use crate::awr::{AWRSCollection, HostCPU, IOStats, LoadProfile, SQLCPUTime, SQLGets, SQLIOTime, SQLReads, SegmentStats, WaitEvents, AWR, GetStats};
+use crate::staticdata::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +32,37 @@ use prettytable::{Table, Row, Cell, format, Attr};
 use rayon::prelude::*;
 
 use crate::tools::*;
-use crate::reasonings::{StatisticsDescription,TopPeaksSelected,MadAnomaliesEvents,MadAnomaliesSQL,TopForegroundWaitEvents,TopBackgroundWaitEvents,PctOfTimesThisSQLFoundInOtherTopSections,WaitEventsWithStrongCorrelation,WaitEventsFromASH,TopSQLsByElapsedTime,StatsSummary,IOStatsByFunctionSummary,LatchActivitySummary,Top10SegmentStats,InstanceStatisticCorrelation,LoadProfileAnomalies,AnomalyDescription,AnomlyCluster,ReportForAI,AppState};
+use crate::reasonings::{StatisticsDescription,
+                        TopPeaksSelected,
+                        MadAnomaliesEvents,
+                        MadAnomaliesSQL,
+                        TopForegroundWaitEvents,
+                        TopBackgroundWaitEvents,
+                        PctOfTimesThisSQLFoundInOtherTopSections,
+                        WaitEventsWithStrongCorrelation,
+                        WaitEventsFromASH,
+                        TopSQLsByElapsedTime,
+                        StatsSummary,
+                        IOStatsByFunctionSummary,
+                        LatchActivitySummary,
+                        Top10SegmentStats,
+                        InstanceStatisticCorrelation,
+                        LoadProfileAnomalies,
+                        AnomalyDescription,
+                        AnomlyCluster,
+                        ReportForAI,
+                        AppState,
+                        GradientSettings,
+                        GradientTopItem,
+                        DbTimeGradientSection};
+
+use crate::gradient::*;
+use crate::gradient::{EventSeriesMap,
+                     EventScalarMap,
+                     EventImpact,
+                     DbTimeGradientResult};
+
+use crate::staticdata::StatUnitGroup;
 
 struct TopStats {
     events: BTreeMap<String, u8>,
@@ -2367,7 +2398,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
     //println!("{}","Load Profile and Top Stats");
     //I want to sort wait events by most heavy ones across the whole period
     let mut y_vals_events_sorted = BTreeMap::new();
-    for (evname, ev) in y_vals_events {
+    for (evname, ev) in y_vals_events.clone() {
         let mut wait_time = 0;
         for v in &ev {
             if *v > 0.0 {
@@ -2390,7 +2421,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
 
     //I want to sort SQL IDs by the number of times they showup in snapshots - for this purpose I'm using BTree with two index keys
     let mut y_vals_sqls_sorted = BTreeMap::new(); 
-    for (sqlid, yv) in y_vals_sqls {
+    for (sqlid, yv) in y_vals_sqls.clone() {
         let mut occuriance = 0;
         for v in &yv {
             if *v > 0.0 {
@@ -3649,10 +3680,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
         merge_correlated_sqls_to_events(crr_event_sql_map, &html_dir);
     }
 
-
     // STATISTICS Correltation to DBTime
-
-    //println!("\n{}","Statistics");
     make_notes!(&logfile_name, false, 0, "\n");
     /* "IO Stats by Function" are goin into report */
     make_notes!(&logfile_name, false, 2,"{}\n",format!("IO Statistics by Function - Summary").yellow());
@@ -3709,7 +3737,8 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
         iostat_summary.push(iostat);
     }
     make_notes!(&logfile_name, args.quiet, 0, "{}\n", table_iostats);
-
+    report_for_ai.io_stats_by_function_summary = iostat_summary;
+    
     make_notes!(&logfile_name, false, 2,"{}\n",format!("Latch Activity Statistics - Summary").yellow());
     make_notes!(&logfile_name, args.quiet, 0, "{}\n", table_latch);
 
@@ -3720,7 +3749,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
     make_notes!(&logfile_name, args.quiet, 0, "\n\n");
     make_notes!(&logfile_name, false, 2, "{}", "Instance Statistics: Correlation with DB Time for values >= 0.5 and <= -0.5".yellow());
     make_notes!(&logfile_name, args.quiet, 0, "\n\n");
-    let mut sorted_correlation = report_instance_stats_cor(instance_stats, y_vals_dbtime);
+    let mut sorted_correlation = report_instance_stats_cor(instance_stats.clone(), y_vals_dbtime.clone());
     let mut stats_table_rows = String::new();
     for ((score, key), value) in sorted_correlation.iter().rev() { // Sort in descending order
         stats_table_rows.push_str(&format!(
@@ -4809,6 +4838,226 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
         &format!("\n{}<div id=\"plotly-html-element\" class=\"plotly-graph-div\" style=\"height:100%; width:100%;\">",
         insight_title)
     );
+
+    let ridge_lambda = args.ridge_lambda;
+    let elastic_net_lambda = args.en_lambda;
+    let elastic_net_alpha = args.en_alpha;
+    let elastic_net_max_iter = args.en_max_iter;
+    let elastic_net_tol = args.en_tol;
+
+    // ---------------------------------------------------------------------
+    // Attach DB Time gradient vs wait events to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        match build_db_time_gradient_section (
+            &y_vals_dbtime,
+            &y_vals_events, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "event_wait_s"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_time_gradient_fg_wait_events = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "{}",
+                    "\n\nDB TIME GRADIENT for wait events attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_time_gradient_fg_wait_events = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nDB TIME GRADIENT skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_time_gradient_fg_wait_events {
+            print_db_time_gradient_tables(section, true, &logfile_name, &args);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Attach DB Time gradient vs instance statistic counters to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.clone().into_iter()
+                                                                         .filter(|i| classify_stat_unit_group(&i.0) == StatUnitGroup::Counter)
+                                                                         .collect();
+        match build_db_time_gradient_section (
+            &y_vals_dbtime,
+            &y_vals_statistics, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "statistic_values_counter"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_time_gradient_instance_stats_counters = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\n{}",
+                    "DB TIME GRADIENT for stats counters attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_time_gradient_instance_stats_counters = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nDB TIME GRADIENT for instance stats counters skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_time_gradient_instance_stats_counters {
+            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Attach DB Time gradient vs instance statistic volumes to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.clone().into_iter()
+                                                                         .filter(|i| classify_stat_unit_group(&i.0) == StatUnitGroup::Volume)
+                                                                         .collect();
+        match build_db_time_gradient_section (
+            &y_vals_dbtime,
+            &y_vals_statistics, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "statistic_values_volume"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_time_gradient_instance_stats_volumes = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\n{}",
+                    "DB TIME GRADIENT for stats attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_time_gradient_instance_stats_volumes = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nDB TIME GRADIENT for instance stats volumes skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_time_gradient_instance_stats_volumes {
+            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Attach DB Time gradient vs instance statistic time to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.into_iter()
+                                                                         .filter(|i| classify_stat_unit_group(&i.0) == StatUnitGroup::Time)
+                                                                         .collect();
+        match build_db_time_gradient_section (
+            &y_vals_dbtime,
+            &y_vals_statistics, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "statistic_values_time"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_time_gradient_instance_stats_time = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "{}",
+                    "\n\nDB TIME GRADIENT for stats time attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_time_gradient_instance_stats_time = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nDB TIME GRADIENT for instance stats time skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_time_gradient_instance_stats_time {
+            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Attach DB Time gradient vs sql_id/old_hash_value elapsed time to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        match build_db_time_gradient_section (
+            &y_vals_dbtime,
+            &y_vals_sqls, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "statistic_values_time"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_time_gradient_sql_elapsed_time = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\n{}",
+                    "DB TIME GRADIENT for SQL elapsed time attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_time_gradient_sql_elapsed_time = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nDB TIME GRADIENT for SQL elapsed time skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_time_gradient_sql_elapsed_time {
+            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+        }
+    }
 
     // Write the updated HTML back to the file
     fs::write(&fname, plotly_html)
