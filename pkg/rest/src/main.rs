@@ -22,6 +22,9 @@ struct RunParams {
     mad_window_size: Option<String>,
     security_level: Option<String>,
     parallel: Option<String>,
+    ai: Option<String>,          // --ai (model name)
+    ai_url: Option<String>,      // .env file
+    ai_key: Option<String>,      // .env file
 }
 
 #[get("/jas-min/status")]
@@ -82,6 +85,38 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
     if let Some(ref v) = query.mad_window_size { cmd.arg("--mad-window-size").arg(v); }
     if let Some(ref v) = query.parallel { cmd.arg("--parallel").arg(v); }
     if let Some(ref v) = query.security_level { cmd.arg("--security-level").arg(v); }
+    if let Some(ref v) = query.ai {
+
+        let mut model_name = v;
+        // Ollama
+        if v.starts_with("ollama") {
+            model_name = v.replace("ollama:", "openai:");
+
+            if let Some (ref v) = query.ai_url {
+                cmd.env("OPENAI_URL", v);
+                cmd.env("OPENAI_API_KEY", "whatever");
+            } else {
+                return HttpResponse::BadRequest().body("ollama requires --ai-url");
+            }
+        // OpenAI
+        } else if v.starts_with("openai") {
+            if let Some(ref v) = query.ai_key {
+                cmd.env("OPENAI_API_KEY", v);
+            } else {
+                return HttpResponse::BadRequest().body("openai requires --ai-key");
+            }
+        // Google
+        } else if v.starts_with("gemini") || v.starts_with("google") {
+            model_name = v.replace("gemini:", "google:");
+            if let Some(ref v) = query.ai_key {
+                cmd.env("GEMINI_API_KEY", query.ai_key);
+            } else {
+                return HttpResponse::BadRequest().body("openai requires --ai-key");
+            }
+        }
+
+        cmd.arg("--ai").arg(model_name);
+    }
 
     println!("Running: {:?}", cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
 
