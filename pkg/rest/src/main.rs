@@ -118,7 +118,9 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
         cmd.arg("--ai").arg(model_name);
     }
 
-    println!("Running: {:?}", cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
+    cmd.cwd(resolved_dir);
+
+    println!("Running (cwd={}): {:?}", resolved_dir, cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
 
     cmd.stdout(Stdio::from(stdout_file)).stderr(Stdio::from(log_file));
 
