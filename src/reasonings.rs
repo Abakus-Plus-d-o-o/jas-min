@@ -20,6 +20,10 @@ use crate::tools::*;
 use crate::awr::{AWRSCollection, HostCPU, IOStats, LoadProfile, SQLCPUTime, SQLGets, SQLIOTime, SQLReads, SegmentStats, WaitEvents, AWR};
 use std::str::FromStr;
 
+fn get_openai_url() -> String {
+    env::var("OPENAI_URL").unwrap_or_else(|_| "https://api.openai.com/".to_string())
+}
+
 #[derive(Default,Serialize, Deserialize, Debug, Clone)]
 pub struct StatisticsDescription {
     pub dbcpu_dbtime: String,
@@ -1017,7 +1021,8 @@ pub async fn openrouter(
     let load_profile = fs::read_to_string(&json_path)
         .expect(&format!("Can't open file {}", json_path));
 
-    let response_file = format!("{}_openrouter.md", logfile_name);
+    let model_name = vendor_model_lang[1].replace("/", "_");
+    let response_file = format!("{}_{}.md", logfile_name, model_name);
     let client = Client::new();
 
     // SYSTEM SPELL + ADVANCED RULES 
@@ -1058,12 +1063,12 @@ pub async fn openrouter(
         .send()
         .await?;
 
-    let _ = tx.send(());
-    let _ = spinner.await;
-
     if resp.status().is_success() {
-        println!("Processing response... (it may take a bit)");
+        println!("Waiting for OpenRouter to stream full response - please wait...");
         let body = resp.text().await?;
+
+        let _ = tx.send(());
+        let _ = spinner.await;
 
         let json: Value = serde_json::from_str(&body)?;
         let content = json["choices"][0]["message"]["content"]
@@ -1103,7 +1108,7 @@ pub async fn openai_gpt(logfile_name: &str, vendor_model_lang: Vec<&str>, token_
     let path = format!("{stem}.html_reports/stats/global_statistics.json");
     let load_profile = fs::read_to_string(&path).expect(&format!("Can't open file {}", path));
 
-    let response_file = format!("{}_gpt5.md", logfile_name);
+    let response_file = format!("{}_{}.md", logfile_name, vendor_model_lang[1]);
 
     // build spell
     let mut spell: String = format!("{} {}", SPELL, vendor_model_lang[2]);
@@ -1153,13 +1158,16 @@ pub async fn openai_gpt(logfile_name: &str, vendor_model_lang: Vec<&str>, token_
     }));
         
     // tune max_output_tokens
-    let max_output_tokens = 8192 * token_count_factor;
+    //let max_output_tokens = 8192 * token_count_factor;
 
     let payload = json!({
         "model": vendor_model_lang[1], // e.g., "gpt-5"
         "input": input_messages,
-        "max_output_tokens": 8192 * token_count_factor,
+        //"max_output_tokens": 8192 * token_count_factor,
     });
+
+    let payload_str = serde_json::to_string(&payload).unwrap();
+    println!("The whole estimated number of tokens is: {}", estimate_tokens_from_str(&payload_str));
 
     let client = Client::new();
 
@@ -1168,7 +1176,7 @@ pub async fn openai_gpt(logfile_name: &str, vendor_model_lang: Vec<&str>, token_
     let spinner = tokio::spawn(spinning_beer(rx));
 
     let response = client
-        .post("https://api.openai.com/v1/responses")
+        .post(format!("{}v1/responses", get_openai_url()))
         .bearer_auth(api_key)
         .header("Content-Type", "application/json")
         .json(&payload)
@@ -1208,7 +1216,7 @@ pub async fn openai_gpt(logfile_name: &str, vendor_model_lang: Vec<&str>, token_
         };
 
         fs::write(&response_file, full_text.as_bytes())?;
-        println!("🧠 GPT-5 response written to file: {}", &response_file);
+        println!("🧠 OpenAI response written to file: {}", &response_file);
 
         convert_md_to_html_file(&response_file, events_sqls);
 
@@ -1291,7 +1299,7 @@ impl OpenAIBackend {
             .text("purpose", "assistants");
         
         let upload_res = self.client
-            .post("https://api.openai.com/v1/files")
+            .post(format!("{}v1/files", get_openai_url()))
             .bearer_auth(&self.api_key)
             .multipart(form)
             .send()
@@ -1307,7 +1315,7 @@ impl OpenAIBackend {
 
         // === Step 3: Create thread with intro message ===
         let thread_res = self.client
-            .post("https://api.openai.com/v1/threads")
+            .post(format!("{}v1/threads", get_openai_url()))
             .bearer_auth(&self.api_key)
             .header("OpenAI-Beta", "assistants=v2")
             .json(&serde_json::json!({
@@ -1328,7 +1336,7 @@ impl OpenAIBackend {
         println!("✅ Thread created: {}", thread_id);
 
         // === Step 4: Attach file to thread ===
-        let message_url = format!("https://api.openai.com/v1/threads/{}/messages", thread_id);
+        let message_url = format!("{}v1/threads/{}/messages", get_openai_url(), thread_id);
         let file_msg_res = self.client
             .post(&message_url)
             .bearer_auth(&self.api_key)
@@ -1366,7 +1374,7 @@ impl OpenAIBackend {
         let max_attempts = 30;
         
         loop {
-            let thread_url = format!("https://api.openai.com/v1/threads/{}", thread_id);
+            let thread_url = format!("{}v1/threads/{}", get_openai_url(), thread_id);
             let thread_res = self.client
                 .get(&thread_url)
                 .bearer_auth(&self.api_key)
@@ -1413,7 +1421,7 @@ impl OpenAIBackend {
     }
 
     async fn check_vector_store_status(&self, vector_store_id: &str) -> anyhow::Result<String> {
-        let url = format!("https://api.openai.com/v1/vector_stores/{}", vector_store_id);
+        let url = format!("{}v1/vector_stores/{}", get_openai_url(), vector_store_id);
         
         let res = self.client
             .get(&url)
@@ -1436,7 +1444,7 @@ impl OpenAIBackend {
     }
 
     async fn create_message(&self, thread_id: &str, content: &str) -> anyhow::Result<()> {
-        let url = format!("https://api.openai.com/v1/threads/{}/messages", thread_id);
+        let url = format!("{}v1/threads/{}/messages", get_openai_url(), thread_id);
 
         let mut body = HashMap::new();
         body.insert("role", "user");
@@ -1453,7 +1461,7 @@ impl OpenAIBackend {
     }
 
     async fn run_assistant(&self, thread_id: &str) -> anyhow::Result<String> {
-        let url = format!("https://api.openai.com/v1/threads/{}/runs", thread_id);
+        let url = format!("{}v1/threads/{}/runs", get_openai_url(), thread_id);
 
         let mut body = HashMap::new();
         body.insert("assistant_id", &self.assistant_id);
@@ -1481,7 +1489,7 @@ impl OpenAIBackend {
 
     async fn wait_for_completion(&self, thread_id: &str, run_id: &str) -> anyhow::Result<()> {
         loop {
-            let url = format!("https://api.openai.com/v1/threads/{}/runs/{}", thread_id, run_id);
+            let url = format!("{}v1/threads/{}/runs/{}", get_openai_url(), thread_id, run_id);
             let res = self.client
                 .get(&url)
                 .bearer_auth(&self.api_key)
@@ -1507,7 +1515,7 @@ impl OpenAIBackend {
     }
 
     async fn get_reply(&self, thread_id: &str) -> anyhow::Result<String> {
-        let url = format!("https://api.openai.com/v1/threads/{}/messages", thread_id);
+        let url = format!("{}v1/threads/{}/messages", get_openai_url(), thread_id);
 
         let res = self.client
             .get(&url)
