@@ -86,8 +86,7 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
     if let Some(ref v) = query.parallel { cmd.arg("--parallel").arg(v); }
     if let Some(ref v) = query.security_level { cmd.arg("--security-level").arg(v); }
     if let Some(ref v) = query.ai {
-
-        let mut model_name = v;
+        let mut model_name = v.clone();
         // Ollama
         if v.starts_with("ollama") {
             model_name = v.replace("ollama:", "openai:");
@@ -109,7 +108,7 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
         } else if v.starts_with("gemini") || v.starts_with("google") {
             model_name = v.replace("gemini:", "google:");
             if let Some(ref v) = query.ai_key {
-                cmd.env("GEMINI_API_KEY", query.ai_key);
+                cmd.env("GEMINI_API_KEY", v);
             } else {
                 return HttpResponse::BadRequest().body("openai requires --ai-key");
             }
@@ -118,9 +117,9 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
         cmd.arg("--ai").arg(model_name);
     }
 
-    cmd.cwd(resolved_dir);
+    cmd.current_dir(resolved_dir.clone());
 
-    println!("Running (cwd={}): {:?}", resolved_dir, cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
+    println!("Running (cwd={}): {:?}", resolved_dir.display(), cmd); // Command implements Debug, so this should output something like './binary" "--directory" "/path" "--plot" "1" ...'
 
     cmd.stdout(Stdio::from(stdout_file)).stderr(Stdio::from(log_file));
 
