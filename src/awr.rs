@@ -21,6 +21,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 
 use crate::analyze::main_report_builder;
+use crate::debug_note;
 use crate::staticdata::is_idle;
 use crate::Args;
 use crate::reasonings::ReportForAI;
@@ -624,6 +625,7 @@ fn sql_elapsed_time(table: ElementRef) -> Vec<SQLElapsedTime> {
 fn sql_ela_time_txt(sql_ela_section: Vec<&str>) -> Vec<SQLElapsedTime> {
 	let mut sql_ela_time: Vec<SQLElapsedTime> = Vec::new();
 	let mut sql_id_hash = String::new();
+	let mut seen_ids: HashSet<String> = HashSet::new();
 	for line in sql_ela_section {
 		let fields = line.split_whitespace().collect::<Vec<&str>>();
 		if fields.len()>=6 {
@@ -647,6 +649,12 @@ fn sql_ela_time_txt(sql_ela_section: Vec<&str>) -> Vec<SQLElapsedTime> {
 												elpased_time_exec_s: ela_exec, 
 												pct_total: pct_total, 
 												pct_cpu: -1.0, pct_io: -1.0, sql_module: "?".to_string(), sql_type: String::new()});
+				if seen_ids.contains(&sql_id_hash) {
+					debug_note!("That's wierd - I've already seen this ID: {}. Check if there are colisions of OLD_HASH_VALUE in statspack report", &sql_id_hash);
+				} else {
+					seen_ids.insert(sql_id_hash.clone());
+				}
+				
 			}
 		}
 		if line.starts_with("Module:") && !sql_id_hash.is_empty() {
@@ -1876,6 +1884,7 @@ fn parse_db_instance_information(fname: String) -> DBInstance {
 fn parse_awr_report_internal(fname: &str, args: &Args) -> (AWR, HashMap<String, String>) {
 	let mut awr: AWR = AWR::default();
 	let mut sqls_txt: HashMap<String, String> = HashMap::new();
+	debug_note!("Parsing file: {}", fname);
 	if fname.ends_with("html") {
 
 		//println!("Parsing file {}", &fname);
@@ -2058,6 +2067,7 @@ fn parse_awr_report_internal(fname: &str, args: &Args) -> (AWR, HashMap<String, 
 
 		let mut sql_ela: Vec<&str> = Vec::new();
 		sql_ela.extend_from_slice(&awr_lines[sql_ela_index.begin..sql_ela_index.end]);
+		debug_note!("Section boundries in {} for SQL ordered by Elapsed time are {}..{}", &fname, sql_ela_index.begin, sql_ela_index.end);
 		awr.sql_elapsed_time = sql_ela_time_txt(sql_ela);
 
 		let instance_activity_start = format!("{}{}", 12u8 as char, "Instance Activity Stats");
@@ -2251,7 +2261,7 @@ pub fn parse_awr_dir(args: Args, events_sqls: &mut HashMap<&str, HashSet<String>
     let json_str = serde_json::to_string_pretty(&collection).unwrap();
 	let mut f = fs::File::create(file).unwrap();
 	f.write_all(json_str.as_bytes()).unwrap();
-    let report_for_ai = main_report_builder(collection, args.clone());
+    let report_for_ai = main_report_builder(collection, args.clone(), events_sqls.clone());
     report_for_ai
 }
 
@@ -2308,6 +2318,6 @@ pub fn prarse_json_file(args: Args, events_sqls: &mut HashMap<&str, HashSet<Stri
 	events_sqls.insert("FG", fg_events);
 	events_sqls.insert("BG", bg_events);
 	events_sqls.insert("SQL", sqls);
-	let report_for_ai = main_report_builder(collection, args.clone());
+	let report_for_ai = main_report_builder(collection, args.clone(), events_sqls.clone());
 	report_for_ai
 }

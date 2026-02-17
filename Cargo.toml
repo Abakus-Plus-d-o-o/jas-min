@@ -1,6 +1,6 @@
 [package]
 name = "jas-min"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 authors = ["Kamil Stawiarski <kamil@ora-600.pl>", "Radoslaw Kut <radek@ora-600.pl>"]
 
@@ -36,3 +36,4 @@ dashmap = "6.1.0"
 base64 ="0.22.1"
 toon = "0.1.0"
 nalgebra = "0.34.1"
+chrono = "0.4.43"

@@ -28,6 +28,7 @@ use crate::{anomalies, Args};
 use crate::anomalies::*;
 
 use crate::make_notes;
+use crate::debug_note;
 use prettytable::{Table, Row, Cell, format, Attr};
 use rayon::prelude::*;
 
@@ -119,9 +120,8 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
     stats_description.median_absolute_deviation = format!("MAD threshold = {}\nMAD window size={}% ({} of probes out of {})\n\n", args.mad_threshold, args.mad_window_size, full_window_size, awrs.len());
     
     let mut top_spikes: Vec<TopPeaksSelected> = Vec::new();
-
+    let (f_begin_snap,f_end_snap) = snap_range;
     for awr in awrs {
-        let (f_begin_snap,f_end_snap) = snap_range;
 
         if awr.snap_info.begin_snap_id >= *f_begin_snap && awr.snap_info.end_snap_id <= *f_end_snap {
             let mut dbtime: f64 = 0.0;
@@ -187,6 +187,11 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
     } else {
         println!("\n****Detecting anamalies using MAD sliding window****\n");
     }
+    
+    let awrs: Vec<AWR> = awrs.clone().iter()
+                                  .filter(|a| a.snap_info.begin_snap_id>= *f_begin_snap && a.snap_info.end_snap_id<=*f_end_snap)
+                                  .cloned().collect();
+
     let event_anomalies = detect_event_anomalies_mad(&awrs, &args, "FOREGROUND");
     for a in &event_anomalies {
         event_names.entry(a.0.to_string()).or_insert(1);
@@ -271,20 +276,24 @@ fn report_top_sql_sections(sqlid: &str, awrs: &Vec<AWR>) -> HashMap<String, f64>
     top_sections
 }
 
-fn report_instance_stats_cor(instance_stats: HashMap<String, Vec<f64>>, dbtime_vec: Vec<f64>) -> BTreeMap<(i64, String), f64> {
+fn report_instance_stats_cor(instance_stats: HashMap<String, Vec<f64>>, dbtime_vec: Vec<f64>) -> (BTreeMap<(i64, String), f64>,f64) {
     let mut sorted_correlation: BTreeMap<(i64, String), f64> = BTreeMap::new();
+    let num_stats = instance_stats.len();
+    let r_threshold = bonferroni_significance_threshold(num_stats, 0.05, dbtime_vec.len());
+    // Use max(0.5, r_threshold) 
+    let effective_threshold = r_threshold.max(0.5);
 
-    for (k,v) in instance_stats {
+    for (k,v) in &instance_stats {
         if v.len() == dbtime_vec.len() {
             let crr = pearson_correlation_2v(&v, &dbtime_vec);
-            if crr >= 0.5 || crr <= -0.5 {
+            if crr >= effective_threshold || crr <= effective_threshold*-1.0 {
                 sorted_correlation.insert(((crr * 1000.0) as i64 , k.clone()), crr);
             }
         } else {
             println!("Can't calculate correlation for {} - diff was {}", &k, dbtime_vec.len() - v.len());
         }
     }
-    sorted_correlation
+    (sorted_correlation,effective_threshold)
 }
 
 //Add SQL_IDs found in ASH to event charts
@@ -2108,7 +2117,7 @@ fn report_segments_summary(awrs: &Vec<AWR>, args: &Args, logfile_name: &str, dir
     sections_toplot   
 }
 
-pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForAI {
+pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: HashMap<&str, HashSet<String>>) -> ReportForAI {
     let mut plot_main: Plot = Plot::new();
     let mut plot_highlight: Plot = Plot::new();
     let mut plot_highlight2: Plot = Plot::new();
@@ -3315,6 +3324,8 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             sql_type = s.unwrap().sql_type;
         }
 
+        debug_note!("Len of X axis is: {}, while {} was marked as TOP in {} probes.", x_vals.len(), &key.1, x.len() );
+        
         make_notes!(&logfile_name, args.quiet, 0, "{: >24}{:.2}% of probes\n", "Marked as TOP in ", (x.len() as f64 / x_vals.len() as f64 )* 100.0);
         make_notes!(&logfile_name, args.quiet, 0, "{: >35} {: <16.2} \tSTDDEV Ela by Exec: {:.2}\n", "--- AVG Ela by Exec:", avg_exec_t, stddev_exec_t);
         make_notes!(&logfile_name, args.quiet, 0, "{: >35} {: <16.2} \tSTDDEV CPU by Exec: {:.2}\n", "--- AVG CPU by Exec:", avg_exec_t_cpu, stddev_exec_t_cpu);
@@ -3746,12 +3757,14 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
     let segstats = report_segments_summary(&collection.awrs, &args, &logfile_name, &html_dir, &mut report_for_ai);
     /********************************************/
 
-    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
-    make_notes!(&logfile_name, false, 2, "{}", "Instance Statistics: Correlation with DB Time for values >= 0.5 and <= -0.5".yellow());
-    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
     let mut sorted_correlation = report_instance_stats_cor(instance_stats.clone(), y_vals_dbtime.clone());
+    let corr_txt = format!("Instance Statistics: Correlation with DB Time for values >= {} and <= -{}", sorted_correlation.1, sorted_correlation.1);
+    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
+    make_notes!(&logfile_name, false, 2, "{}", corr_txt.yellow());
+    make_notes!(&logfile_name, args.quiet, 0, "\n\n");
+    
     let mut stats_table_rows = String::new();
-    for ((score, key), value) in sorted_correlation.iter().rev() { // Sort in descending order
+    for ((score, key), value) in sorted_correlation.0.iter().rev() { // Sort in descending order
         stats_table_rows.push_str(&format!(
             r#"<tr><td>{}</td><td>{:.3}</td></tr>"#,
             key,
@@ -3818,7 +3831,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
                 <p><a href="https://github.com/ora600pl/jas-min" target="_blank">
                 <img src="https://raw.githubusercontent.com/rakustow/jas-min/main/img/jasmin_LOGO_white.png" width="150" alt="JAS-MIN" onerror="this.style.display='none';"/>
                 </a></p>
-                <p><span style="font-size:20px;font-weight:bold;">Correlation of Instance Statistics with DB Time for Values >= 0.5 and <= -0.5</span></p>
+                <p><span style="font-size:20px;font-weight:bold;">Correlation of Instance Statistics with DB Time for Values >= {} and <= -{}</span></p>
                 <table id="stats_corr_table" >
                     <thead>
                         <tr>
@@ -3834,7 +3847,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
         </body>
         </html>
         "#,
-        stats_table_rows
+        sorted_correlation.1, sorted_correlation.1, stats_table_rows
     );
 
     // Write to the file
@@ -3842,7 +3855,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
     if let Err(e) = fs::write(&stats_corr_filename, table_stat_corr) {
         eprintln!("Error writing file {}: {}", stats_corr_filename, e);
     }
-    for (k,v) in sorted_correlation {
+    for (k,v) in sorted_correlation.0 {
         make_notes!(&logfile_name, args.quiet, 0, "\t{: >64} : {:.2}\n", &k.1, v);
         report_for_ai.instance_stats_pearson_correlation.push(InstanceStatisticCorrelation{stat_name: k.1.clone(), pearson_correlation_value: v});
     }
@@ -4736,9 +4749,12 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             "<button id=\"show-bgevents-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">TOP Backgrd Events</span><span>TOP Backgrd Events</span></button>",
             "<button id=\"show-anomalies-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">Anomalies Summary</span><span>Anomalies Summary</span></button>",
             format!(
-                "<a href=\"{}\" target=\"_blank\" style=\"text-decoration: none;\">
+                "<a href=\"stats/statistics_corr.html\" target=\"_blank\" style=\"text-decoration: none;\">
                     <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">STATS Correlation</span><span>STATS Correlation</span></button>
-                </a>", "stats/statistics_corr.html"
+                </a>
+                <a href=\"stats/gradient.html\" target=\"_blank\" style=\"text-decoration: none;\">
+                    <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">Gradient Analyzes</span><span>Gradient Analyzes</span></button>
+                </a>"
             ),
             if !args.backend_assistant.is_empty() { 
                 format!("{}","<button id=\"show-JASMINAI-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">JAS-MIN Assistant</span><span>JAS-MIN Assistant</span></button>")
@@ -4845,6 +4861,14 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
     let elastic_net_max_iter = args.en_max_iter;
     let elastic_net_tol = args.en_tol;
 
+    /*HTML variables for tables*/
+    let mut gradient_events = String::new();
+    let mut gradient_stats_cnt = String::new();
+    let mut gradient_stats_volume = String::new();
+    let mut gradient_stats_time = String::new();
+    let mut gradient_sqls = String::new();
+    /* *********************** */
+
     // ---------------------------------------------------------------------
     // Attach DB Time gradient vs wait events to ReportForAI (optional section)
     // ---------------------------------------------------------------------
@@ -4882,7 +4906,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             }
         }
         if let Some(section) = &report_for_ai.db_time_gradient_fg_wait_events {
-            print_db_time_gradient_tables(section, true, &logfile_name, &args);
+            gradient_events = print_db_time_gradient_tables(section, true, &logfile_name, &args);
         }
     }
 
@@ -4926,7 +4950,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             }
         }
         if let Some(section) = &report_for_ai.db_time_gradient_instance_stats_counters {
-            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+            gradient_stats_cnt = print_db_time_gradient_tables(section, false, &logfile_name, &args);
         }
     }
 
@@ -4970,7 +4994,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             }
         }
         if let Some(section) = &report_for_ai.db_time_gradient_instance_stats_volumes {
-            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+            gradient_stats_volume = print_db_time_gradient_tables(section, false, &logfile_name, &args);
         }
     }
 
@@ -5014,7 +5038,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             }
         }
         if let Some(section) = &report_for_ai.db_time_gradient_instance_stats_time {
-            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+            gradient_stats_time = print_db_time_gradient_tables(section, false, &logfile_name, &args);
         }
     }
 
@@ -5055,8 +5079,87 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args) -> ReportForA
             }
         }
         if let Some(section) = &report_for_ai.db_time_gradient_sql_elapsed_time {
-            print_db_time_gradient_tables(section, false, &logfile_name, &args);
+            gradient_sqls = print_db_time_gradient_tables(section, false, &logfile_name, &args);
         }
+    }
+
+    let gradient_html = format!(
+        r#"<!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Gradient Analyzes</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .content {{ font-size: 14px; }}
+                table {{
+                    width: 30%;
+                    border-collapse: collapse;
+                    margin-top: 20px;
+                }}
+                th, td {{ 
+                    border: 1px solid black;
+                    padding: 8px;
+                    text-align: center;
+                }}
+                th {{
+                    background-color: #632e4f;
+                    color: white;
+                }}
+                tr:nth-child(even) {{
+                    background-color: #f2f2f2;
+                }}
+                td:first-child {{
+                    text-align: right;
+                    font-weight: bold;
+                }}
+                .tables-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+                    gap: 20px;
+                    align-items: start;
+                }}
+                .tables-grid table {{
+                    width: 100%;
+                    margin-top: 0;
+                }}
+                .cross-model table {{
+                    width: 100%;
+                    margin-top: 20px;
+                    }}
+                .cross-model p {{
+                    font-weight: bold;
+                    font-size: 16px;
+                    margin-top: 40px;
+                    }}
+            </style>
+            </head>
+        <body>
+            <div class="content">
+                <p><a href="https://github.com/ora600pl/jas-min" target="_blank">
+                <img src="https://raw.githubusercontent.com/rakustow/jas-min/main/img/jasmin_LOGO_white.png" width="150" alt="JAS-MIN" onerror="this.style.display='none';"/>
+                </a></p>
+                <p><span style="font-size:20px;font-weight:bold;">Gradient Analyzes</span></p>
+                <p><span style="font-size:15px;font-weight:bold;">DB Time vs Wait Events</span></p>
+                {gradient_events}
+                <p><span style="font-size:15px;font-weight:bold;">DB Time vs Statistic Counters</span></p>
+                {gradient_stats_cnt}
+                <p><span style="font-size:15px;font-weight:bold;">DB Time vs Statistic Volumes</span></p>
+                {gradient_stats_volume}
+                <p><span style="font-size:15px;font-weight:bold;">DB Time vs Statistic Time</span></p>
+                {gradient_stats_time}
+                <p><span style="font-size:15px;font-weight:bold;">DB Time vs SQLs</span></p>
+                {gradient_sqls}
+            </div>
+        </body>
+        </html>
+        "#
+    );
+    let gradient_html = add_links_to_html(gradient_html, events_sqls, "..".to_string(), html_dir.clone());
+    let gradient_filename: String = format!("{}/stats/gradient.html", &html_dir);
+    if let Err(e) = fs::write(&gradient_filename, gradient_html) {
+        eprintln!("Error writing file {}: {}", gradient_filename, e);
     }
 
     // Write the updated HTML back to the file
