@@ -15,6 +15,7 @@ use crate::awr::GetStats;
 use tokio::sync::oneshot;
 use serde::Serialize;
 use chrono::Local;
+use regex::Regex;
 
 /// Bonferroni-corrected correlation significance threshold.
 /// Returns the minimum |r| that is significant at family-wise alpha
@@ -383,20 +384,36 @@ pub fn std_deviation(data: Vec<f64>) -> Option<f64> {
 }
 
 pub fn median(data: &[f64]) -> f64 {
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let len = sorted.len();
-    if len == 0 {
+    if data.is_empty() {
         return 0.0;
     }
-    if len % 2 == 0 {
-        (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
+    let mut tmp = data.to_vec();
+    let mid = tmp.len() / 2;
+    tmp.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    if tmp.len() % 2 == 1 {
+        tmp[mid]
     } else {
-        sorted[len / 2]
+        let lower_max = tmp[..mid]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        (lower_max + tmp[mid]) * 0.5
     }
 }
 
-pub fn mad(data: &[f64], med: f64) -> f64 {
+pub fn mad(data: &[f64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let med = median(data);
+    let deviations: Vec<f64> = data.iter().map(|x| (x - med).abs()).collect();
+    median(&deviations)
+}
+
+pub fn mad_with_median(data: &[f64], med: f64) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
     let deviations: Vec<f64> = data.iter().map(|x| (x - med).abs()).collect();
     median(&deviations)
 }
@@ -549,4 +566,92 @@ pub fn max_prefix_that_fits<T: Serialize>(
     }
 
     lo
+}
+
+/// Extracts table names from Oracle SQL text.
+///
+/// Handles: FROM, JOIN, INTO, UPDATE, MERGE INTO, DELETE [FROM]
+pub fn extract_tables_from_sql(sql: &str) -> Vec<String> {
+    let mut tables: HashSet<String> = HashSet::new();
+
+    // Normalize: collapse whitespace, remove newlines
+    let normalized = sql
+        .replace('\n', " ")
+        .replace('\r', " ")
+        .replace('\t', " ");
+
+    // Remove single-line comments (-- ...)
+    let re_single_comment = Regex::new(r"--[^\n]*").unwrap();
+    let normalized = re_single_comment.replace_all(&normalized, " ").to_string();
+
+    // Remove multi-line comments (/* ... */)
+    let re_multi_comment = Regex::new(r"/\*[\s\S]*?\*/").unwrap();
+    let normalized = re_multi_comment.replace_all(&normalized, " ").to_string();
+
+    // Remove string literals ('...')
+    let re_strings = Regex::new(r"'[^']*'").unwrap();
+    let normalized = re_strings.replace_all(&normalized, " ").to_string();
+
+    // Collapse multiple spaces
+    let re_spaces = Regex::new(r"\s+").unwrap();
+    let normalized = re_spaces.replace_all(&normalized, " ").to_string();
+
+    let upper = normalized.to_uppercase();
+
+    // NOTE: DELETE supports optional FROM: DELETE table ... and DELETE FROM table ...
+    let table_pattern = Regex::new(
+        r"(?i)\b(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO|DELETE(?:\s+FROM)?)\s+([A-Z_$#][A-Z0-9_$#]*(?:\.[A-Z_$#][A-Z0-9_$#]*)*)(?:\s+(?:AS\s+)?[A-Z_][A-Z0-9_]*)?"
+    ).unwrap();
+
+    // Pseudo-tables and system schemas to exclude
+    let exclude: HashSet<&str> = [
+        "DUAL", "SYS", "SYSTEM", "SELECT", "VALUES", "SET", "WHERE",
+        "AND", "OR", "ON", "USING", "TABLE", "INDEX", "VIEW",
+        "BEGIN", "END", "DECLARE", "EXCEPTION", "LOOP", "IF", "THEN",
+        "ELSE", "ELSIF", "RETURN", "NULL", "NOT", "IN", "EXISTS",
+        "PARTITION", "SUBPARTITION", "LATERAL", "XMLTABLE", "JSON_TABLE",
+        // FOR UPDATE [SKIP LOCKED | NOWAIT | WAIT n] clause tokens
+        "SKIP", "LOCKED", "NOWAIT", "WAIT", "FOR",
+    ].iter().cloned().collect();
+
+    for cap in table_pattern.captures_iter(&upper) {
+        let table_name = cap[1].trim().to_string();
+
+        let base_name = table_name.split('.').last().unwrap_or(&table_name);
+        if exclude.contains(base_name) {
+            continue;
+        }
+        if table_name.starts_with("SYS.") || table_name.starts_with("SYSTEM.") {
+            continue;
+        }
+        if !table_name.contains('.') && table_name.len() <= 1 {
+            continue;
+        }
+
+        tables.insert(table_name);
+    }
+
+    let mut result: Vec<String> = tables.into_iter().collect();
+    result.sort();
+    result
+}
+
+/// Given a set of SQL_IDs, the sql_text map, and a lookup function,
+/// returns a deduplicated sorted list of table names found across all matching SQLs.
+pub fn find_tables_for_sql_ids(
+    sql_ids: &HashSet<String>,
+    sql_text: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut all_tables: HashSet<String> = HashSet::new();
+    
+    for sql_id in sql_ids {
+        if let Some(text) = sql_text.get(sql_id) {
+            let tables = extract_tables_from_sql(text);
+            all_tables.extend(tables);
+        }
+    }
+    
+    let mut result: Vec<String> = all_tables.into_iter().collect();
+    result.sort();
+    result
 }

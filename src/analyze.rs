@@ -55,7 +55,10 @@ use crate::reasonings::{StatisticsDescription,
                         AppState,
                         GradientSettings,
                         GradientTopItem,
-                        DbTimeGradientSection};
+                        DbTimeGradientSection,
+                        strip_gradient_descriptions,
+                        VifDiagnostic,
+                        CollinearGroupImpact,};
 
 use crate::gradient::*;
 use crate::gradient::{EventSeriesMap,
@@ -68,7 +71,8 @@ use crate::staticdata::StatUnitGroup;
 struct TopStats {
     events: BTreeMap<String, u8>,
     bgevents: BTreeMap<String, u8>,
-    sqls:   BTreeMap<String, String>,   // <SQL_ID, Module>
+    sqls:     BTreeMap<String, String>,   // <SQL_ID, Module>
+    sqls_cpu: BTreeMap<String, String>,   // <SQL_ID, Module>
     stat_names: BTreeMap<String, u8>,
     event_anomalies_mad: HashMap<String, Vec<(String,f64)>>,
     bgevent_anomalies_mad: HashMap<String, Vec<(String,f64)>>,
@@ -98,6 +102,7 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
     let mut event_names: BTreeMap<String, u8> = BTreeMap::new();
     let mut bgevent_names: BTreeMap<String, u8> = BTreeMap::new();
     let mut sql_ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut sql_ids_cpu: BTreeMap<String, String> = BTreeMap::new();
     let mut stat_names: BTreeMap<String, u8> = BTreeMap::new();
 
     let mut stats_description = StatisticsDescription::default();
@@ -127,14 +132,22 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
             let mut dbtime: f64 = 0.0;
             let mut cputime: f64 = 0.0;
             //We want to find dbtime and cputime because based on their delta we will base our decisions 
-            for lp in awr.load_profile.clone() {
+            for tm in &awr.time_model_stats {
+                if tm.stat_name.starts_with("DB Time") || tm.stat_name.starts_with("DB time") {
+                    dbtime = tm.time_s;
+                    
+                } else if tm.stat_name.starts_with("DB CPU") {
+                    cputime = tm.time_s;
+                }
+            }
+            /*for lp in awr.load_profile.clone() {
                 if lp.stat_name.starts_with("DB Time") || lp.stat_name.starts_with("DB time") {
                     dbtime = lp.per_second;
                     
                 } else if lp.stat_name.starts_with("DB CPU") {
                     cputime = lp.per_second;
                 }
-            }
+            }*/
             //If proportion of cputime and dbtime is less then db_time_cpu_ratio (default 0.666) than we want to find out what might be the problem 
             //because it means that Oracle spent some time waiting on wait events and not working on CPU
 
@@ -173,6 +186,23 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
                 } else if l > 1 && l <=5 {
                     for i in 0..=l-1 {
                         sql_ids.entry(sqls[i].sql_id.clone()).or_insert(sqls[i].sql_module.clone());
+                    }
+                }
+
+                //And the same with SQLs by CPU
+                let mut sqls_cpu: Vec<crate::awr::SQLCPUTime> = awr.sql_cpu_time.iter()
+                                                                  .map(|s| s.1.clone())
+                                                                  .collect();
+
+                sqls_cpu.sort_by_key(|s| s.cpu_time_s as i64);
+                let l: usize = sqls_cpu.len();  
+                if l > 5 {
+                    for i in 1..6 {
+                        sql_ids_cpu.entry(sqls_cpu[l-i].sql_id.clone()).or_insert(sqls_cpu[l-i].sql_module.clone());
+                    }
+                } else if l > 1 && l <=5 {
+                    for i in 0..=l-1 {
+                        sql_ids_cpu.entry(sqls_cpu[i].sql_id.clone()).or_insert(sqls_cpu[i].sql_module.clone());
                     }
                 }
             }
@@ -217,6 +247,7 @@ fn find_top_stats(awrs: &Vec<AWR>, db_time_cpu_ratio: f64, filter_db_time: f64, 
     let top: TopStats = TopStats {events: event_names, 
                                   bgevents: bgevent_names, 
                                   sqls: sql_ids, 
+                                  sqls_cpu: sql_ids_cpu,
                                   stat_names: stat_names, 
                                   event_anomalies_mad: event_anomalies,
                                   bgevent_anomalies_mad: bgevent_anomalies,
@@ -718,7 +749,10 @@ fn generate_sqls_plotfiles(awrs: &Vec<AWR>, top_stats: &TopStats, snap_range: &(
         .map(|awr| format!("{} ({})", awr.snap_info.begin_snap_time, awr.snap_info.begin_snap_id))
         .collect();
 
-    let sqls_by_stats: HashMap<String, SQLStats> = top_stats.sqls.par_iter()
+    let mut combined_sqls = top_stats.sqls.clone();
+    combined_sqls.extend(top_stats.sqls_cpu.clone());
+    
+    let sqls_by_stats: HashMap<String, SQLStats> = combined_sqls.par_iter()
         .map(|(sql_id, _)| {
             let mut stats = SQLStats {
                 execs: Vec::new(),
@@ -2169,6 +2203,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     let mut y_vals_events: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_bgevents: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_sqls: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut y_vals_sqls_cpu: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut y_vals_logons: Vec<u64> = Vec::new();
     let mut y_vals_logouts: Vec<u64> = Vec::new();
     let mut y_vals_calls: Vec<f64> = Vec::new();
@@ -2235,6 +2270,12 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
                 y_vals_sqls_exec_n.entry(sql.to_string()).or_insert(Vec::new());
                 y_vals_sqls_exec_s.entry(sql.to_string()).or_insert(Vec::new());
                 let mut v = y_vals_sqls.get_mut(sql).unwrap();
+                v.push(0.0);
+            }
+
+            for(sql, _) in &top_stats.sqls_cpu {
+                y_vals_sqls_cpu.entry(sql.to_string()).or_insert(Vec::new());
+                let mut v = y_vals_sqls_cpu.get_mut(sql).unwrap();
                 v.push(0.0);
             } 
 
@@ -2303,6 +2344,13 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
                         v.push(sqls.elapsed_time_s as f64); 
                     }
             }
+            for sqls in &awr.sql_cpu_time {
+                if top_stats.sqls_cpu.contains_key(&sqls.1.sql_id) {
+                    let mut v = y_vals_sqls_cpu.get_mut(&sqls.1.sql_id).unwrap();
+                    v[x_vals.len()-1] = sqls.1.cpu_time_s;
+                }
+            }
+
             let mut is_statspack: bool = false;
             //DB Time and DB CPU are in each snap, so you don't need that kind of precautions
             for lp in &awr.load_profile {
@@ -2466,7 +2514,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
                                                     .name("DB Time (s/s)")
                                                     .x_axis("x1")
                                                     .y_axis("y1");
-    let dbcpu_trace = Scatter::new(x_vals.clone(), y_vals_dbcpu)
+    let dbcpu_trace = Scatter::new(x_vals.clone(), y_vals_dbcpu.clone())
                                                     .mode(Mode::LinesText)
                                                     .name("DB CPU (s/s)")
                                                     .x_axis("x1")
@@ -2803,6 +2851,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
         let event_name: String = key.1.clone();
         /* Correlation calc */
         let corr: f64 = pearson_correlation_2v(&y_vals_dbtime, &yv);
+        let corr = if corr.is_finite() { corr } else { 0.0 };
         // Print Correlation considered high enough to mark it
         make_notes!(&logfile_name, args.quiet, 3, "\t{: >5}\n", &event_name.bold());
 
@@ -3027,6 +3076,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
         let event_name: String = key.1.clone();
         /* Correlation calc */
         let corr: f64 = pearson_correlation_2v(&y_vals_dbtime, &yv);
+        let corr = if corr.is_finite() { corr } else { 0.0 };
 
         /* STDDEV/AVG Calculations */
         let x_n: Vec<f64> = y_vals_bgevents_n.get(&event_name).unwrap().clone();
@@ -3266,6 +3316,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
         let sql_id_disp = format!("SQL_ID: {}", key.1.clone());
         /* Correlation calc */
         let corr: f64 = pearson_correlation_2v(&y_vals_dbtime, &yv);
+        let corr = if corr.is_finite() { corr } else { 0.0 };
         // Print Correlation considered high enough to mark it
         let top_sections: HashMap<String, f64> = report_top_sql_sections(&sql_id, &collection.awrs);
         make_notes!(&logfile_name, args.quiet, 3, "\n\t{: >5}", &sql_id_disp.bold());
@@ -3599,8 +3650,8 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
         }
 
         let mut sql_text = format!("Security level {} does not allow gathering SQL text, use level 2 or higher", args.security_level);
-        if args.security_level >= 2 {
-            sql_text = format!("<code><details><summary>FULL SQL TEXT</summary>{}</details></code>\n</body>",collection.sql_text.get(&sql_id).unwrap())
+        if args.security_level >= 2 && !collection.sql_text.is_empty() {
+            sql_text = format!("<code><details><summary>FULL SQL TEXT</summary>{}</details></code>\n</body>",collection.sql_text.get(&sql_id).unwrap_or(&"SQL NOT FOUND".to_string()))
         }
 
         // Format the content as HTML
@@ -3652,6 +3703,40 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     }
 
     report_for_ai.top_sqls_by_elapsed_time = top_sqls;
+
+    // --- Enrich foreground wait events with table names from SQL text ---
+    if !collection.sql_text.is_empty() {
+        // Build reverse map: event_name -> Set<SQL_ID>
+        // Sources: ASH data + strong correlation
+        let mut event_to_sqls: HashMap<String, HashSet<String>> = HashMap::new();
+        
+        for sql_data in &report_for_ai.top_sqls_by_elapsed_time {
+            // From ASH
+            for ash_event in &sql_data.wait_events_found_in_ash_sections_for_this_sql {
+                event_to_sqls
+                    .entry(ash_event.event_name.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(sql_data.sql_id.clone());
+            }
+            // From correlation
+            for corr_event in &sql_data.wait_events_with_strong_pearson_correlation {
+                event_to_sqls
+                    .entry(corr_event.event_name.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(sql_data.sql_id.clone());
+            }
+        }
+        
+        for event_data in report_for_ai.top_foreground_wait_events.iter_mut() {
+            if let Some(sql_ids) = event_to_sqls.get(&event_data.event_name) {
+                let tables = find_tables_for_sql_ids(sql_ids, &collection.sql_text);
+                if !tables.is_empty() {
+                    event_data.tables_associated_with_event_based_on_ash_sql = Some(tables);
+                }
+            }
+        }
+    }
+    // -----------------
 
     let sqls_table_html: String = format!(
         r#"
@@ -4753,7 +4838,10 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
                     <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">STATS Correlation</span><span>STATS Correlation</span></button>
                 </a>
                 <a href=\"stats/gradient.html\" target=\"_blank\" style=\"text-decoration: none;\">
-                    <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">Gradient Analyzes</span><span>Gradient Analyzes</span></button>
+                    <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">DB Time Gradient Analyzes</span><span>DB Time Gradient Analyzes</span></button>
+                </a>
+                <a href=\"stats/gradient_cpu.html\" target=\"_blank\" style=\"text-decoration: none;\">
+                    <button id=\"show-stat_corr-button\" class=\"button-JASMIN\" role=\"button\"><span class=\"text\">DB CPU Gradient Analyzes</span><span>DB CPU Gradient Analyzes</span></button>
                 </a>"
             ),
             if !args.backend_assistant.is_empty() { 
@@ -4867,6 +4955,8 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     let mut gradient_stats_volume = String::new();
     let mut gradient_stats_time = String::new();
     let mut gradient_sqls = String::new();
+    let mut gradient_cpu_stats_all = String::new();
+    let mut gradient_cpu_sqls = String::new();
     /* *********************** */
 
     // ---------------------------------------------------------------------
@@ -4915,7 +5005,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     // ---------------------------------------------------------------------
     {
         let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.clone().into_iter()
-                                                                         .filter(|i| classify_stat_unit_group(&i.0) == StatUnitGroup::Counter)
+                                                                         .filter(|i| is_counter_stat(&i.0))
                                                                          .collect();
         match build_db_time_gradient_section (
             &y_vals_dbtime,
@@ -4959,7 +5049,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     // ---------------------------------------------------------------------
     {
         let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.clone().into_iter()
-                                                                         .filter(|i| classify_stat_unit_group(&i.0) == StatUnitGroup::Volume)
+                                                                         .filter(|i| is_volume_stat(&i.0))
                                                                          .collect();
         match build_db_time_gradient_section (
             &y_vals_dbtime,
@@ -5002,8 +5092,8 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     // Attach DB Time gradient vs instance statistic time to ReportForAI (optional section)
     // ---------------------------------------------------------------------
     {
-        let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.into_iter()
-                                                                         .filter(|i| classify_stat_unit_group(&i.0) == StatUnitGroup::Time)
+        let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.clone().into_iter()
+                                                                         .filter(|i| is_time_stat(&i.0))
                                                                          .collect();
         match build_db_time_gradient_section (
             &y_vals_dbtime,
@@ -5054,7 +5144,7 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
             elastic_net_alpha,
             elastic_net_max_iter,
             elastic_net_tol,
-            "statistic_values_time"
+            "SQL_elapsed_time"
         ) {
             Ok(section) => {
                 report_for_ai.db_time_gradient_sql_elapsed_time = Some(section);
@@ -5156,8 +5246,169 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
         </html>
         "#
     );
-    let gradient_html = add_links_to_html(gradient_html, events_sqls, "..".to_string(), html_dir.clone());
+    let gradient_html = add_links_to_html(gradient_html, events_sqls.clone(), "..".to_string(), html_dir.clone());
     let gradient_filename: String = format!("{}/stats/gradient.html", &html_dir);
+    if let Err(e) = fs::write(&gradient_filename, gradient_html) {
+        eprintln!("Error writing file {}: {}", gradient_filename, e);
+    }
+
+
+    // ---------------------------------------------------------------------
+    // Attach CPU Time gradient vs instance statistic CPU to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        let y_vals_statistics: BTreeMap<String,Vec<f64>> = instance_stats.clone().into_iter()
+                                                                         .filter(|i| is_cpu_stat(&i.0))
+                                                                         .collect();
+        debug_note!("All instance statistics: {}, filtered for CPU: {}", instance_stats.len(), y_vals_statistics.len());
+        match build_db_time_gradient_section (
+            &y_vals_dbcpu,
+            &y_vals_statistics, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "statistic_values_cpu"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_cpu_gradient_instance_stats = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "{}",
+                    "\n\nCPU TIME GRADIENT for stats attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_cpu_gradient_instance_stats = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nCPU TIME GRADIENT for instance stats time skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_cpu_gradient_instance_stats {
+            gradient_cpu_stats_all = print_db_time_gradient_tables(section, false, &logfile_name, &args);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Attach CPU Time gradient vs SQL by CPU Time to ReportForAI (optional section)
+    // ---------------------------------------------------------------------
+    {
+        
+        match build_db_time_gradient_section (
+            &y_vals_dbcpu,
+            &y_vals_sqls_cpu, // BTreeMap<String, Vec<f64>> aligned & zero-filled
+            ridge_lambda,
+            elastic_net_lambda,
+            elastic_net_alpha,
+            elastic_net_max_iter,
+            elastic_net_tol,
+            "SQL_CPU_time"
+        ) {
+            Ok(section) => {
+                report_for_ai.db_cpu_gradient_sql_cpu_time = Some(section);
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "{}",
+                    "\n\nCPU TIME GRADIENT for SQL CPU attached to ReportForAI".bold().green()
+                );
+            }
+            Err(err) => {
+                // Don't kill report generation; just log and continue.
+                report_for_ai.db_cpu_gradient_sql_cpu_time = None;
+                make_notes!(
+                    &logfile_name,
+                    false,
+                    1,
+                    "\n\nCPU TIME GRADIENT for SQL CPU time skipped: {}",
+                    err
+                );
+            }
+        }
+        if let Some(section) = &report_for_ai.db_cpu_gradient_sql_cpu_time {
+            gradient_cpu_sqls = print_db_time_gradient_tables(section, false, &logfile_name, &args);
+        }
+    }
+
+    let gradient_html = format!(
+        r#"<!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Gradient Analyzes</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .content {{ font-size: 14px; }}
+                table {{
+                    width: 30%;
+                    border-collapse: collapse;
+                    margin-top: 20px;
+                }}
+                th, td {{ 
+                    border: 1px solid black;
+                    padding: 8px;
+                    text-align: center;
+                }}
+                th {{
+                    background-color: #632e4f;
+                    color: white;
+                }}
+                tr:nth-child(even) {{
+                    background-color: #f2f2f2;
+                }}
+                td:first-child {{
+                    text-align: right;
+                    font-weight: bold;
+                }}
+                .tables-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+                    gap: 20px;
+                    align-items: start;
+                }}
+                .tables-grid table {{
+                    width: 100%;
+                    margin-top: 0;
+                }}
+                .cross-model table {{
+                    width: 100%;
+                    margin-top: 20px;
+                    }}
+                .cross-model p {{
+                    font-weight: bold;
+                    font-size: 16px;
+                    margin-top: 40px;
+                    }}
+            </style>
+            </head>
+        <body>
+            <div class="content">
+                <p><a href="https://github.com/ora600pl/jas-min" target="_blank">
+                <img src="https://raw.githubusercontent.com/rakustow/jas-min/main/img/jasmin_LOGO_white.png" width="150" alt="JAS-MIN" onerror="this.style.display='none';"/>
+                </a></p>
+                <p><span style="font-size:20px;font-weight:bold;">Gradient Analyzes</span></p>
+                <p><span style="font-size:15px;font-weight:bold;">DB CPU vs Instance Statistics</span></p>
+                {gradient_cpu_stats_all}
+                <p><span style="font-size:15px;font-weight:bold;">DB CPU vs SQLs by CPU Time</span></p>
+                {gradient_cpu_sqls}
+            </div>
+        </body>
+        </html>
+        "#
+    );
+    let gradient_html = add_links_to_html(gradient_html, events_sqls, "..".to_string(), html_dir.clone());
+    let gradient_filename: String = format!("{}/stats/gradient_cpu.html", &html_dir);
     if let Err(e) = fs::write(&gradient_filename, gradient_html) {
         eprintln!("Error writing file {}: {}", gradient_filename, e);
     }
@@ -5169,5 +5420,11 @@ pub fn main_report_builder(collection: AWRSCollection, args: Args, events_sqls: 
     println!("{}{}\n","JAS-MIN Report saved to: ",&fname);
 
     open::that(fname);
+
+    /* Clear gradient description to minimalyze token usage */
+    strip_gradient_descriptions(&mut report_for_ai);
+    /* ***************************************************** */
+
+    report_for_ai.initialization_parameters = collection.initialization_parameters;
     report_for_ai
 }

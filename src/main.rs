@@ -141,7 +141,7 @@ struct Args {
 	///For calculating gradient - mixing between L1 and L2 in Elastic Net:
 	///     alpha = 1.0 -> Lasso (pure L1)
 	///     alpha = 0.0 -> Ridge-like (pure L2)
-	#[clap(short = 'A', long, default_value_t=0.666,verbatim_doc_comment)]
+	#[clap(short = 'A', long, default_value_t=0.333,verbatim_doc_comment)]
 	en_alpha: f64,
 
 	///Max iterations for coordinate descent in Elastic Net
@@ -152,6 +152,9 @@ struct Args {
 	#[clap(short = 'T', long, default_value_t=1e-6)]
 	en_tol: f64,
 
+	///Convert existing markdown file to HTML without calling AI model 
+	#[clap(short, long, default_value="", verbatim_doc_comment)]
+	convert_md2html: String,
 }
 
 
@@ -351,5 +354,9 @@ fn main() {
 		f.write_all(toon_str.as_bytes()).unwrap();
 		backend_ai(reportfile, backend_type, model_name, toon_str);
     }
+
+	if !args.convert_md2html.is_empty() {
+		convert_md_to_html_file(&args.convert_md2html, events_sqls.clone());
+	}
 	
 }
