@@ -655,3 +655,137 @@ pub fn find_tables_for_sql_ids(
     result.sort();
     result
 }
+
+/// Compute Z-Score normalization for a vector: (x - mean) / stddev.
+/// Returns a vector of the same length. If stddev is 0 or NaN, returns zeros
+/// (the series is constant — nothing to normalize).
+pub fn z_score_normalize(values: &[f64]) -> Vec<f64> {
+    // Use only finite values to compute mean/stddev, but preserve NaN positions in output.
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return vec![0.0; values.len()];
+    }
+    let avg = mean(finite.clone()).unwrap_or(0.0);
+    let sd  = std_deviation(finite).unwrap_or(0.0);
+    if sd.abs() < f64::EPSILON || !sd.is_finite() {
+        return vec![0.0; values.len()];
+    }
+    values
+        .iter()
+        .map(|v| if v.is_finite() { (v - avg) / sd } else { f64::NAN })
+        .collect()
+}
+
+pub fn robust_z_score(values: &[f64]) -> Vec<f64> {
+    if values.is_empty() { return Vec::new(); }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let mut deviations: Vec<f64> = values.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = deviations[deviations.len() / 2];
+    if mad.abs() < f64::EPSILON {
+        return vec![0.0; values.len()];
+    }
+    let scale = 1.4826 * mad;
+    values.iter().map(|v| (v - median) / scale).collect()
+}
+
+pub fn robust_minmax_0_100(values: &[f64], low_pct: f64, high_pct: f64) -> Vec<f64> {
+    let finite: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+
+    if finite.is_empty() {
+        return vec![0.0; values.len()];
+    }
+
+    let lo = percentile(&finite, low_pct);
+    let hi = percentile(&finite, high_pct);
+
+    if !lo.is_finite() || !hi.is_finite() || (hi - lo).abs() < f64::EPSILON {
+        return vec![0.0; values.len()];
+    }
+
+    values
+        .iter()
+        .map(|v| {
+            if !v.is_finite() {
+                f64::NAN
+            } else {
+                let scaled = ((*v - lo) / (hi - lo)) * 100.0;
+                scaled.clamp(0.0, 100.0)
+            }
+        })
+        .collect()
+}
+
+pub fn percentile(values: &[f64], pct: f64) -> f64 {
+    let mut sorted: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let pct = pct.clamp(0.0, 100.0);
+    let rank = (pct / 100.0) * ((sorted.len() - 1) as f64);
+
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+
+    if lower == upper {
+        sorted[lower]
+    } else {
+        let weight = rank - lower as f64;
+        sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+    }
+}
+
+pub fn log1p_robust_minmax_0_100(values: &[f64], low_pct: f64, high_pct: f64) -> Vec<f64> {
+    let transformed: Vec<f64> = values
+        .iter()
+        .map(|v| {
+            if v.is_finite() && *v >= 0.0 {
+                v.ln_1p()
+            } else if v.is_finite() {
+                // For safety. Most Oracle counters should not be negative anyway.
+                0.0
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+
+    robust_minmax_0_100(&transformed, low_pct, high_pct)
+}
+
+/// Percentile of absolute values — robust measure of "active magnitude".
+/// Uses linear interpolation between order statistics.
+/// Returns 0.0 for empty input.
+pub fn abs_percentile(series: &[f64], p: f64) -> f64 {
+    if series.is_empty() {
+        return 0.0;
+    }
+    let mut abs_vals: Vec<f64> = series.iter()
+        .map(|v| v.abs())
+        .filter(|v| v.is_finite())
+        .collect();
+    if abs_vals.is_empty() {
+        return 0.0;
+    }
+    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = abs_vals.len();
+    let rank = p.clamp(0.0, 1.0) * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = rank - lo as f64;
+    abs_vals[lo] * (1.0 - frac) + abs_vals[hi] * frac
+}

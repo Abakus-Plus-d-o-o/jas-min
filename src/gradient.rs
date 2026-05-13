@@ -45,12 +45,29 @@ pub type EventScalarMap = BTreeMap<String, f64>;
 #[derive(Debug, Clone)]
 pub struct EventImpact {
     pub event_name: String,
-    /// Regression coefficient for standardized Δ(event/stat/sql)
+    /// Regression coefficient on standardized Δ
     pub gradient_coef: f64,
-    /// impact = |coef| * MAD(raw Δ(event/stat/sql))
+
+    /// Legacy/typical impact = |coef| * MAD(Δx)
+    /// Measures contribution during *typical* variability.
     pub impact: f64,
-    /// signed_impact = coef * MAD — preserves direction
+    /// Signed version of `impact` (preserves direction).
     pub signed_impact: f64,
+
+    /// Active impact = |coef| * P90(|Δx|)
+    /// Measures contribution when the predictor is *actively moving*.
+    /// **Primary metric for DB tuning prioritization.**
+    pub impact_active: f64,
+    /// Signed active impact (positive = true bottleneck contributor).
+    pub signed_impact_active: f64,
+
+    /// Peak impact = |coef| * P99(|Δx|)
+    /// Measures worst-case single-snapshot contribution.
+    pub impact_peak: f64,
+
+    /// Share of total active impact across all predictors in this ranking.
+    /// Range: [0.0, 1.0]. Computed after ranking is built.
+    pub impact_share: f64,
 }
 
 /// Full result package
@@ -97,6 +114,15 @@ enum RegressionResult {
     Quantile95(EventScalarMap),
 }
 
+fn compute_abs_percentile_by_event(
+    series_by_event: &EventSeriesMap,
+    p: f64,
+) -> EventScalarMap {
+    series_by_event.iter()
+        .map(|(name, series)| (name.clone(), abs_percentile(series, p)))
+        .collect()
+}
+
 pub fn compute_db_time_gradient(
     db_time_series: &[f64],
     event_series: &EventSeriesMap,
@@ -141,8 +167,10 @@ pub fn compute_db_time_gradient(
     let event_delta_standardized_by_event =
         standardize_by_event(&event_delta_by_event, &event_delta_mean_by_event, &event_delta_std_by_event);
     let event_delta_mad_by_event = compute_mad_by_event(&event_delta_by_event);
+    let event_delta_p90_by_event = compute_abs_percentile_by_event(&event_delta_by_event, 0.90);
+    let event_delta_p99_by_event = compute_abs_percentile_by_event(&event_delta_by_event, 0.99);
 
-
+ 
     let tasks: Vec<u8> = vec![0, 1, 2, 3]; //4 tasks - 4 models
 
     // Compute Huber delta from median residuals (intercept-only model)
@@ -209,10 +237,10 @@ pub fn compute_db_time_gradient(
     let huber_gradient_by_event = huber_gradient_by_event.unwrap();
     let quantile95_gradient_by_event = quantile95_gradient_by_event.unwrap();
 
-    let ridge_ranking = build_ranking(&ridge_gradient_by_event, &event_delta_mad_by_event);
-    let elastic_net_ranking = build_ranking(&elastic_net_gradient_by_event, &event_delta_mad_by_event);
-    let huber_ranking = build_ranking(&huber_gradient_by_event, &event_delta_mad_by_event);
-    let quantile95_ranking = build_ranking(&quantile95_gradient_by_event, &event_delta_mad_by_event);
+    let ridge_ranking = build_ranking(&ridge_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
+    let elastic_net_ranking = build_ranking(&elastic_net_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
+    let huber_ranking = build_ranking(&huber_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
+    let quantile95_ranking = build_ranking(&quantile95_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
 
     // VIF diagnostics
     let vif_by_event = compute_vif(&event_delta_standardized_by_event);
@@ -757,16 +785,28 @@ pub fn compute_vif(x_by_event: &EventSeriesMap) -> EventScalarMap {
         return event_names.iter().map(|e| (e.clone(), 1.0)).collect();
     }
 
-    let vif_entries: Vec<(String, f64)> = event_names.par_iter().map(|target_name| {
-        let y_j: &[f64] = &x_by_event[target_name];
+    // Pre-materialize all columns ONCE — eliminates BTreeMap lookups in hot loops.
+    // Indexed by position in `event_names`.
+    let all_columns: Vec<&[f64]> = event_names
+        .iter()
+        .map(|name| x_by_event[name].as_slice())
+        .collect();
 
-        let other_names: Vec<&String> = event_names
+    let vif_entries: Vec<(String, f64)> = (0..p).into_par_iter().map(|target_idx| {
+        let target_name = &event_names[target_idx];
+        let y_j: &[f64] = all_columns[target_idx];
+
+        // Build slice of "other" columns (everything except target_idx)
+        let other_columns: Vec<&[f64]> = all_columns
             .iter()
-            .filter(|name| *name != target_name)
+            .enumerate()
+            .filter(|(i, _)| *i != target_idx)
+            .map(|(_, col)| *col)
             .collect();
-        let q = other_names.len();
+        let q = other_columns.len();
 
-        let mut xtx: Vec<Vec<f64>> = vec![vec![0.0; q]; q];
+        // Flat row-major X'X (q×q) and X'y (q)
+        let mut xtx: Vec<f64> = vec![0.0; q * q];
         let mut xty: Vec<f64> = vec![0.0; q];
         let mut yty: f64 = 0.0;
         let mut y_sum: f64 = 0.0;
@@ -776,24 +816,26 @@ pub fn compute_vif(x_by_event: &EventSeriesMap) -> EventScalarMap {
             y_sum += yt;
             yty += yt * yt;
             for a in 0..q {
-                let xa = x_by_event[other_names[a]][t];
+                let xa = other_columns[a][t];
                 xty[a] += xa * yt;
+                // Upper triangle only — mirror later
                 for b in a..q {
-                    let xb = x_by_event[other_names[b]][t];
-                    let val = xa * xb;
-                    xtx[a][b] += val;
-                    if a != b {
-                        xtx[b][a] += val;
-                    }
+                    xtx[a * q + b] += xa * other_columns[b][t];
                 }
             }
         }
-        // Tiny ridge for numerical stability in VIF auxiliary regressions
+
+        // Mirror upper triangle to lower + add tiny ridge for numerical stability
         for a in 0..q {
-            xtx[a][a] += 1e-8;
+            for b in (a + 1)..q {
+                xtx[b * q + a] = xtx[a * q + b];
+            }
+            xtx[a * q + a] += 1e-8;
         }
 
-        let beta = solve_dense_linear_system(&xtx, &xty);
+        // Solve (X'X + εI) β = X'y using the fast flat solver
+        let mut beta: Vec<f64> = vec![0.0; q];
+        solve_dense_linear_system_flat(&mut xtx, &mut xty, q, &mut beta);
 
         let y_mean_val = y_sum / n as f64;
         let ss_tot = yty - n as f64 * y_mean_val * y_mean_val;
@@ -802,7 +844,7 @@ pub fn compute_vif(x_by_event: &EventSeriesMap) -> EventScalarMap {
         for t in 0..n {
             let mut pred = 0.0;
             for a in 0..q {
-                pred += beta[a] * x_by_event[other_names[a]][t];
+                pred += beta[a] * other_columns[a][t];
             }
             let r = y_j[t] - pred;
             ss_res += r * r;
@@ -949,22 +991,49 @@ pub fn compute_grouped_impacts(
 fn build_ranking(
     coef_by_event: &EventScalarMap,
     mad_by_event: &EventScalarMap,
+    p90_by_event: &EventScalarMap,
+    p99_by_event: &EventScalarMap,
 ) -> Vec<EventImpact> {
-    let mut ranking = Vec::new();
-    for (event_name, coef) in coef_by_event.iter() {
+    let mut ranking: Vec<EventImpact> = coef_by_event.iter().map(|(event_name, coef)| {
         let mad_val = *mad_by_event.get(event_name).unwrap_or(&0.0);
-        ranking.push(EventImpact {
+        let p90_val = *p90_by_event.get(event_name).unwrap_or(&0.0);
+        let p99_val = *p99_by_event.get(event_name).unwrap_or(&0.0);
+
+        let abs_coef = coef.abs();
+
+        EventImpact {
             event_name: event_name.clone(),
             gradient_coef: *coef,
-            impact: coef.abs() * mad_val,
+            impact: abs_coef * mad_val,
             signed_impact: *coef * mad_val,
-        });
+            impact_active: abs_coef * p90_val,
+            signed_impact_active: *coef * p90_val,
+            impact_peak: abs_coef * p99_val,
+            impact_share: 0.0, // fill below
+        }
+    }).collect();
+
+    // Compute share of active impact (only over positive contributors —
+    // negative coefs are usually confounders, not bottlenecks)
+    let total_positive_active: f64 = ranking.iter()
+        .filter(|r| r.gradient_coef > 0.0)
+        .map(|r| r.impact_active)
+        .sum();
+
+    if total_positive_active > 1e-15 {
+        for r in ranking.iter_mut() {
+            if r.gradient_coef > 0.0 {
+                r.impact_share = r.impact_active / total_positive_active;
+            }
+        }
     }
-    // Sort by signed_impact descending (positive = actual bottlenecks first)
-    // then by absolute impact as tiebreaker
+
+    // Primary sort: signed_impact_active DESC
+    // This puts real bottlenecks (positive coef × active magnitude) on top,
+    // and suppressors (negative coef) at the bottom.
     ranking.sort_by(|a, b| {
-        b.signed_impact
-            .partial_cmp(&a.signed_impact)
+        b.signed_impact_active
+            .partial_cmp(&a.signed_impact_active)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranking
@@ -1020,6 +1089,34 @@ pub fn cross_model_classify(
         let in_q95 = q95_set.contains(event);
 
         let model_count = [in_ridge, in_en, in_huber, in_q95].iter().filter(|&&b| b).count();
+        let ridge_impact = section.ridge_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+                                               .unwrap_or(0.0);
+        let en_impact = section.elastic_net_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+                                               .unwrap_or(0.0);
+        let huber_impact = section.huber_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+                                               .unwrap_or(0.0);
+        let q95_impact = section.quantile95_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+                                               .unwrap_or(0.0);
+        let combined_impact = ridge_impact + en_impact + huber_impact + q95_impact;
+
+        let ridge_peak_impact = section.ridge_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+                                               .unwrap_or(0.0);
+        let en_peak_impact = section.elastic_net_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+                                               .unwrap_or(0.0);
+        let huber_peak_impact = section.huber_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+                                               .unwrap_or(0.0);
+        let q95_peak_impact = section.quantile95_top.iter() 
+                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+                                               .unwrap_or(0.0);
+
+        let combined_peak_impact = ridge_peak_impact + en_peak_impact + huber_peak_impact + q95_peak_impact;
 
         let (classification, priority) = if in_ridge && in_en && in_huber && in_q95 {
             // All 4 models agree
@@ -1110,6 +1207,8 @@ pub fn cross_model_classify(
             in_huber,
             in_quantile95: in_q95,
             priority: priority as u8,
+            combined_impact: combined_impact,
+            combined_peak_impact: combined_peak_impact,
         });
     }
 
@@ -1135,6 +1234,8 @@ pub fn print_cross_model_table(
         Cell::new("EN").with_style(Attr::Bold),
         Cell::new("Huber").with_style(Attr::Bold),
         Cell::new("Q95").with_style(Attr::Bold),
+        Cell::new("Combined Impact").with_style(Attr::Bold),
+        Cell::new("Combined Peak Impact").with_style(Attr::Bold),
         Cell::new("Description").with_style(Attr::Bold),
     ]));
 
@@ -1148,6 +1249,8 @@ pub fn print_cross_model_table(
             Cell::new(yn(c.in_elastic_net)),
             Cell::new(yn(c.in_huber)),
             Cell::new(yn(c.in_quantile95)),
+            Cell::new(&format!("{:.2}",c.combined_impact)),
+            Cell::new(&format!("{:.2}",c.combined_peak_impact)),
             Cell::new(&desc),
         ]));
         }
@@ -1155,7 +1258,7 @@ pub fn print_cross_model_table(
     }
 
 
-    let mut html = table_to_html_string(&table, &format!("Cross-Model Triangulation: {}", section_label), &["Event/Stat/SQL", "Classification", "Ridge", "EN", "Huber", "Q95", "Description"]);
+    let mut html = table_to_html_string(&table, &format!("Cross-Model Triangulation: {}", section_label), &["Event/Stat/SQL", "Classification", "Ridge", "EN", "Huber", "Q95", "Combined Impact","Combined Peak Impact","Description"]);
     html = format!(r#"<div>{html}</div>"#);
 
     /* Removing description before printing on screen, because it doesn't look good */
@@ -1216,6 +1319,9 @@ pub fn build_db_time_gradient_section(
                 event_name: x.event_name.clone(),
                 gradient_coef: x.gradient_coef,
                 impact: x.impact,
+                impact_active: x.impact_active,
+                impact_peak: x.impact_peak,
+                impact_share: x.impact_share,
             })
             .collect()
     };
@@ -1245,7 +1351,7 @@ pub fn build_db_time_gradient_section(
     };
 
     //Compute cross-model triangulation
-    section.cross_model_classifications = cross_model_classify(&section, 20);
+    section.cross_model_classifications = cross_model_classify(&section, 50);
 
     // VIF diagnostics
     section.vif_diagnostics = gradient_result.vif_by_event.iter()
@@ -1405,13 +1511,21 @@ pub fn print_db_time_gradient_tables(section: &DbTimeGradientSection, print_sett
     gradient_html
 }
 
-pub fn print_top_items_table(title: &str, items: &[GradientTopItem], logfile_name: &str, args: &Args) -> String {
+pub fn print_top_items_table(
+    title: &str,
+    items: &[GradientTopItem],
+    logfile_name: &str,
+    args: &Args,
+) -> String {
     let mut table = Table::new();
     table.set_titles(Row::new(vec![
         Cell::new("#").with_style(Attr::Bold),
         Cell::new("Wait Event/Statistic").with_style(Attr::Bold),
         Cell::new("Coef").with_style(Attr::Bold),
-        Cell::new("Impact").with_style(Attr::Bold),
+        Cell::new("Active Impact (P90)").with_style(Attr::Bold),
+        Cell::new("Peak Impact (P99)").with_style(Attr::Bold),
+        Cell::new("Share %").with_style(Attr::Bold),
+        Cell::new("Typical Impact (MAD)").with_style(Attr::Bold),
     ]));
     for (idx, item) in items.iter().enumerate() {
         table.add_row(Row::new(vec![
@@ -1421,14 +1535,299 @@ pub fn print_top_items_table(title: &str, items: &[GradientTopItem], logfile_nam
                 if item.gradient_coef > 0.0 { "↑" } else { "↓" },
                 item.gradient_coef
             )),
+            Cell::new(&format!("{:.6}", item.impact_active)),
+            Cell::new(&format!("{:.6}", item.impact_peak)),
+            Cell::new(&format!("{:.1}%", item.impact_share * 100.0)),
             Cell::new(&format!("{:.6}", item.impact)),
         ]));
     }
-    make_notes!(logfile_name, args.quiet, 0, "{}", format!("{} table (Top {})\n", title, items.len()).bright_black());
+    make_notes!(logfile_name, args.quiet, 0, "{}",
+        format!("{} table (Top {})\n", title, items.len()).bright_black());
     for table_line in table.to_string().lines() {
         make_notes!(logfile_name, args.quiet, 0, "{}\n", table_line);
     }
-    let mut html = table_to_html_string(&table, title, &["#", "Wait Event/Statistic", "Coef", "Impact"]);
+    let mut html = table_to_html_string(
+        &table,
+        title,
+        &["#", "Wait Event/Statistic", "Coef", "Active Impact (P90)",
+          "Peak Impact (P99)", "Share %", "Typical Impact (MAD)"],
+    );
     html = format!(r#"<div>{html}</div>"#);
     html
+}
+
+
+pub struct GradientSectionSpec<'a> {
+    /// Target time series (e.g. DB Time or DB CPU)
+    pub target: &'a [f64],
+    /// Feature series – already filtered/ready
+    pub features: BTreeMap<String, Vec<f64>>,
+    /// Label passed to `build_db_time_gradient_section`
+    pub label: String,
+    /// Whether this is a wait-events section (affects table rendering)
+    pub is_events: bool,
+    /// Human-readable name for logs
+    pub display_name: String,
+}
+
+pub fn run_gradient_section(
+    spec: &GradientSectionSpec,
+    ridge_lambda: f64,
+    elastic_net_lambda: f64,
+    elastic_net_alpha: f64,
+    elastic_net_max_iter: usize,
+    elastic_net_tol: f64,
+    logfile_name: &str,
+    args: &Args,
+) -> (Option<DbTimeGradientSection>, String) {
+    match build_db_time_gradient_section(
+        spec.target,
+        &spec.features,
+        ridge_lambda,
+        elastic_net_lambda,
+        elastic_net_alpha,
+        elastic_net_max_iter,
+        elastic_net_tol,
+        &spec.label,
+    ) {
+        Ok(section) => {
+            make_notes!(
+                logfile_name, false, 1,
+                "\n\n{}",
+                format!("{} attached to ReportForAI", spec.display_name)
+                    .bold().green()
+            );
+            let html = print_db_time_gradient_tables(
+                &section, spec.is_events, logfile_name, args,
+            );
+            (Some(section), html)
+        }
+        Err(err) => {
+            make_notes!(
+                logfile_name, false, 1,
+                "\n\n{} skipped: {}", spec.display_name, err
+            );
+            (None, String::new())
+        }
+    }
+}
+
+/// Specification of a single gradient section to be rendered in HTML
+pub struct GradientHtmlSection {
+    /// Section heading displayed in HTML (e.g. "DB Time vs Wait Events")
+    pub heading: String,
+    /// Rendered HTML of this section (output from `print_db_time_gradient_tables`)
+    pub html: String,
+}
+
+/// Generic function that builds a complete HTML file from gradient sections.
+///
+/// # Arguments
+/// * `title` - page title (e.g. "DB Time Gradient Analyzes" or "DB CPU Gradient Analyzes")
+/// * `main_heading` - main heading displayed on the page
+/// * `sections` - vector of gradient sections to render (in order)
+///
+/// # Returns
+/// Complete HTML document as a `String`.
+pub fn build_gradient_html(
+    title: &str,
+    main_heading: &str,
+    sections: Vec<GradientHtmlSection>,
+) -> String {
+    // Combine all non-empty sections into a single HTML block
+    let sections_html: String = sections
+        .into_iter()
+        .filter(|s| !s.html.trim().is_empty()) // skip empty sections
+        .map(|s| {
+            format!(
+                r#"                <p><span style="font-size:15px;font-weight:bold;">{}</span></p>
+                {}
+"#,
+                s.heading, s.html
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; }}
+        .content {{ font-size: 14px; }}
+        table {{
+            width: 30%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }}
+        th, td {{
+            border: 1px solid black;
+            padding: 8px;
+            text-align: center;
+        }}
+        th {{
+            background-color: #632e4f;
+            color: white;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+        }}
+        th:hover {{
+            background-color: #7a3a62;
+        }}
+        th.sort-asc::after {{
+            content: " \25B2";
+            font-size: 0.8em;
+        }}
+        th.sort-desc::after {{
+            content: " \25BC";
+            font-size: 0.8em;
+        }}
+        tr:nth-child(even) {{
+            background-color: #f2f2f2;
+        }}
+        td:first-child {{
+            text-align: right;
+            font-weight: bold;
+        }}
+        .tables-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(720px, 1fr));
+            gap: 20px;
+            align-items: start;
+        }}
+        .tables-grid table {{
+            width: 100%;
+            margin-top: 0;
+            table-layout: fixed;      /* kluczowe: nie rozpychaj się zawartością */
+            word-break: break-word;   /* długie liczby mogą się łamać */
+        }}
+        .tables-grid td,
+        .tables-grid th {{
+            overflow-wrap: anywhere;  /* żeby liczby mogły się złamać */
+            font-size: 12px;          /* odrobinę mniejsze, więcej się mieści */
+        }}
+        .cross-model table {{
+            width: 100%;
+            margin-top: 20px;
+        }}
+        .cross-model p {{
+            font-weight: bold;
+            font-size: 16px;
+            margin-top: 40px;
+        }}
+    </style>
+    <script>
+        // Generic sorter that works for every table on the page.
+        // Numeric values (including negative and scientific notation) are sorted numerically,
+        // otherwise locale-aware string comparison is used.
+        function gradientSortTable(headerCell) {{
+            const table = headerCell.closest('table');
+            if (!table) return;
+
+            // Determine the clicked column index within its own row
+            const headerRow = headerCell.parentElement;
+            const headers = Array.from(headerRow.children);
+            const columnIndex = headers.indexOf(headerCell);
+            if (columnIndex < 0) return;
+
+            // Pick the tbody (or fallback to the table itself if missing)
+            const tbody = table.tBodies[0] || table;
+            const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => {{
+                // Skip rows that are actually header rows inside tbody
+                return r.querySelector('td') !== null;
+            }});
+            if (rows.length === 0) return;
+
+            // Toggle sort direction based on the previous state stored on the header
+            const currentDir = headerCell.getAttribute('data-sort-dir');
+            const ascending = currentDir !== 'asc';
+
+            // Clear sort indicators on all headers of this table
+            table.querySelectorAll('th').forEach(th => {{
+                th.removeAttribute('data-sort-dir');
+                th.classList.remove('sort-asc', 'sort-desc');
+            }});
+
+            // Helper: try to parse a cell's text as a number
+            // Helper: try to parse a cell's text as a number
+            const parseValue = (text) => {{
+                if (text === null || text === undefined) return {{ num: NaN, str: '' }};
+                const trimmed = String(text).trim();
+                if (trimmed === '' || trimmed === '-' || trimmed === 'N/A') {{
+                    return {{ num: NaN, str: trimmed }};
+                }}
+
+                // Extract the first signed number (int, decimal, or scientific notation)
+                // from the text, ignoring leading symbols like arrows (↑ ↓), currency,
+                // thousands separators, trailing %, etc.
+                // Examples matched:
+                //   "↑ +0.123456"   -> 0.123456
+                //   "↓ -1.5e-3"     -> -0.0015
+                //   "12.5%"         -> 12.5
+                //   "1,234.56"      -> 1234.56
+                const cleaned = trimmed.replace(/,/g, '');
+                const match = cleaned.match(/[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?/);
+                if (match) {{
+                    const num = Number(match[0]);
+                    if (!isNaN(num)) {{
+                        return {{ num: num, str: trimmed }};
+                    }}
+                }}
+                return {{ num: NaN, str: trimmed }};
+            }};
+
+            // Sort the rows using the chosen column
+            rows.sort((rowA, rowB) => {{
+                const cellA = rowA.children[columnIndex];
+                const cellB = rowB.children[columnIndex];
+                const textA = cellA ? cellA.innerText : '';
+                const textB = cellB ? cellB.innerText : '';
+                const a = parseValue(textA);
+                const b = parseValue(textB);
+
+                let cmp;
+                if (!isNaN(a.num) && !isNaN(b.num)) {{
+                    cmp = a.num - b.num;
+                }} else {{
+                    cmp = a.str.localeCompare(b.str, undefined, {{ numeric: true, sensitivity: 'base' }});
+                }}
+                return ascending ? cmp : -cmp;
+            }});
+
+            // Re-append rows in the new order
+            rows.forEach(r => tbody.appendChild(r));
+
+            // Save the new direction indicator on the clicked header
+            headerCell.setAttribute('data-sort-dir', ascending ? 'asc' : 'desc');
+            headerCell.classList.add(ascending ? 'sort-asc' : 'sort-desc');
+        }}
+
+        // Attach click handlers to every table header on page load
+        document.addEventListener('DOMContentLoaded', function() {{
+            document.querySelectorAll('table th').forEach(th => {{
+                th.addEventListener('click', function() {{
+                    gradientSortTable(th);
+                }});
+            }});
+        }});
+    </script>
+</head>
+<body>
+    <div class="content">
+        <p><a href="https://github.com/ora600pl/jas-min" target="_blank">
+            <img src="https://raw.githubusercontent.com/rakustow/jas-min/main/img/jasmin_LOGO_white.png"
+                 width="150" alt="JAS-MIN" onerror="this.style.display='none';"/>
+        </a></p>
+        <p><span style="font-size:20px;font-weight:bold;">{main_heading}</span></p>
+{sections_html}
+    </div>
+</body>
+</html>
+"#
+    )
 }

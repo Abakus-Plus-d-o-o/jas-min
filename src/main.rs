@@ -97,15 +97,15 @@ struct Args {
 	#[clap(short, long, default_value="", verbatim_doc_comment)]
 	backend_assistant: String,
 
-	///Threshold for detecting anomalies using MAD
-	#[clap(short, long, default_value_t=7.0)]
-	mad_threshold: f64,
+	///TOPn for detecting anomalies using MAD 
+	#[clap(short, long, default_value_t=10)]
+	mad_threshold: usize,
 
 	///Window size for detecting anomalies using MAD for local sliding window specified as % of probes
 	#[clap(short = 'W', long, default_value_t = 100)]
     mad_window_size: usize,
 
-	///Parallelism level
+	///Parallelism level 
 	#[clap(short = 'P', long, default_value_t=4)]
     parallel: usize,
 
@@ -155,6 +155,10 @@ struct Args {
 	///Convert existing markdown file to HTML without calling AI model 
 	#[clap(short, long, default_value="", verbatim_doc_comment)]
 	convert_md2html: String,
+
+	///Build customer gradient analyze for given SQL_ID
+    #[clap(short = 'G', long, default_value="", verbatim_doc_comment)]
+	gradient_sql: String,
 }
 
 
