@@ -1,36 +1,585 @@
-use colored::Colorize;
+use crate::ai_tools::*;
+use crate::awr::{
+    load_awrs_collection_from_json_str, AWRSCollection, HostCPU, IOStats, LoadProfile, SQLCPUTime,
+    SQLGets, SQLIOTime, SQLReads, SegmentStats, WaitEvents, AWR,
+};
+use crate::{debug_note, tools::*};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
-use reqwest::{Client, multipart};
+use colored::Colorize;
 use reqwest::multipart::{Form, Part};
-use serde_json::json;
-use std::env::Args;
-use std::fmt::format;
-use std::borrow::Cow;
-use std::{env, fs, collections::HashMap, sync::Arc, path::Path, collections::HashSet};
-use axum::{routing::post, Router, Json, extract::State, http::StatusCode, response::IntoResponse};
+use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_json::Value;
-use tower_http::cors::{CorsLayer, Any};
+use std::borrow::Cow;
+use std::env::Args;
+use std::error::Error;
+use std::fmt::format;
+use std::io::{stdout, Write};
+use std::str::FromStr;
+use std::{collections::HashMap, collections::HashSet, env, fs, path::Path, sync::Arc};
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tokio::sync::oneshot;
-use std::io::{stdout, Write};
-use std::error::Error;
-use crate::tools::*;
-use crate::awr::{AWRSCollection, HostCPU, IOStats, LoadProfile, SQLCPUTime, SQLGets, SQLIOTime, SQLReads, SegmentStats, WaitEvents, AWR};
-use std::str::FromStr;
+use tower_http::cors::{Any, CorsLayer};
 
 fn get_openai_url() -> String {
     env::var("OPENAI_URL").unwrap_or_else(|_| "https://api.openai.com/".to_string())
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
-pub struct StatisticsDescription {
-    pub dbcpu_dbtime: String,
-    pub median_absolute_deviation: String, 
+fn stem_from_logfile(logfile_name: &str) -> &str {
+    logfile_name.split('.').next().unwrap_or(logfile_name)
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+fn load_profile_for_stem(stem: &str) -> String {
+    let json_path = format!("{stem}.html_reports/stats/global_statistics.json");
+    fs::read_to_string(&json_path).expect(&format!("Can't open file {}", json_path))
+}
+
+fn load_tools_collection(args: &crate::Args) -> AWRSCollection {
+    let mut json_file = args.json_file().to_string();
+    if json_file.is_empty() {
+        json_file = format!("{}.json", args.directory());
+    }
+    let s_json = fs::read_to_string(&json_file).expect(&format!("Can't read {}", json_file));
+    load_awrs_collection_from_json_str(&s_json).expect("Wrong AWRSCollection JSON")
+}
+
+fn build_model_instructions(
+    lang: &str,
+    args: &crate::Args,
+    events_sqls: &HashMap<&str, HashSet<String>>,
+    stem: &str,
+    tools_mode: bool,
+) -> String {
+    let mut spell = format!("{} {}", SPELL, lang);
+
+    if let Some(pr) = private_reasonings() {
+        spell = format!("{spell}\n#ADVANCED RULES\n{pr}");
+    }
+
+    if !args.url_context_file.is_empty() {
+        if let Some(urls) = url_context(&args.url_context_file, events_sqls.clone()) {
+            spell = format!("{spell}\n# URL CONTEXT\n{urls}");
+        }
+    }
+
+    if tools_mode {
+        spell.push_str(&tools_mode_instructions(stem));
+    }
+
+    spell
+}
+
+fn tools_mode_instructions(stem: &str) -> String {
+    let attachments_dir = format!("{stem}_attachments");
+    let aix_dir = format!("{attachments_dir}/AIX");
+    let xplan_note = if Path::new(&attachments_dir).is_dir() {
+        format!(
+            "\nAvailable execution-plan attachment directory: `{}`. \
+             If list_available_sql_plans is present, use it to discover SQL_IDs with plans. \
+             If list_available_child_cursor_reasons is present, use it to discover TOP SQL_IDs \
+             for which decoded V$SQL_SHARED_CURSOR.REASON evidence was collected.",
+            attachments_dir
+        )
+    } else {
+        String::new()
+    };
+    let alertlog_note = if Path::new(&attachments_dir).is_dir() {
+        format!(
+            "\nIf get_alertlog_errors is present, an alert.log-like file was found in `{}`. \
+             Use it as additional evidence when the report mentions parse errors, ORA/TNS errors, incidents, warnings, failed operations, disconnects, redo/log allocation issues, or any symptom that may be explained by alert.log messages. \
+             Query the narrowest relevant date range and request parse-error details when parse errors are suspected.",
+            attachments_dir
+        )
+    } else {
+        String::new()
+    };
+    let aix_note = if Path::new(&aix_dir).is_dir() {
+        format!(
+            "\nAIX OS attachment directory is available: `{}`. \
+             If AIX tools are present, you MUST call get_db_instance_info and get_aix_cpu_entitlement_summary before deciding whether the system is CPU-bound. \
+             On AIX LPARs, AWR Host CPU %CPU and DB CPU/DB Time can be misleading when Entc%/%entc is high. \
+             If Entc%/ec is near saturation, do NOT dismiss CPU pressure because the LPAR is uncapped, because AWR Host CPU idle is nonzero, or because the shared pool has theoretical spare capacity. \
+             If Entc%/physc/pc/EC/capped/shared-dedicated details are not available from tools, ask the user for those OS details and do not make a final CPU-bound classification.",
+            aix_dir
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "\n\n# TOOLS MODE\n\
+         You have access to diagnostic tools that fetch detailed AWR/STATSPACK data on demand. \
+         Use tools proactively. Do not rely only on the initial summary when a precise tool call can verify or falsify a hypothesis. \
+         Start with get_database_load_summary unless the user request is already very narrow. \
+         For suspicious snapshots, call list_snapshots, compare_snapshots, top_wait_events_in_snapshot, top_sqls_in_snapshot, get_metric_time_series, get_sql_timeline, or get_wait_event_timeline as needed. \
+         For every SQL_ID that materially contributes to DB Time, elapsed time, DB CPU, I/O time, buffer gets, physical reads, anomalous waits, or regression symptoms, call get_sql_text and get_sql_timeline. When a wait-to-SQL contributor tool is exposed, use it for every material foreground wait and preserve correlation versus direct ASH attribution separately. \
+         If execution-plan tools are available, you are expected to use list_available_sql_plans and get_sql_execution_plan for important SQL_IDs before making SQL tuning recommendations. Classify BEGIN/DECLARE/CALL entry points as PL/SQL: a top-level row-source plan is not applicable, so profile the PL/SQL unit and inspect its inner SQL instead of requesting DBMS_XPLAN recapture. \
+         If child-cursor reason tools are available, call list_available_child_cursor_reasons and get_child_cursor_reasons before explaining child cursor proliferation, version_count growth, parsing pressure, library cache or cursor mutex contention, optimizer/NLS/bind/authorization mismatches, or plan instability. Treat A/B values as comparison-vector sides, never chronological old/new values. \
+         If alert.log tools are available, use get_alertlog_errors to verify error evidence for relevant date ranges, especially before dismissing parse errors or other reported failures as unrelated. \
+         If AIX OS tools are available or get_db_instance_info reports an AIX platform, use get_aix_cpu_entitlement_summary before any CPU-bound conclusion; never rely only on %CPU, DB CPU, or DB CPU/DB Time on AIX. High Entc%/%entc/ec or physc/pc near entitlement is CPU entitlement/physical-capacity pressure even on uncapped LPARs and even when AWR Host CPU idle is nonzero. \
+         When you fetch an applicable SQL execution plan, produce a dedicated analysis covering: dominant operations, access paths, join methods and join order, cardinality estimate errors, partition pruning, parallel execution, adaptive plan notes, temp spills/sorts, index usage, and concrete remediation options. For a PL/SQL entry point, report instrumentation and inner-SQL coverage instead of inventing plan findings. \
+         Recommendations must be specific and evidence-based: statistics refresh, histograms, extended statistics, SQL rewrite, indexing, partitioning, SQL Plan Management baseline/profile, bind/literal handling, or application-side change. \
+         Prefer multiple narrow tool calls over guessing. Stop calling tools only when you have enough evidence to produce the FINAL markdown report following the OUTPUT STRUCTURE.{}",
+        format!("{xplan_note}{alertlog_note}{aix_note}")
+    )
+}
+
+fn available_attachments_prompt(stem: &str) -> Option<String> {
+    let attachments_dir = format!("{stem}_attachments");
+    let aix_dir = format!("{attachments_dir}/AIX");
+    let mut lines = Vec::new();
+
+    if Path::new(&attachments_dir).is_dir() {
+        lines.push("Execution plan attachments (*.xplan) may be available through tools. Use list_available_sql_plans and get_sql_execution_plan for important SQL_IDs before making SQL tuning recommendations.".to_string());
+        lines.push("Decoded V$SQL_SHARED_CURSOR.REASON attachments (*.shared_cursor_reasons) may be available through tools. Use list_available_child_cursor_reasons and get_child_cursor_reasons before explaining child cursor proliferation, parsing pressure, cursor/library-cache contention, or plan instability.".to_string());
+    }
+
+    if Path::new(&aix_dir).is_dir() {
+        lines.push("AIX OS attachments were found under the AIX subdirectory. If the database platform is AIX, use get_db_instance_info and get_aix_cpu_entitlement_summary before deciding whether the system is CPU-bound. Entc%/%entc/ec is mandatory evidence on shared/capped/uncapped LPARs; low %CPU, nonzero AWR Host CPU idle, uncapped mode, or shared-pool spare capacity do not clear CPU saturation when Entc% is high.".to_string());
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "### AVAILABLE ATTACHMENTS\n{}\n-- END AVAILABLE ATTACHMENTS --",
+            lines.join("\n")
+        ))
+    }
+}
+
+fn final_synthesis_request() -> &'static str {
+    r#"
+You have reached the maximum number of allowed tool iterations.
+
+You must now write the final Oracle performance analysis report in Markdown.
+
+Rules:
+- Do not request or call any more tools.
+- Use the original ReportForAI / AWR / Statspack data already provided.
+- Use all tool results already returned in this conversation.
+- If some SQL texts or execution plans were not inspected, do not invent their details.
+- Focus on evidence-backed findings, impact, root causes, and concrete recommendations.
+- Do not mention that the tool budget was exhausted.
+- Produce the final Markdown report now.
+"#
+}
+
+fn estimate_tokens_from_value(value: &Value) -> usize {
+    let payload_str = serde_json::to_string(value).unwrap_or_default();
+    estimate_tokens_from_str(&payload_str)
+}
+
+fn openrouter_bad_response_path(response_file: &str, context: &str) -> String {
+    let safe_context = context.replace(' ', "_");
+    format!("{response_file}.{safe_context}.bad_response.json")
+}
+
+fn parse_openrouter_response_json(
+    body: &str,
+    response_file: &str,
+    context: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    if body.trim().is_empty() {
+        let debug_path = openrouter_bad_response_path(response_file, context);
+        let _ = fs::write(&debug_path, body.as_bytes());
+        return Err(format!(
+            "OpenRouter returned an empty or whitespace-only response during {context}. \
+             Raw response saved to {debug_path} ({} chars).",
+            body.chars().count()
+        )
+        .into());
+    }
+
+    match serde_json::from_str(body) {
+        Ok(json) => Ok(json),
+        Err(e) => {
+            let debug_path = openrouter_bad_response_path(response_file, context);
+            let _ = fs::write(&debug_path, body.as_bytes());
+            Err(format!(
+                "OpenRouter returned malformed JSON during {context}: {e}. \
+                 Raw response saved to {debug_path} ({} chars).",
+                body.chars().count()
+            )
+            .into())
+        }
+    }
+}
+
+const OPENROUTER_REQUEST_ATTEMPTS: usize = 3;
+
+fn openrouter_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+async fn request_openrouter_json(
+    client: &Client,
+    api_key: &str,
+    payload: &Value,
+    response_file: &str,
+    context: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut last_error = String::new();
+    let mut attempts_made = 0;
+
+    for attempt in 1..=OPENROUTER_REQUEST_ATTEMPTS {
+        attempts_made = attempt;
+        debug_note!(
+            "OpenRouter request attempt: context='{}', attempt={}/{}, payload_bytes={}",
+            context,
+            attempt,
+            OPENROUTER_REQUEST_ATTEMPTS,
+            payload.to_string().len()
+        );
+        let (tx, rx) = oneshot::channel();
+        let spinner = tokio::spawn(spinning_beer(rx));
+
+        let response_result = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("X-Title", "jas-min")
+            .json(payload)
+            .send()
+            .await;
+
+        let _ = tx.send(());
+        let _ = spinner.await;
+
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("OpenRouter transport error during {context}: {error}");
+                debug_note!(
+                    "OpenRouter transport failure: context='{}', attempt={}, error={}",
+                    context,
+                    attempt,
+                    error
+                );
+                if attempt < OPENROUTER_REQUEST_ATTEMPTS {
+                    eprintln!(
+                        "⚠️ {last_error}. Retrying ({}/{})...",
+                        attempt + 1,
+                        OPENROUTER_REQUEST_ATTEMPTS
+                    );
+                    sleep(Duration::from_secs(attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                last_error =
+                    format!("Could not read OpenRouter response body during {context}: {error}");
+                if attempt < OPENROUTER_REQUEST_ATTEMPTS {
+                    eprintln!(
+                        "⚠️ {last_error}. Retrying ({}/{})...",
+                        attempt + 1,
+                        OPENROUTER_REQUEST_ATTEMPTS
+                    );
+                    sleep(Duration::from_secs(attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+        debug_note!(
+            "OpenRouter response received: context='{}', attempt={}, status={}, body_bytes={}",
+            context,
+            attempt,
+            status,
+            body.len()
+        );
+
+        if !status.is_success() {
+            last_error = format!(
+                "OpenRouter returned HTTP {status} during {context}: {}",
+                body.trim()
+            );
+            if openrouter_retryable_status(status) && attempt < OPENROUTER_REQUEST_ATTEMPTS {
+                eprintln!(
+                    "⚠️ {last_error}. Retrying ({}/{})...",
+                    attempt + 1,
+                    OPENROUTER_REQUEST_ATTEMPTS
+                );
+                sleep(Duration::from_secs(attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        let diagnostic_context = if attempt == OPENROUTER_REQUEST_ATTEMPTS {
+            context.to_string()
+        } else {
+            format!("{context}.attempt_{attempt}")
+        };
+
+        match parse_openrouter_response_json(&body, response_file, &diagnostic_context) {
+            Ok(json) => {
+                debug_note!(
+                    "OpenRouter response parsed: context='{}', attempt={}",
+                    context,
+                    attempt
+                );
+                return Ok(json);
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt < OPENROUTER_REQUEST_ATTEMPTS {
+                    eprintln!(
+                        "⚠️ {last_error} Retrying ({}/{})...",
+                        attempt + 1,
+                        OPENROUTER_REQUEST_ATTEMPTS
+                    );
+                    sleep(Duration::from_secs(attempt as u64)).await;
+                    continue;
+                }
+            }
+        }
+    }
+
+    debug_note!(
+        "OpenRouter request exhausted retries: context='{}', attempts={}, last_error={}",
+        context,
+        attempts_made,
+        last_error
+    );
+    Err(format!(
+        "OpenRouter request failed during {context} after {attempts_made} attempt(s): {last_error}"
+    )
+    .into())
+}
+
+fn openrouter_payload_tokens(model: &str, messages: &[Value], tools: Option<&Value>) -> usize {
+    let mut payload = json!({
+        "model": model,
+        "messages": messages,
+        "reasoning": { "effort": "high" },
+        "stream": false
+    });
+
+    if let Some(tools) = tools {
+        payload["tools"] = tools.clone();
+        payload["tool_choice"] = json!("auto");
+    }
+
+    estimate_tokens_from_value(&payload)
+}
+
+fn gemini_payload_tokens(spell: &str, contents: &[Value], tools: Option<&Value>) -> usize {
+    let mut payload = json!({
+        "systemInstruction": {
+            "parts": [{ "text": format!("### SYSTEM INSTRUCTIONS\n{spell}") }]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "thinkingConfig": {
+                "thinkingBudget": -1
+            }
+        }
+    });
+
+    if let Some(tools) = tools {
+        payload["tools"] = tools.clone();
+        payload["toolConfig"] = json!({
+            "functionCallingConfig": { "mode": "AUTO" }
+        });
+    }
+
+    estimate_tokens_from_value(&payload)
+}
+
+fn openai_responses_payload_tokens(
+    model: &str,
+    input_messages: &[Value],
+    tools: Option<&Value>,
+) -> usize {
+    let mut payload = json!({
+        "model": model,
+        "input": input_messages,
+    });
+
+    if let Some(tools) = tools {
+        payload["tools"] = tools.clone();
+        payload["tool_choice"] = json!("auto");
+    }
+
+    estimate_tokens_from_value(&payload)
+}
+
+fn compact_openrouter_tool_results_for_budget(
+    model: &str,
+    messages: &mut Vec<Value>,
+    budget_tokens: usize,
+) -> usize {
+    let mut compacted = 0;
+
+    while openrouter_payload_tokens(model, messages, None) > budget_tokens {
+        let largest_tool_message = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, msg)| {
+                if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+                    return None;
+                }
+
+                let len = msg
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+
+                Some((idx, len))
+            })
+            .max_by_key(|(_, len)| *len);
+
+        let Some((idx, len)) = largest_tool_message else {
+            break;
+        };
+
+        if len <= 2048 {
+            break;
+        }
+
+        let original = messages[idx]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prefix: String = original.chars().take(2048).collect();
+        messages[idx]["content"] = json!(format!(
+            "{}\n\n[Tool result truncated by JAS-MIN token budget guard. Original length: {} chars.]",
+            prefix, len
+        ));
+        compacted += 1;
+    }
+
+    compacted
+}
+
+fn compact_gemini_tool_results_for_budget(
+    spell: &str,
+    contents: &mut Vec<Value>,
+    budget_tokens: usize,
+) -> usize {
+    let mut compacted = 0;
+
+    while gemini_payload_tokens(spell, contents, None) > budget_tokens {
+        let largest_tool_response = contents
+            .iter()
+            .enumerate()
+            .filter_map(|(msg_idx, content)| {
+                let parts = content.get("parts")?.as_array()?;
+                let mut max_part: Option<(usize, usize)> = None; // (part_idx, len)
+                for (part_idx, part) in parts.iter().enumerate() {
+                    if let Some(response) = part.pointer("/functionResponse/response") {
+                        let len = serde_json::to_string(response)
+                            .map(|s| s.chars().count())
+                            .unwrap_or(0);
+                        if max_part.is_none() || len > max_part.unwrap().1 {
+                            max_part = Some((part_idx, len));
+                        }
+                    }
+                }
+                max_part.map(|(part_idx, len)| (msg_idx, part_idx, len))
+            })
+            .max_by_key(|&(_, _, len)| len);
+
+        let Some((msg_idx, part_idx, len)) = largest_tool_response else {
+            break;
+        };
+
+        if len <= 2048 {
+            break;
+        }
+
+        let original = contents[msg_idx]
+            .pointer(&format!("/parts/{}/functionResponse/response", part_idx))
+            .and_then(|v| serde_json::to_string(v).ok())
+            .unwrap_or_default();
+        let prefix: String = original.chars().take(2048).collect();
+
+        if let Some(response) =
+            contents[msg_idx].pointer_mut(&format!("/parts/{}/functionResponse/response", part_idx))
+        {
+            *response = json!({
+                "truncated_by_jasmin_token_budget": true,
+                "original_length_chars": len,
+                "prefix": prefix
+            });
+            compacted += 1;
+        } else {
+            break;
+        }
+    }
+
+    compacted
+}
+
+fn compact_openai_tool_results_for_budget(
+    model: &str,
+    input_messages: &mut Vec<Value>,
+    budget_tokens: usize,
+) -> usize {
+    let mut compacted = 0;
+
+    while openai_responses_payload_tokens(model, input_messages, None) > budget_tokens {
+        let largest_tool_output = input_messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                if item.get("type").and_then(|v| v.as_str()) != Some("function_call_output") {
+                    return None;
+                }
+
+                let len = item
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+
+                Some((idx, len))
+            })
+            .max_by_key(|(_, len)| *len);
+
+        let Some((idx, len)) = largest_tool_output else {
+            break;
+        };
+
+        if len <= 2048 {
+            break;
+        }
+
+        let original = input_messages[idx]
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prefix: String = original.chars().take(2048).collect();
+        input_messages[idx]["output"] = json!(format!(
+            "{}\n\n[Tool result truncated by JAS-MIN token budget guard. Original length: {} chars.]",
+            prefix, len
+        ));
+        compacted += 1;
+    }
+
+    compacted
+}
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+pub struct StatisticsDescription {
+    pub dbcpu_dbtime: String,
+    pub median_absolute_deviation: String,
+}
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct TopPeaksSelected {
     pub report_name: String,
     pub report_date: String,
@@ -40,7 +589,7 @@ pub struct TopPeaksSelected {
     pub dbcpu_dbtime_ratio: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct MadAnomaliesEvents {
     pub anomaly_date: String,
     pub mad_score: f64,
@@ -50,7 +599,7 @@ pub struct MadAnomaliesEvents {
     pub pct_of_db_time: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct MadAnomaliesSQL {
     pub anomaly_date: String,
     pub mad_score: f64,
@@ -59,7 +608,7 @@ pub struct MadAnomaliesSQL {
     pub avg_exec_time_for_execution: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct TopForegroundWaitEvents {
     pub event_name: String,
     pub correlation_with_db_time: f64,
@@ -77,7 +626,7 @@ pub struct TopForegroundWaitEvents {
     pub tables_associated_with_event_based_on_ash_sql: Option<Vec<String>>,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct TopBackgroundWaitEvents {
     pub event_name: String,
     pub correlation_with_db_time: f64,
@@ -93,7 +642,7 @@ pub struct TopBackgroundWaitEvents {
     pub median_absolute_deviation_anomalies: Vec<MadAnomaliesEvents>,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct PctOfTimesThisSQLFoundInOtherTopSections {
     pub sqls_by_cpu_time_pct: f64,
     pub sqls_by_user_io_pct: f64,
@@ -101,13 +650,13 @@ pub struct PctOfTimesThisSQLFoundInOtherTopSections {
     pub sqls_by_gets: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct WaitEventsWithStrongCorrelation {
     pub event_name: String,
     pub correlation_value: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct WaitEventsFromASH {
     pub event_name: String,
     pub avg_pct_of_dbtime_in_sql: f64,
@@ -115,7 +664,7 @@ pub struct WaitEventsFromASH {
     pub count: u64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct TopSQLsByElapsedTime {
     pub sql_id: String,
     pub module: String,
@@ -138,20 +687,20 @@ pub struct TopSQLsByElapsedTime {
     pub wait_events_found_in_ash_sections_for_this_sql: Vec<WaitEventsFromASH>,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct StatsSummary {
     pub statistic_name: String,
     pub avg_value: f64,
     pub stddev_value: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct IOStatsByFunctionSummary {
     pub function_name: String,
     pub statistics_summary: Vec<StatsSummary>,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct LatchActivitySummary {
     pub latch_name: String,
     pub get_requests_avg: f64,
@@ -160,7 +709,7 @@ pub struct LatchActivitySummary {
     pub found_in_pct_of_probes: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct Top10SegmentStats {
     pub segment_name: String,
     pub segment_type: String,
@@ -171,13 +720,13 @@ pub struct Top10SegmentStats {
     pub pct_of_occuriance: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct InstanceStatisticCorrelation {
     pub stat_name: String,
     pub pearson_correlation_value: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct LoadProfileAnomalies {
     pub load_profile_stat_name: String,
     pub anomaly_date: String,
@@ -187,13 +736,13 @@ pub struct LoadProfileAnomalies {
     pub avg_value_per_second: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct AnomalyDescription {
     pub area_of_anomaly: String,
     pub statistic_name: String,
 }
- 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct AnomlyCluster {
     pub begin_snap_id: u64,
     pub begin_snap_date: String,
@@ -201,10 +750,28 @@ pub struct AnomlyCluster {
     pub number_of_anomalies: u64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct GradientSettings {
     pub ridge_lambda: f64,
+    /// Selected Elastic Net lambda. In automatic mode this is the value chosen
+    /// by forward-chaining validation and used for the final full-data fit.
     pub elastic_net_lambda: f64,
+    #[serde(default)]
+    pub elastic_net_lambda_mode: String,
+    #[serde(default)]
+    pub elastic_net_lambda_max: f64,
+    #[serde(default)]
+    pub elastic_net_lambda_ratio: f64,
+    #[serde(default)]
+    pub elastic_net_cv_folds: usize,
+    #[serde(default)]
+    pub elastic_net_cv_rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elastic_net_cv_mean_loss: Option<f64>,
+    #[serde(default)]
+    pub elastic_net_nonzero_coefficients: usize,
+    #[serde(default)]
+    pub elastic_net_target_standardized: bool,
     pub elastic_net_alpha: f64,
     pub elastic_net_max_iter: usize,
     pub elastic_net_tol: f64,
@@ -212,17 +779,17 @@ pub struct GradientSettings {
     pub input_db_time_unit: String,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct GradientTopItem {
     pub event_name: String,
     pub gradient_coef: f64,
-    pub impact: f64,              // typical (MAD-based) — legacy, keep for compatibility
-    pub impact_active: f64,       // P90-based — primary tuning metric
-    pub impact_peak: f64,         // P99-based — worst-case
-    pub impact_share: f64,        // % of total active impact
+    pub impact: f64,        // typical (MAD-based) — legacy, keep for compatibility
+    pub impact_active: f64, // P90-based — primary tuning metric
+    pub impact_peak: f64,   // P99-based — worst-case
+    pub impact_share: f64,  // % of total active impact
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct DbTimeGradientSection {
     pub settings: GradientSettings,
     pub ridge_top: Vec<GradientTopItem>,
@@ -236,7 +803,7 @@ pub struct DbTimeGradientSection {
     pub collinear_group_impacts: Vec<CollinearGroupImpact>,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct CrossModelClassification {
     pub event_name: String,
     pub classification: String,
@@ -265,7 +832,52 @@ pub struct CollinearGroupImpact {
     pub combined_coef: f64,
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+pub struct DbTimeDegradationReport {
+    pub is_degradation_detected: bool,
+    pub verdict: String,
+    pub baseline_start: String,
+    pub baseline_end: String,
+    pub degraded_start: String,
+    pub degraded_end: String,
+    pub baseline_samples: usize,
+    pub degraded_samples: usize,
+    pub db_time_baseline_avg: f64,
+    pub db_time_degraded_avg: f64,
+    pub db_time_delta_avg: f64,
+    pub db_time_delta_pct: f64,
+    pub db_time_robust_z_score: f64,
+    pub db_cpu_baseline_avg: f64,
+    pub db_cpu_degraded_avg: f64,
+    pub db_cpu_delta_avg: f64,
+    pub db_cpu_delta_pct: f64,
+    pub dominant_domains: Vec<DbTimeDegradationDomainSummary>,
+    pub findings: Vec<DbTimeDegradationFinding>,
+}
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+pub struct DbTimeDegradationDomainSummary {
+    pub domain: String,
+    pub findings_count: usize,
+    pub total_positive_delta: f64,
+}
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+pub struct DbTimeDegradationFinding {
+    pub domain: String,
+    pub name: String,
+    pub baseline_avg: f64,
+    pub degraded_avg: f64,
+    pub delta_avg: f64,
+    pub delta_pct: f64,
+    pub robust_z_score: f64,
+    pub correlation_with_db_time: f64,
+    pub estimated_db_time_delta_share: f64,
+    pub severity: String,
+    pub evidence: String,
+}
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct ReportForAI {
     pub general_data: StatisticsDescription,
     pub top_spikes_marked: Vec<TopPeaksSelected>,
@@ -292,8 +904,9 @@ pub struct ReportForAI {
     pub db_time_gradient_sql_elapsed_time: Option<DbTimeGradientSection>,
     pub db_cpu_gradient_instance_stats: Option<DbTimeGradientSection>,
     pub db_cpu_gradient_sql_cpu_time: Option<DbTimeGradientSection>,
-    pub sql_id_gradient_wait_events: Option<DbTimeGradientSection>,
-    pub sql_id_gradient_instance_stats: Option<DbTimeGradientSection>,
+    pub custom_gradient_wait_events: Option<DbTimeGradientSection>,
+    pub custom_gradient_instance_stats: Option<DbTimeGradientSection>,
+    pub db_time_degradation_report: Option<DbTimeDegradationReport>,
     pub initialization_parameters: HashMap<String, String>,
 }
 
@@ -357,6 +970,10 @@ The ReportForAI contains these analytical sections:
 - `instance_stats_pearson_correlation` — instance statistics correlated with DB Time (abs(rho) >= 0.5)
 - `load_profile_anomalies` — MAD-detected load profile anomalies
 - `anomaly_clusters` — temporally grouped anomalies across multiple domains
+- `db_time_degradation_report` — baseline-vs-recent statistical degradation report for DB Time.
+  Use it to state whether the latest snapshots statistically departed from the prior baseline,
+  and to list the SQL IDs, wait events, instance statistics, time-model metrics, and load-profile
+  counters that increased together with DB Time.
 - `initialization_parameters` — Oracle instance initialization parameters (name-value pairs). 
   Contains both explicit (user-set) and default parameter values from the analyzed instance.
 
@@ -390,6 +1007,14 @@ Each gradient section contains results from four regression models:
 - **Huber** (`huber_top`) — outlier-resistant ranking (downweights extreme snapshots)
 - **Quantile 95** (`quantile95_top`) — models the worst 5% of snapshots (tail risk)
 
+Elastic Net standardizes both predictor and target deltas. Unless a fixed lambda override was
+requested, it selects a per-section lambda from a lambda/lambda_max path using expanding-window,
+forward-chaining validation and the one-standard-error rule. Inspect `settings.elastic_net_lambda_mode`,
+`elastic_net_lambda`, `elastic_net_lambda_max`, `elastic_net_lambda_ratio`, `elastic_net_cv_rule`,
+`elastic_net_cv_folds`, and `elastic_net_nonzero_coefficients` before interpreting an empty or unusually
+dense sparse-model result. The reported coefficient has already been converted back to DB Time or DB CPU
+target units; do not apply target standard deviation a second time.
+
 ### Gradient Impact Metrics (GradientTopItem fields)
 
 Each entry in `ridge_top` / `elastic_net_top` / `huber_top` / `quantile95_top` contains:
@@ -399,15 +1024,15 @@ Each entry in `ridge_top` / `elastic_net_top` / `huber_top` / `quantile95_top` c
   Sign matters: positive = contributes to DB Time, negative = suppressor/confounder.
   Use for understanding mechanics.
 
-- `impact_active` = abs(coef) * P90(abs(delta_x)) — **PRIMARY TUNING METRIC**.
+- `impact_active` = abs(coef / stddev(delta_x)) * P90(abs(delta_x)) — **PRIMARY TUNING METRIC**.
   Contribution to DB Time when the predictor is actively moving (not during idle periods).
   Expressed in DB Time units. **Use this first when ranking bottlenecks.**
 
-- `impact_peak` = abs(coef) * P99(abs(delta_x)) — worst-case single-snapshot contribution.
+- `impact_peak` = abs(coef / stddev(delta_x)) * P99(abs(delta_x)) — worst-case single-snapshot contribution.
   How much DB Time this predictor can add during its most aggressive moments.
   Use for capacity planning and identifying spike causes.
 
-- `impact` = abs(coef) * MAD(delta_x) — legacy/typical impact.
+- `impact` = abs(coef / stddev(delta_x)) * MAD(delta_x) — legacy/typical impact.
   Contribution during *median* variability. Often near zero for bursty events.
   Use only as comparison baseline (see diagnostic rule below).
 
@@ -506,6 +1131,7 @@ Follow this reasoning sequence:
 ## Step 1: Establish Performance Profile
 - Interpret DB CPU / DB Time ratio across all spikes (< 0.66 = wait-bound, ~1.0 = CPU-bound)
 - Assess ratio variance for mixed/intermittent problems
+- AIX caveat: if the platform is AIX, do not decide CPU-bound from DB CPU/DB Time or AWR Host CPU %CPU alone. Entc%/%entc/ec, physc/pc, EC, capped/uncapped and shared/dedicated LPAR data are required; if Entc%/ec is high, classify it as CPU entitlement/physical-capacity pressure even when AWR idle is nonzero or the LPAR is uncapped.
 
 ## Step 2: Map Temporal Patterns
 - Connect anomaly_clusters to top_spikes_marked via snap_id and dates
@@ -630,6 +1256,7 @@ Your recommendations MUST include explicit answers to:
 
 # LANGUAGE
 
+Language style has to be precise, descriptive and professional. 
 Write answer in language: ";
 
 #[derive(Deserialize)]
@@ -674,12 +1301,11 @@ fn private_reasonings() -> Option<String> {
     Some(r_content)
 }
 
-#[derive(Default,Serialize, Deserialize, Debug, Clone)]
-struct UrlContext{
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+struct UrlContext {
     action: String,
     url: String,
 }
-
 
 fn url_context(url_fname: &str, events_sqls: HashMap<&str, HashSet<String>>) -> Option<String> {
     let r_content = fs::read_to_string(url_fname);
@@ -688,7 +1314,8 @@ fn url_context(url_fname: &str, events_sqls: HashMap<&str, HashSet<String>>) -> 
         println!("Couldn't read url file");
         return None;
     }
-    let url_context_data: HashMap<String, Vec<UrlContext>> = serde_json::from_str(&r_content.unwrap()).expect("Wrong url file JSON format");
+    let url_context_data: HashMap<String, Vec<UrlContext>> =
+        serde_json::from_str(&r_content.unwrap()).expect("Wrong url file JSON format");
     let mut url_context_msg = "\nAdditionally you have to follow those commands:".to_string();
 
     for (_, search_key) in events_sqls {
@@ -704,7 +1331,12 @@ fn url_context(url_fname: &str, events_sqls: HashMap<&str, HashSet<String>>) -> 
     Some(url_context_msg)
 }
 
-async fn upload_file_to_gemini_from_path(api_key: &str, path: &str, file_type: &str,file_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn upload_file_to_gemini_from_path(
+    api_key: &str,
+    path: &str,
+    file_type: &str,
+    file_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let file_bytes = fs::read(path)?;
 
     let part = multipart::Part::bytes(file_bytes)
@@ -715,7 +1347,10 @@ async fn upload_file_to_gemini_from_path(api_key: &str, path: &str, file_type: &
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!("https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",api_key))
+        .post(format!(
+            "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
+            api_key
+        ))
         .multipart(form)
         .send()
         .await?;
@@ -724,7 +1359,10 @@ async fn upload_file_to_gemini_from_path(api_key: &str, path: &str, file_type: &
         let response_text = response.text().await?;
         match serde_json::from_str::<GeminiFileUploadResponse>(&response_text) {
             Ok(file_upload_response) => {
-                println!("✅ {} uploaded! URI: {}", path, file_upload_response.file.uri);
+                println!(
+                    "✅ {} uploaded! URI: {}",
+                    path, file_upload_response.file.uri
+                );
                 Ok(file_upload_response.file.uri)
             }
             Err(e) => {
@@ -740,19 +1378,28 @@ async fn upload_file_to_gemini_from_path(api_key: &str, path: &str, file_type: &
     }
 }
 
-async fn upload_log_file_gemini(api_key: &str, log_content: String, file_name: String) -> Result<String, Box<dyn std::error::Error>> {
+async fn upload_log_file_gemini(
+    api_key: &str,
+    log_content: String,
+    file_name: String,
+) -> Result<String, Box<dyn std::error::Error>> {
     let part = multipart::Part::bytes(log_content.into_bytes())
-        .file_name(file_name) 
-        .mime_str("text/plain").unwrap();
+        .file_name(file_name)
+        .mime_str("text/plain")
+        .unwrap();
 
     let form = multipart::Form::new().part("file", part);
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!("https://generativelanguage.googleapis.com/upload/v1beta/files?key={}", api_key))
+        .post(format!(
+            "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
+            api_key
+        ))
         .multipart(form)
         .send()
-        .await.unwrap();
+        .await
+        .unwrap();
 
     if response.status().is_success() {
         let response_text = response.text().await?;
@@ -761,7 +1408,7 @@ async fn upload_log_file_gemini(api_key: &str, log_content: String, file_name: S
             Ok(file_upload_response) => {
                 println!("✅ File uploaded! URI: {}", file_upload_response.file.uri);
                 Ok(file_upload_response.file.uri)
-            },
+            }
             Err(e) => {
                 eprintln!("Error while paring JSON: {}", e);
                 Err(format!("Parsing error: {}. TEXT: '{}'", e, response_text).into())
@@ -775,1085 +1422,1425 @@ async fn upload_log_file_gemini(api_key: &str, log_content: String, file_name: S
     }
 }
 
-async fn gemini_deep(logfile_name: &str, args: &crate::Args, vendor_model_lang: Vec<&str>, token_count_factor: usize, first_response: String, api_key: &str, events_sqls: HashMap<&str, HashSet<String>>,) {
-    println!("{}{}{}","=== Starting deep dive with Google Gemini model: ".bright_cyan(), vendor_model_lang[1]," ===".bright_cyan());
-    let mut json_file = args.json_file.clone();
-    if json_file.is_empty() {
-        json_file = format!("{}.json", args.directory);
-    }
+fn extract_gemini_text(json: &Value) -> String {
+    let Some(parts) = json
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+    else {
+        return String::new();
+    };
 
-    let client = Client::new();
+    let mut seen = HashSet::new();
+    parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+        .filter(|t| seen.insert(t.to_string()))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
 
-    let file_uri = upload_log_file_gemini(&api_key, first_response, "performance_analyze.md".to_string()).await.unwrap();
-    let spell = format!(
-        "You are given a detailed Oracle Database performance analysis report (markdown format). \
-         Your task is to select exactly {} SNAP_IDs that warrant the deepest investigation.\n\n\
-         Selection criteria:\n\
-         1. Choose snapshots that represent the most severe performance degradation\n\
-         2. Ensure temporal diversity: select approximately half from business hours and half from \
-            off-hours/maintenance windows to capture different workload profiles\n\
-         3. Prioritize snapshots mentioned in anomaly clusters or as top spikes\n\
-         4. Avoid selecting adjacent snap_ids unless they represent distinctly different problems\n\n\
-         Output format: Return ONLY the selected SNAP_IDs, one number per line, with no additional text.",
-        args.deep_check
+fn extract_gemini_function_calls(json: &Value) -> Vec<Value> {
+    json.pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("functionCall").cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::main]
+pub async fn gemini(
+    logfile_name: &str,
+    vendor_model_lang: Vec<&str>,
+    events_sqls: HashMap<&str, HashSet<String>>,
+    args: &crate::Args,
+    report_for_ai: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tools_mode = args.tools_mode;
+    let mode_label = if tools_mode { "TOOLS" } else { "single-shot" };
+    debug_note!(
+        "Starting Gemini analysis: model='{}', language='{}', mode={}, report_chars={}",
+        vendor_model_lang.get(1).copied().unwrap_or(""),
+        vendor_model_lang.get(2).copied().unwrap_or(""),
+        mode_label,
+        report_for_ai.len()
+    );
+    println!(
+        "{}{}{}{}{}",
+        "=== Consulting Google Gemini (".bright_cyan(),
+        mode_label,
+        ") model: ".bright_cyan(),
+        vendor_model_lang[1],
+        " ===".bright_cyan()
     );
 
-    let payload = json!({
-                    "contents": [{
-                        "parts": [
-                            { "text": spell }, 
-                            {
-                                "fileData": {
-                                    "mimeType": "text/plain",
-                                    "fileUri": file_uri
-                                }
-                            }
-                        ]
-                    }],
+    let api_key = env::var("GEMINI_API_KEY").expect("You have to set GEMINI_API_KEY env variable");
+
+    let stem = stem_from_logfile(logfile_name);
+    let load_profile = load_profile_for_stem(stem);
+    let suffix = if tools_mode { "_tools" } else { "" };
+    let response_file = format!("{}_gemini{}.md", logfile_name, suffix);
+    let client = Client::new();
+
+    let spell =
+        build_model_instructions(vendor_model_lang[2], args, &events_sqls, stem, tools_mode);
+    let main_report_uri = upload_log_file_gemini(
+        &api_key,
+        report_for_ai.to_string(),
+        "main_report.toon".to_string(),
+    )
+    .await
+    .unwrap();
+    let global_profile_data_uri = upload_log_file_gemini(
+        &api_key,
+        load_profile,
+        "load_profile_statistics.json".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let mut initial_parts = vec![
+        json!({
+            "fileData": {
+                "mimeType": "text/plain",
+                "fileUri": main_report_uri
+            }
+        }),
+        json!({
+            "fileData": {
+                "mimeType": "text/plain",
+                "fileUri": global_profile_data_uri
+            }
+        }),
+    ];
+
+    if tools_mode {
+        if let Some(note) = available_attachments_prompt(stem) {
+            initial_parts.push(json!({
+                "text": note
+            }));
+        }
+    }
+
+    let mut contents: Vec<Value> = vec![json!({
+        "role": "user",
+        "parts": initial_parts
+    })];
+
+    let collection: Option<AWRSCollection> = if tools_mode {
+        Some(load_tools_collection(args))
+    } else {
+        None
+    };
+
+    let max_iterations = if tools_mode {
+        args.max_tool_iterations
+    } else {
+        1
+    };
+
+    let tools = if tools_mode {
+        tools_schema_for_gemini(stem)
+    } else {
+        json!([])
+    };
+
+    let gemini_tool_payload_budget = if tools_mode {
+        let initial_payload_tokens = gemini_payload_tokens(&spell, &contents, Some(&tools));
+        let budget = initial_payload_tokens.saturating_add(args.tokens_budget);
+        println!(
+            "Gemini tools token guard: initial payload ~{} tokens, tool headroom {}, stop threshold ~{} tokens.",
+            initial_payload_tokens, args.tokens_budget, budget
+        );
+        budget
+    } else {
+        args.tokens_budget
+    };
+
+    let mut final_content = String::new();
+    let mut last_usage: Value = Value::Null;
+    let mut last_finish: Value = Value::Null;
+
+    for iteration in 0..max_iterations {
+        if tools_mode {
+            println!(
+                "🔁 Gemini tool loop iteration {}/{}",
+                iteration + 1,
+                max_iterations
+            );
+        }
+
+        let is_last_iteration = iteration + 1 == max_iterations;
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [{ "text": format!("### SYSTEM INSTRUCTIONS\n{spell}") }]
+            },
+            "contents": contents.clone(),
+            "generationConfig": {
+                "thinkingConfig": {
+                    "thinkingBudget": -1
+                }
+            }
+        });
+
+        if tools_mode {
+            payload["tools"] = tools.clone();
+            payload["toolConfig"] = json!({
+                "functionCallingConfig": { "mode": "AUTO" }
+            });
+        }
+
+        if tools_mode {
+            let estimated_payload_tokens = estimate_tokens_from_value(&payload);
+            println!(
+                "Estimated Gemini tool payload tokens: {}/{}",
+                estimated_payload_tokens, gemini_tool_payload_budget
+            );
+
+            if estimated_payload_tokens > gemini_tool_payload_budget {
+                eprintln!(
+                    "⚠️ Gemini tools token budget reached before iteration {}/{}. \
+                     Running final synthesis without more tool calls.",
+                    iteration + 1,
+                    max_iterations
+                );
+
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{ "text": final_synthesis_request() }]
+                }));
+
+                let compacted = compact_gemini_tool_results_for_budget(
+                    &spell,
+                    &mut contents,
+                    gemini_tool_payload_budget,
+                );
+
+                if compacted > 0 {
+                    eprintln!(
+                        "⚠️ Compacted {} large Gemini tool result(s) to fit the final synthesis budget.",
+                        compacted
+                    );
+                }
+
+                let final_payload = json!({
+                    "systemInstruction": {
+                        "parts": [{ "text": format!("### SYSTEM INSTRUCTIONS\n{spell}") }]
+                    },
+                    "contents": contents.clone(),
                     "generationConfig": {
-                        "maxOutputTokens": 8192 * token_count_factor,
                         "thinkingConfig": {
                             "thinkingBudget": -1
                         }
                     }
                 });
+                let final_payload_tokens = estimate_tokens_from_value(&final_payload);
 
-    let (tx, rx) = oneshot::channel();
-    let spinner = tokio::spawn(spinning_beer(rx));
+                if final_payload_tokens > gemini_tool_payload_budget {
+                    return Err(format!(
+                        "Gemini tools token budget exhausted: final synthesis payload is ~{} tokens, budget is ~{} tokens. \
+                         Increase --tokens-budget or reduce the initial report/tool scope.",
+                        final_payload_tokens, gemini_tool_payload_budget
+                    )
+                    .into());
+                }
 
-    let response = client
-            .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}", vendor_model_lang[1], api_key))
+                println!(
+                    "Estimated Gemini final synthesis tokens: {}/{}",
+                    final_payload_tokens, gemini_tool_payload_budget
+                );
+
+                let (tx, rx) = oneshot::channel();
+                let spinner = tokio::spawn(spinning_beer(rx));
+
+                let final_response = client
+                    .post(format!(
+                        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                        vendor_model_lang[1],
+                        api_key
+                    ))
+                    .header("Content-Type", "application/json")
+                    .json(&final_payload)
+                    .send()
+                    .await?;
+
+                let _ = tx.send(());
+                let _ = spinner.await;
+
+                if !final_response.status().is_success() {
+                    eprintln!("Error during final synthesis: {}", final_response.status());
+                    eprintln!("{}", final_response.text().await.unwrap_or_default());
+                    break;
+                }
+
+                let final_json: Value = final_response.json().await?;
+                last_usage = final_json
+                    .get("usageMetadata")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                last_finish = final_json
+                    .pointer("/candidates/0/finishReason")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                final_content = extract_gemini_text(&final_json);
+                break;
+            }
+        }
+
+        debug_note!(
+            "Gemini request prepared: payload_bytes={}, estimated_tokens={}",
+            payload.to_string().len(),
+            estimate_tokens_from_value(&payload)
+        );
+
+        let (tx, rx) = oneshot::channel();
+        let spinner = tokio::spawn(spinning_beer(rx));
+
+        let response = client
+            .post(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                vendor_model_lang[1], api_key
+            ))
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
-            .await.unwrap();
-    
-    let _ = tx.send(());
-    let _ = spinner.await;
+            .await?;
 
-    if response.status().is_success() {
-        let json: Value = response.json().await.unwrap();
+        let _ = tx.send(());
+        let _ = spinner.await;
 
-        let parts = &json["candidates"][0]["content"]["parts"];
-        let mut seen = HashSet::new();
-        let full_text = parts
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .filter(|text| seen.insert(text.to_string()))
-            .collect::<Vec<&str>>()
-            .join("\n");
-
-        println!("🍻 Gemini will analyze further the following SNP_ID:\n{}", &full_text);
-        
-        let s_json = fs::read_to_string(&json_file).expect(&format!("Something wrong with a file {} ", &args.json_file));
-        let mut collection: AWRSCollection = serde_json::from_str(&s_json).expect(&format!("Wrong JSON format {}", &json_file));
-        let awrs: Vec<AWR> = collection.awrs;
-        let mut snap_ids: HashSet<u64> = HashSet::new();
-        for snap_id in full_text.split("\n") {
-            let id = u64::from_str(snap_id);
-            if id.is_ok() {
-                snap_ids.insert(id.unwrap());
-            } else if snap_id.contains("_") {
-                let s_id = snap_id.split("_").next().unwrap();
-                snap_ids.insert(u64::from_str(s_id).unwrap());
-            } else {
-                let id = awrs.iter()
-                                           .find(|a| &a.snap_info.begin_snap_time == snap_id).unwrap()
-                                           .snap_info.begin_snap_id;
-                snap_ids.insert(id);
-            }
-            
+        if !response.status().is_success() {
+            eprintln!("Error: {}", response.status());
+            eprintln!("{}", response.text().await.unwrap_or_default());
+            break;
         }
 
-        let mut deep_stats: Vec<AWR> = Vec::new();
-        for awr in awrs {
-            if snap_ids.contains(&awr.snap_info.begin_snap_id) {
-                deep_stats.push(awr);
-            }
-        }
-        
-        let spell = format!(
-            "# DEEP-DIVE PERFORMANCE ANALYSIS\n\n\
-             You are given:\n\
-             1. A comprehensive performance report (markdown) covering the full analysis period\n\
-             2. A JSON file with detailed AWR/STATSPACK statistics for one specific snapshot period\n\n\
-             # TASK\n\n\
-             Perform an in-depth analysis of this specific snapshot period. Your analysis must:\n\n\
-             ## Analytical Approach\n\
-             1. **Contextualize**: Compare this snapshot's metrics against the baselines from the full report\n\
-             2. **Decompose DB Time**: Break down exactly where DB Time was spent in this period\n\
-             3. **SQL Investigation**: Examine all SQL sections and cross-reference SQL_IDs across them. \
-                Identify SQL_IDs appearing in multiple sections — these are the highest-priority targets\n\
-             4. **Latch & Contention**: Identify unusual latch activity or internal contention specific to this period\n\
-             5. **Segment Analysis**: Connect segment-level activity to specific SQLs and wait events\n\
-             6. **Root Cause Synthesis**: Trace from symptoms (wait events) through SQLs to root causes\n\n\
-             ## Cross-Reference Requirements\n\
-             - Match SQL_IDs found here with those flagged in the full report\n\
-             - Compare wait event distribution against the full-period averages\n\
-             - Identify what is UNIQUE to this snapshot vs. what is a continuation of systemic issues\n\n\
-             # OUTPUT FORMAT\n\n\
-             Structure your answer in markdown:\n\n\
-             1. 🧭 Executive Summary (what makes this period notable)\n\
-             2. 📈 Performance Profile (DB Time breakdown, comparison to baseline)\n\
-             3. ⏳ Wait Event Analysis (foreground and background)\n\
-             4. 🧮 SQL-Level Analysis (harmful SQL_IDs, multi-section appearances, patterns)\n\
-             5. 🧱 Segment & Object Analysis\n\
-             6. 🔧 Latches & Internal Contention\n\
-             7. 💾 I/O Assessment\n\
-             8. 🔁 UNDO / Redo / Load Profile\n\
-             9. ⚡ Anomalies & Cross-Domain Patterns\n\
-             10. ✅ Recommendations (DBAs, Developers, Immediate Actions, Management Summary)\n\n\
-             Rules:\n\
-             - Never invent numbers. Quote exact values from the data.\n\
-             - Always pair SNAP_ID with SNAP_DATE.\n\
-             - Format wait event names and SQL_IDs as inline code.\n\
-             - Cross-reference with the full report's findings.\n\n\
-             Write answer in language: {}",
-            vendor_model_lang[2]
-        );
+        let json: Value = response.json().await?;
+        last_usage = json.get("usageMetadata").cloned().unwrap_or(Value::Null);
+        last_finish = json
+            .pointer("/candidates/0/finishReason")
+            .cloned()
+            .unwrap_or(Value::Null);
 
-        for ds in deep_stats {
+        if tools_mode {
+            let tool_calls = extract_gemini_function_calls(&json);
+            if !tool_calls.is_empty() {
+                if let Some(model_content) = json.pointer("/candidates/0/content").cloned() {
+                    contents.push(model_content);
+                }
 
-            let deep_stats_json = serde_json::to_string(&ds).unwrap();
-            let file_uri_stats = upload_log_file_gemini(&api_key, deep_stats_json, "detailed_statistics.json".to_string()).await.unwrap();
+                let mut responses = Vec::new();
+                for tc in tool_calls {
+                    let fn_name = tc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let parsed_args = tc.get("args").cloned().unwrap_or_else(|| json!({}));
 
-            let payload = json!({
-                "contents": [{
-                    "parts": [
-                        { "text": spell },
-                        {
-                            "fileData": {
-                                "mimeType": "text/plain",
-                                "fileUri": file_uri
-                            }
+                    println!("🛠  Gemini tool call: {}({})", fn_name, parsed_args);
+                    debug_note!("Gemini requested diagnostic tool: name='{}'", fn_name);
+
+                    let result_text = dispatch_tool_call(
+                        &fn_name,
+                        &parsed_args,
+                        collection.as_ref().unwrap(),
+                        stem,
+                    );
+                    let result_json: Value = serde_json::from_str(&result_text)
+                        .unwrap_or_else(|_| json!({ "result": result_text }));
+
+                    responses.push(json!({
+                        "functionResponse": {
+                            "name": fn_name,
+                            "response": result_json
+                        }
+                    }));
+                }
+
+                contents.push(json!({
+                    "role": "user",
+                    "parts": responses
+                }));
+
+                if is_last_iteration {
+                    eprintln!(
+                        "⚠️ Tool loop limit reached while model still requested tools. \
+                         Running final synthesis pass without tools."
+                    );
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{ "text": final_synthesis_request() }]
+                    }));
+
+                    let compacted = compact_gemini_tool_results_for_budget(
+                        &spell,
+                        &mut contents,
+                        gemini_tool_payload_budget,
+                    );
+
+                    if compacted > 0 {
+                        eprintln!(
+                            "⚠️ Compacted {} large Gemini tool result(s) to fit the final synthesis budget.",
+                            compacted
+                        );
+                    }
+
+                    let final_payload = json!({
+                        "systemInstruction": {
+                            "parts": [{ "text": format!("### SYSTEM INSTRUCTIONS\n{spell}") }]
                         },
-                        {
-                            "fileData": {
-                                "mimeType": "text/plain",
-                                "fileUri": file_uri_stats
+                        "contents": contents.clone(),
+                        "generationConfig": {
+                            "thinkingConfig": {
+                                "thinkingBudget": -1
                             }
                         }
-                    ]
-                }],
-                "generationConfig": {
-                    "maxOutputTokens": 8192 * token_count_factor,
-                    "thinkingConfig": {
-                        "thinkingBudget": -1
+                    });
+                    let final_payload_tokens = estimate_tokens_from_value(&final_payload);
+
+                    if final_payload_tokens > gemini_tool_payload_budget {
+                        return Err(format!(
+                            "Gemini tools token budget exhausted: final synthesis payload is ~{} tokens, budget is ~{} tokens. \
+                             Increase --tokens-budget or reduce the initial report/tool scope.",
+                            final_payload_tokens, gemini_tool_payload_budget
+                        )
+                        .into());
                     }
+
+                    println!(
+                        "Estimated Gemini final synthesis tokens: {}/{}",
+                        final_payload_tokens, gemini_tool_payload_budget
+                    );
+
+                    let (tx, rx) = oneshot::channel();
+                    let spinner = tokio::spawn(spinning_beer(rx));
+
+                    let final_response = client
+                        .post(format!(
+                            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                            vendor_model_lang[1],
+                            api_key
+                        ))
+                        .header("Content-Type", "application/json")
+                        .json(&final_payload)
+                        .send()
+                        .await?;
+
+                    let _ = tx.send(());
+                    let _ = spinner.await;
+
+                    if !final_response.status().is_success() {
+                        eprintln!("Error during final synthesis: {}", final_response.status());
+                        eprintln!("{}", final_response.text().await.unwrap_or_default());
+                        break;
+                    }
+
+                    let final_json: Value = final_response.json().await?;
+                    last_usage = final_json
+                        .get("usageMetadata")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    last_finish = final_json
+                        .pointer("/candidates/0/finishReason")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    final_content = extract_gemini_text(&final_json);
+                    break;
                 }
-            });
 
-            let (tx, rx) = oneshot::channel();
-            let spinner = tokio::spawn(spinning_beer(rx));
-
-            let response = client
-                    .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}", vendor_model_lang[1], api_key))
-                    .header("Content-Type", "application/json")
-                    .json(&payload)
-                    .send()
-                    .await.unwrap();
-            
-            let _ = tx.send(());
-            let _ = spinner.await;
-
-            if response.status().is_success() {
-                let json: Value = response.json().await.unwrap();
-
-                let parts = &json["candidates"][0]["content"]["parts"];
-                let mut seen = HashSet::new();
-                let full_text = parts
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|part| part["text"].as_str())
-                    .filter(|text| seen.insert(text.to_string()))
-                    .collect::<Vec<&str>>()
-                    .join("\n");
-
-                let stem = logfile_name.split('.').next().unwrap();
-                let response_file = format!("{stem}.html_reports/{}_gemini_deep_{}.md", logfile_name, &ds.snap_info.begin_snap_id);
-                fs::write(&response_file, full_text.as_bytes()).unwrap();
-
-                println!("🍻 Gemini response written to file: {}", &response_file);
-                convert_md_to_html_file(&response_file, events_sqls.clone());
-
-            } else {
-                eprintln!("Error: {}", response.status());
-                eprintln!("{}", response.text().await.unwrap());
+                continue;
             }
-
         }
-        
 
+        final_content = extract_gemini_text(&json);
+        break;
+    }
+
+    if final_content.is_empty() {
+        debug_note!("Gemini analysis completed without extractable content");
+        eprintln!("⚠️ Gemini response had no extractable final content");
     } else {
-        eprintln!("Error: {}", response.status());
-        eprintln!("{}", response.text().await.unwrap());
-    }
-
-
-}
-
-#[tokio::main]
-pub async fn gemini(logfile_name: &str,vendor_model_lang: Vec<&str>,token_count_factor: usize,events_sqls: HashMap<&str, HashSet<String>>,args: &crate::Args, report_for_ai: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}{}{}", 
-        "=== Consulting Google Gemini model: ".bright_cyan(), 
-        vendor_model_lang[1], 
-        " ===".bright_cyan()
-    );
-
-    let api_key = env::var("GEMINI_API_KEY")
-        .expect("You have to set GEMINI_API_KEY env variable");
-
-    let log_content = fs::read_to_string(logfile_name).expect(&format!("Can't open file {}", logfile_name));
-    let stem = logfile_name.split('.').next().unwrap();
-    let json_path = format!("{stem}.html_reports/stats/global_statistics.json");
-    let load_profile = fs::read_to_string(&json_path).expect(&format!("Can't open file {}", json_path));
-    let response_file = format!("{}_gemini.md", logfile_name);
-    let client = Client::new();
-
-    let mut spell = format!("{} {}", SPELL, vendor_model_lang[2]);
-
-    if let Some(pr) = private_reasonings() {
-        spell = format!("{spell}\n#ADVANCED RULES\n{pr}");
-    }
-
-    if !args.url_context_file.is_empty() {
-        if let Some(urls) = url_context(&args.url_context_file, events_sqls.clone()) {
-            spell = format!("{spell}\n# URL CONTEXT\n{urls}");
-        }
-    }
-    let main_report_uri = upload_log_file_gemini(&api_key, report_for_ai.to_string(), "main_report.toon".to_string()).await.unwrap();
-    let global_profile_data_uri = upload_log_file_gemini(&api_key, load_profile, "load_profile_statistics.json".to_string()).await.unwrap();
-
-    let payload = json!({
-                "contents": [{
-                    "parts": [
-                        { "text": format!("### SYSTEM INSTRUCTIONS\n{spell}") },
-                        {
-                            "fileData": {
-                                "mimeType": "text/plain",
-                                "fileUri": main_report_uri
-                            }
-                        },
-                        {
-                            "fileData": {
-                                "mimeType": "text/plain",
-                                "fileUri": global_profile_data_uri
-                            }
-                        }
-                    ]
-                }],
-                "generationConfig": {
-                    "maxOutputTokens": 8192 * token_count_factor,
-                    "thinkingConfig": {
-                        "thinkingBudget": -1
-                    }
-                }
-            });
-    
-
-    let (tx, rx) = oneshot::channel();
-    let spinner = tokio::spawn(spinning_beer(rx));
-
-    let response = client
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            vendor_model_lang[1],
-            api_key
-        ))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?;
-
-    let _ = tx.send(());
-    let _ = spinner.await;
-
-    if response.status().is_success() {
-        let json: Value = response.json().await.unwrap();
-
-        let parts = json["candidates"][0]["content"]["parts"]
-            .as_array()
-            .unwrap();
-
-        let mut seen = HashSet::new();
-        let full_text = parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .filter(|t| seen.insert(t.to_string()))
-            .collect::<Vec<&str>>()
-            .join("\n");
-
-        fs::write(&response_file, full_text.as_bytes())?;
+        fs::write(&response_file, final_content.as_bytes())?;
+        debug_note!(
+            "Gemini analysis output written: path='{}', bytes={}",
+            response_file,
+            final_content.len()
+        );
         println!("🍻 Gemini response written to file: {}", &response_file);
-
         convert_md_to_html_file(&response_file, events_sqls.clone());
-
         println!(
             "Total tokens: {}\nFinish reason: {}\n",
-            json["usageMetadata"]["totalTokenCount"],
-            json["candidates"][0]["finishReason"]
+            last_usage, last_finish
         );
-
-        if args.deep_check > 0 {
-            gemini_deep(
-                logfile_name,
-                &args,
-                vendor_model_lang,
-                token_count_factor,
-                full_text,
-                &api_key,
-                events_sqls,
-            )
-            .await;
-        }
-    } else {
-        eprintln!("Error: {}", response.status());
-        eprintln!("{}", response.text().await.unwrap());
     }
 
     Ok(())
+}
+
+fn extract_chat_message_content(msg: &Value) -> String {
+    if let Some(s) = msg.get("content").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+
+    if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
+        let mut out = String::new();
+
+        for item in arr {
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                out.push_str(text);
+                out.push('\n');
+            } else if let Some(text) = item.get("content").and_then(|v| v.as_str()) {
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+
+        return out.trim().to_string();
+    }
+
+    String::new()
 }
 
 #[tokio::main]
 pub async fn openrouter(
     logfile_name: &str,
     vendor_model_lang: Vec<&str>,
-    token_count_factor: usize,
     events_sqls: HashMap<&str, HashSet<String>>,
     args: &crate::Args,
     report_for_ai: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
-    println!("=== Consulting OpenRouter model: {} ===", vendor_model_lang[1]);
+    let tools_mode = args.tools_mode;
+    let mode_label = if tools_mode { "TOOLS" } else { "single-shot" };
+    debug_note!(
+        "Starting OpenRouter analysis: model='{}', language='{}', mode={}, report_chars={}",
+        vendor_model_lang.get(1).copied().unwrap_or(""),
+        vendor_model_lang.get(2).copied().unwrap_or(""),
+        mode_label,
+        report_for_ai.len()
+    );
+    println!(
+        "=== Consulting OpenRouter ({}) model: {} ===",
+        mode_label, vendor_model_lang[1]
+    );
 
     let api_key = env::var("OPENROUTER_API_KEY")
-        .expect("You have to set OPENROUTER_API_KEY env variable");
+        .map_err(|_| "You have to set OPENROUTER_API_KEY env variable")?;
 
-    let stem = logfile_name.split('.').next().unwrap();
-    let json_path = format!("{stem}.html_reports/stats/global_statistics.json");
-    let load_profile = fs::read_to_string(&json_path)
-        .expect(&format!("Can't open file {}", json_path));
+    let stem = stem_from_logfile(logfile_name);
+    let load_profile = load_profile_for_stem(stem);
 
     let model_name = vendor_model_lang[1].replace("/", "_");
-    let response_file = format!("{}_{}.md", logfile_name, model_name);
+    let suffix = if tools_mode { "_tools" } else { "" };
+    let response_file = format!("{}_{}{}.md", logfile_name, model_name, suffix);
     let client = Client::new();
 
-    let mut spell = format!("{} {}", SPELL, vendor_model_lang[2]);
-    if let Some(pr) = private_reasonings() {
-        spell = format!("{spell}\n#ADVANCED RULES\n{pr}");
+    let spell =
+        build_model_instructions(vendor_model_lang[2], args, &events_sqls, stem, tools_mode);
+
+    // --- common - history begins ---
+    let attachment_note = if tools_mode {
+        available_attachments_prompt(stem)
+            .map(|note| format!("\n\n{note}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut messages: Vec<Value> = vec![
+        json!({ "role": "system", "content": format!("### SYSTEM INSTRUCTIONS\n{}", spell) }),
+        json!({ "role": "user", "content": format!(
+            "MAIN REPORT (toon/json-as-text):\n```\n{}\n```\n\nGLOBAL PROFILE:\n```json\n{}\n```{}",
+            report_for_ai, load_profile, attachment_note
+        )}),
+    ];
+
+    let collection: Option<AWRSCollection> = if tools_mode {
+        Some(load_tools_collection(args))
+    } else {
+        None
+    };
+
+    let max_iterations = if tools_mode {
+        args.max_tool_iterations
+    } else {
+        1 // without tools we always have one iteration.
+    };
+
+    let tools = if tools_mode {
+        tools_schema(stem)
+    } else {
+        json!([])
+    };
+
+    let openrouter_tool_payload_budget = if tools_mode {
+        let initial_payload_tokens =
+            openrouter_payload_tokens(vendor_model_lang[1], &messages, Some(&tools));
+        let budget = initial_payload_tokens.saturating_add(args.tokens_budget);
+        println!(
+            "OpenRouter tools token guard: initial payload ~{} tokens, tool headroom {}, stop threshold ~{} tokens.",
+            initial_payload_tokens, args.tokens_budget, budget
+        );
+        budget
+    } else {
+        args.tokens_budget
+    };
+
+    let mut final_content = String::new();
+    let mut last_usage: Value = Value::Null;
+    let mut last_finish: String = String::new();
+
+    for iteration in 0..max_iterations {
+        if tools_mode {
+            println!(
+                "🔁 Tool loop iteration {}/{}",
+                iteration + 1,
+                max_iterations
+            );
+        }
+
+        let is_last_iteration = iteration + 1 == max_iterations;
+
+        // Payload — if tools mode is on we can add it to payload
+        let mut payload = json!({
+            "model": vendor_model_lang[1],
+            "messages": messages,
+            "reasoning": { "effort": "high" },
+            "stream": false
+        });
+
+        if tools_mode {
+            payload["tools"] = tools.clone();
+            payload["tool_choice"] = json!("auto");
+        }
+
+        if tools_mode {
+            let estimated_payload_tokens = estimate_tokens_from_value(&payload);
+            println!(
+                "Estimated OpenRouter tool payload tokens: {}/{}",
+                estimated_payload_tokens, openrouter_tool_payload_budget
+            );
+
+            if estimated_payload_tokens > openrouter_tool_payload_budget {
+                eprintln!(
+                    "⚠️ OpenRouter tools token budget reached before iteration {}/{}. \
+                     Running final synthesis without more tool calls.",
+                    iteration + 1,
+                    max_iterations
+                );
+
+                messages.push(json!({
+                    "role": "user",
+                    "content": final_synthesis_request()
+                }));
+
+                let compacted = compact_openrouter_tool_results_for_budget(
+                    vendor_model_lang[1],
+                    &mut messages,
+                    openrouter_tool_payload_budget,
+                );
+
+                if compacted > 0 {
+                    eprintln!(
+                        "⚠️ Compacted {} large tool result(s) to fit the final synthesis budget.",
+                        compacted
+                    );
+                }
+
+                let final_payload = json!({
+                    "model": vendor_model_lang[1],
+                    "messages": messages,
+                    "reasoning": { "effort": "high" },
+                    "stream": false
+                });
+                let final_payload_tokens = estimate_tokens_from_value(&final_payload);
+
+                if final_payload_tokens > openrouter_tool_payload_budget {
+                    return Err(format!(
+                        "OpenRouter tools token budget exhausted: final synthesis payload is ~{} tokens, budget is ~{} tokens. \
+                         Increase --tokens-budget or reduce the initial report/tool scope.",
+                        final_payload_tokens, openrouter_tool_payload_budget
+                    )
+                    .into());
+                }
+
+                println!(
+                    "Estimated OpenRouter final synthesis tokens: {}/{}",
+                    final_payload_tokens, openrouter_tool_payload_budget
+                );
+
+                let final_json = request_openrouter_json(
+                    &client,
+                    &api_key,
+                    &final_payload,
+                    &response_file,
+                    "final_synthesis",
+                )
+                .await?;
+
+                let final_choice = &final_json["choices"][0];
+                let final_msg = &final_choice["message"];
+
+                last_usage = final_json["usage"].clone();
+                last_finish = final_choice["finish_reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+
+                final_content = extract_chat_message_content(final_msg);
+
+                if final_content.is_empty() {
+                    eprintln!("⚠️ Final synthesis message had no extractable content:");
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(final_msg)
+                            .unwrap_or_else(|_| final_msg.to_string())
+                    );
+                }
+
+                break;
+            }
+        }
+
+        debug_note!(
+            "OpenRouter request prepared: payload_bytes={}, estimated_tokens={}",
+            payload.to_string().len(),
+            estimate_tokens_from_value(&payload)
+        );
+
+        let json =
+            request_openrouter_json(&client, &api_key, &payload, &response_file, "tool_loop")
+                .await?;
+
+        let choice = &json["choices"][0];
+        let msg = &choice["message"];
+
+        last_usage = json["usage"].clone();
+        last_finish = choice["finish_reason"].as_str().unwrap_or("").to_string();
+
+        // --- TOOLS: is model calling any tools? ---
+        if tools_mode {
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                if !tool_calls.is_empty() {
+                    messages.push(msg.clone()); // keep assistant tool-call message in history
+
+                    for tc in tool_calls {
+                        let tc_id = tc["id"].as_str().unwrap_or("").to_string();
+
+                        let fn_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+
+                        let raw_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+
+                        let parsed_args: Value =
+                            serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+
+                        println!("🛠  Tool call: {}({})", fn_name, parsed_args);
+                        debug_note!("OpenRouter requested diagnostic tool: name='{}'", fn_name);
+
+                        let result = dispatch_tool_call(
+                            &fn_name,
+                            &parsed_args,
+                            collection.as_ref().unwrap(),
+                            stem,
+                        );
+
+                        let result_text = serde_json::to_string(&result).unwrap_or_else(|_| {
+                            "{\"error\":\"failed to serialize tool result\"}".to_string()
+                        });
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": result_text
+                        }));
+                    }
+
+                    if is_last_iteration {
+                        eprintln!(
+                            "⚠️ Tool loop limit reached while model still requested tools. \
+                         Running final synthesis pass without tools."
+                        );
+
+                        messages.push(json!({
+                            "role": "user",
+                            "content": final_synthesis_request()
+                        }));
+
+                        let compacted = compact_openrouter_tool_results_for_budget(
+                            vendor_model_lang[1],
+                            &mut messages,
+                            openrouter_tool_payload_budget,
+                        );
+
+                        if compacted > 0 {
+                            eprintln!(
+                                "⚠️ Compacted {} large tool result(s) to fit the final synthesis budget.",
+                                compacted
+                            );
+                        }
+
+                        let final_payload = json!({
+                            "model": vendor_model_lang[1],
+                            "messages": messages,
+                            "reasoning": { "effort": "high" },
+                            "stream": false
+                        });
+                        let final_payload_tokens = estimate_tokens_from_value(&final_payload);
+
+                        if final_payload_tokens > openrouter_tool_payload_budget {
+                            return Err(format!(
+                                "OpenRouter tools token budget exhausted: final synthesis payload is ~{} tokens, budget is ~{} tokens. \
+                                 Increase --tokens-budget or reduce the initial report/tool scope.",
+                                final_payload_tokens, openrouter_tool_payload_budget
+                            )
+                            .into());
+                        }
+
+                        println!(
+                            "Estimated OpenRouter final synthesis tokens: {}/{}",
+                            final_payload_tokens, openrouter_tool_payload_budget
+                        );
+
+                        debug_note!(
+                            "OpenRouter final synthesis prepared: payload_bytes={}, estimated_tokens={}",
+                            final_payload.to_string().len(),
+                            final_payload_tokens
+                        );
+
+                        let final_json = request_openrouter_json(
+                            &client,
+                            &api_key,
+                            &final_payload,
+                            &response_file,
+                            "final_synthesis",
+                        )
+                        .await?;
+
+                        let final_choice = &final_json["choices"][0];
+                        let final_msg = &final_choice["message"];
+
+                        last_usage = final_json["usage"].clone();
+                        last_finish = final_choice["finish_reason"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+
+                        final_content = extract_chat_message_content(final_msg);
+
+                        if final_content.is_empty() {
+                            eprintln!("⚠️ Final synthesis message had no extractable content:");
+                            eprintln!(
+                                "{}",
+                                serde_json::to_string_pretty(final_msg)
+                                    .unwrap_or_else(|_| final_msg.to_string())
+                            );
+                        }
+
+                        break;
+                    }
+
+                    continue; // next round, because tools were called
+                }
+            }
+        }
+
+        // --- No tool called or single-shot -> final answer ---
+        final_content = extract_chat_message_content(msg);
+
+        if final_content.is_empty() {
+            eprintln!("⚠️ Assistant message had no extractable final content:");
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(msg).unwrap_or_else(|_| msg.to_string())
+            );
+        }
+
+        break;
     }
-    if !args.url_context_file.is_empty() {
-        if let Some(urls) = url_context(&args.url_context_file, events_sqls.clone()) {
-            spell = format!("{spell}\n# URL CONTEXT\n{urls}");
+
+    fs::write(&response_file, final_content.as_bytes())?;
+    debug_note!(
+        "OpenRouter analysis output written: path='{}', bytes={}, finish_reason='{}'",
+        response_file,
+        final_content.len(),
+        last_finish
+    );
+    println!("🍻 OpenRouter response written to file: {}", &response_file);
+    convert_md_to_html_file(&response_file, events_sqls.clone());
+    println!(
+        "Total tokens: {}\nFinish reason: {}\n",
+        last_usage, last_finish
+    );
+
+    Ok(())
+}
+
+fn tools_schema_for_openai_responses(stem: &str) -> Value {
+    let tools = tools_schema(stem);
+
+    let Some(arr) = tools.as_array() else {
+        return json!([]);
+    };
+
+    let converted: Vec<Value> = arr
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.clone();
+            let description = function
+                .get("description")
+                .cloned()
+                .unwrap_or_else(|| json!(""));
+            let parameters = function.get("parameters").cloned().unwrap_or_else(|| {
+                json!({
+                    "type": "object",
+                    "properties": {}
+                })
+            });
+
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+                "strict": false
+            }))
+        })
+        .collect();
+
+    json!(converted)
+}
+
+fn tools_schema_for_gemini(stem: &str) -> Value {
+    let tools = tools_schema(stem);
+
+    let Some(arr) = tools.as_array() else {
+        return json!([]);
+    };
+
+    let declarations: Vec<Value> = arr
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.clone();
+            let description = function
+                .get("description")
+                .cloned()
+                .unwrap_or_else(|| json!(""));
+            let parameters = function.get("parameters").cloned().unwrap_or_else(|| {
+                json!({
+                    "type": "object",
+                    "properties": {}
+                })
+            });
+
+            Some(json!({
+                "name": name,
+                "description": description,
+                "parameters": parameters
+            }))
+        })
+        .collect();
+
+    json!([{ "functionDeclarations": declarations }])
+}
+
+fn extract_openai_responses_text(json: &Value) -> String {
+    if let Some(s) = json.get("output_text").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut chunks: Vec<String> = vec![];
+
+    if let Some(output_arr) = json.get("output").and_then(|o| o.as_array()) {
+        for item in output_arr {
+            if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                for c in content_arr {
+                    if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                        if seen.insert(t.to_string()) {
+                            chunks.push(t.to_string());
+                        }
+                    } else if let Some(t) = c.get("output_text").and_then(|t| t.as_str()) {
+                        if seen.insert(t.to_string()) {
+                            chunks.push(t.to_string());
+                        }
+                    }
+                }
+            }
         }
     }
 
-    let payload = json!({
-        "model": vendor_model_lang[1],
-        "messages": [
-            { "role": "system", "content": format!("### SYSTEM INSTRUCTIONS\n{spell}") },
-            { "role": "user", "content": format!(
-                "MAIN REPORT (toon/json-as-text):\n```\n{}\n```\n\nGLOBAL PROFILE:\n```json\n{}\n```",
-                report_for_ai, load_profile
-            )}
-        ],
-        "reasoning": { "effort": "high" },
-        "stream": false
-    });
+    chunks.join("\n")
+}
 
-    let (tx, rx) = oneshot::channel();
-    let spinner = tokio::spawn(spinning_beer(rx));
+#[tokio::main]
+pub async fn openai_gpt(
+    logfile_name: &str,
+    vendor_model_lang: Vec<&str>,
+    events_sqls: HashMap<&str, HashSet<String>>,
+    args: &crate::Args,
+    report_for_ai: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tools_mode = args.tools_mode;
+    let mode_label = if tools_mode { "TOOLS" } else { "single-shot" };
+    debug_note!(
+        "Starting OpenAI analysis: model='{}', language='{}', mode={}, report_chars={}",
+        vendor_model_lang.get(1).copied().unwrap_or(""),
+        vendor_model_lang.get(2).copied().unwrap_or(""),
+        mode_label,
+        report_for_ai.len()
+    );
+    println!(
+        "{}{}{}{}{}",
+        "=== Consulting OpenAI (".bright_cyan(),
+        mode_label,
+        ") model: ".bright_cyan(),
+        vendor_model_lang[1],
+        " ===".bright_cyan()
+    );
 
-    let resp = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("X-Title", "jas-min")
-        .json(&payload)
-        .send()
-        .await?;
+    let api_key = env::var("OPENAI_API_KEY").expect("You have to set OPENAI_API_KEY env variable");
 
-    if resp.status().is_success() {
-        println!("Waiting for OpenRouter to stream full response - please wait...");
-        let body = resp.text().await?;
+    let stem = stem_from_logfile(logfile_name);
+    let load_profile = load_profile_for_stem(stem);
+
+    let suffix = if tools_mode { "_tools" } else { "" };
+    let response_file = format!("{}_{}{}.md", logfile_name, vendor_model_lang[1], suffix);
+
+    let spell =
+        build_model_instructions(vendor_model_lang[2], args, &events_sqls, stem, tools_mode);
+
+    let mut input_messages = vec![json!({
+        "role": "system",
+        "content": [
+            { "type": "input_text", "text": spell }
+        ]
+    })];
+
+    let mut report_payload = vec![
+        json!({"type":"input_text", "text":
+            format!("### ATTACHED REPORT\n{report_for_ai}\n-- END ATTACHED REPORT --")
+        }),
+        json!({
+            "type": "input_text",
+            "text": format!("### LOAD PROFILE STATISTICS JSON\n{}\n-- END JSON --", load_profile)
+        }),
+    ];
+
+    if tools_mode {
+        if let Some(note) = available_attachments_prompt(stem) {
+            report_payload.push(json!({
+                "type": "input_text",
+                "text": note
+            }));
+        }
+    }
+
+    input_messages.push(json!({
+        "role": "user",
+        "content": report_payload
+    }));
+
+    let collection: Option<AWRSCollection> = if tools_mode {
+        Some(load_tools_collection(args))
+    } else {
+        None
+    };
+
+    let max_iterations = if tools_mode {
+        args.max_tool_iterations
+    } else {
+        1
+    };
+
+    let tools = if tools_mode {
+        tools_schema_for_openai_responses(stem)
+    } else {
+        json!([])
+    };
+
+    let openai_tool_payload_budget = if tools_mode {
+        let initial_payload_tokens =
+            openai_responses_payload_tokens(vendor_model_lang[1], &input_messages, Some(&tools));
+        let budget = initial_payload_tokens.saturating_add(args.tokens_budget);
+        println!(
+            "OpenAI tools token guard: initial payload ~{} tokens, tool headroom {}, stop threshold ~{} tokens.",
+            initial_payload_tokens, args.tokens_budget, budget
+        );
+        budget
+    } else {
+        args.tokens_budget
+    };
+
+    let client = Client::new();
+    let mut final_content = String::new();
+    let mut last_usage: Value = Value::Null;
+    let mut last_finish: Value = Value::Null;
+
+    for iteration in 0..max_iterations {
+        if tools_mode {
+            println!(
+                "🔁 OpenAI tool loop iteration {}/{}",
+                iteration + 1,
+                max_iterations
+            );
+        }
+
+        let is_last_iteration = iteration + 1 == max_iterations;
+
+        let mut payload = json!({
+            "model": vendor_model_lang[1],
+            "input": input_messages,
+        });
+
+        if tools_mode {
+            payload["tools"] = tools.clone();
+            payload["tool_choice"] = json!("auto");
+        }
+
+        let estimated_payload_tokens = estimate_tokens_from_value(&payload);
+        if tools_mode {
+            println!(
+                "Estimated OpenAI tool payload tokens: {}/{}",
+                estimated_payload_tokens, openai_tool_payload_budget
+            );
+
+            if estimated_payload_tokens > openai_tool_payload_budget {
+                eprintln!(
+                    "⚠️ OpenAI tools token budget reached before iteration {}/{}. \
+                     Running final synthesis without more tool calls.",
+                    iteration + 1,
+                    max_iterations
+                );
+
+                input_messages.push(json!({
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": final_synthesis_request() }
+                    ]
+                }));
+
+                let compacted = compact_openai_tool_results_for_budget(
+                    vendor_model_lang[1],
+                    &mut input_messages,
+                    openai_tool_payload_budget,
+                );
+
+                if compacted > 0 {
+                    eprintln!(
+                        "⚠️ Compacted {} large OpenAI tool result(s) to fit the final synthesis budget.",
+                        compacted
+                    );
+                }
+
+                let final_payload = json!({
+                    "model": vendor_model_lang[1],
+                    "input": input_messages,
+                });
+                let final_payload_tokens = estimate_tokens_from_value(&final_payload);
+
+                if final_payload_tokens > openai_tool_payload_budget {
+                    return Err(format!(
+                        "OpenAI tools token budget exhausted: final synthesis payload is ~{} tokens, budget is ~{} tokens. \
+                         Increase --tokens-budget or reduce the initial report/tool scope.",
+                        final_payload_tokens, openai_tool_payload_budget
+                    )
+                    .into());
+                }
+
+                println!(
+                    "Estimated OpenAI final synthesis tokens: {}/{}",
+                    final_payload_tokens, openai_tool_payload_budget
+                );
+
+                let (tx, rx) = oneshot::channel();
+                let spinner = tokio::spawn(spinning_beer(rx));
+
+                let final_response = client
+                    .post(format!("{}v1/responses", get_openai_url()))
+                    .bearer_auth(&api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&final_payload)
+                    .send()
+                    .await?;
+
+                let _ = tx.send(());
+                let _ = spinner.await;
+
+                if !final_response.status().is_success() {
+                    eprintln!("Error during final synthesis: {}", final_response.status());
+                    eprintln!("{}", final_response.text().await.unwrap_or_default());
+                    break;
+                }
+
+                let final_json: Value = final_response.json().await?;
+                last_usage = final_json.get("usage").cloned().unwrap_or(Value::Null);
+                last_finish = final_json
+                    .pointer("/output/0/finish_reason")
+                    .cloned()
+                    .or_else(|| final_json.get("finish_reason").cloned())
+                    .unwrap_or(Value::Null);
+                final_content = extract_openai_responses_text(&final_json);
+                break;
+            }
+        } else {
+            println!(
+                "The whole estimated number of tokens is: {}",
+                estimated_payload_tokens
+            );
+        }
+        debug_note!(
+            "OpenAI Responses request prepared: payload_bytes={}, estimated_tokens={}",
+            payload.to_string().len(),
+            estimated_payload_tokens
+        );
+
+        let (tx, rx) = oneshot::channel();
+        let spinner = tokio::spawn(spinning_beer(rx));
+
+        let response = client
+            .post(format!("{}v1/responses", get_openai_url()))
+            .bearer_auth(&api_key)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await?;
 
         let _ = tx.send(());
         let _ = spinner.await;
 
-        let json: Value = serde_json::from_str(&body)?;
-        let content = json["choices"][0]["message"]["content"]
-            .as_str().unwrap_or("")
-            .to_string();
-
-        fs::write(&response_file, content.as_bytes())?;
-        println!("🍻 OpenRouter response written to file: {}", &response_file);
-
-        convert_md_to_html_file(&response_file, events_sqls.clone());
-
-        println!(
-            "Total tokens: {}\nFinish reason: {}\n",
-            json["usage"]["total_tokens"],
-            json["choices"][0]["finish_reason"]
-        );
-    } else {
-        eprintln!("Error: {}", resp.status());
-        eprintln!("{}", resp.text().await.unwrap_or_default());
-    }
-
-    Ok(())
-}
-
-#[tokio::main]
-pub async fn openai_gpt(logfile_name: &str, vendor_model_lang: Vec<&str>, token_count_factor: usize, events_sqls: HashMap<&str, HashSet<String>>, args: &crate::Args, report_for_ai: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}{}{}", "=== Consulting OpenAI model: ".bright_cyan(), vendor_model_lang[1], " ===".bright_cyan());
-
-    let api_key = env::var("OPENAI_API_KEY")
-        .expect("You have to set OPENAI_API_KEY env variable");
-
-    let log_content = fs::read_to_string(logfile_name)
-        .expect(&format!("Can't open file {}", logfile_name));
-
-    let stem = logfile_name.split('.').collect::<Vec<&str>>()[0];
-    let path = format!("{stem}.html_reports/stats/global_statistics.json");
-    let load_profile = fs::read_to_string(&path).expect(&format!("Can't open file {}", path));
-
-    let response_file = format!("{}_{}.md", logfile_name, vendor_model_lang[1]);
-
-    let mut spell: String = format!("{} {}", SPELL, vendor_model_lang[2]);
-    let rag_context = private_reasonings();
-
-    if !args.url_context_file.is_empty() {
-        if let Some(urls) = url_context(&args.url_context_file, events_sqls.clone()) {
-            spell = format!("{spell}\n{urls}");
+        if !response.status().is_success() {
+            eprintln!("Error: {}", response.status());
+            eprintln!("{}", response.text().await.unwrap_or_default());
+            break;
         }
-    }
-    
-    let mut input_messages = vec![
-        json!({
-            "role": "system",
-            "content": [
-                { "type": "input_text", "text": spell }
-            ]
-        }),
-    ];
 
-    if let Some(rag) = rag_context {
-        input_messages.push(json!({
-            "role": "user",
-            "content": [
-                { "type": "input_text", "text":
-                    format!("### RAG CONTEXT\n{rag}\n-- END RAG CONTEXT --")
-                }
-            ]
-        }));
-    }
-    
-    let mut log_and_images = vec![
-        json!({"type":"input_text", "text":
-            format!("### ATTACHED REPORT\n{report_for_ai}\n-- END ATTACHED REPORT --")
-        }),
-    ];
-
-    log_and_images.push(json!({
-        "type": "input_text",
-        "text": format!("### LOAD PROFILE STATISTICS JSON\n{}\n-- END JSON --",load_profile
-        )
-    }));
-    
-    input_messages.push(json!({
-        "role": "user",
-        "content": log_and_images
-    }));
-
-    let payload = json!({
-        "model": vendor_model_lang[1],
-        "input": input_messages,
-    });
-
-    let payload_str = serde_json::to_string(&payload).unwrap();
-    println!("The whole estimated number of tokens is: {}", estimate_tokens_from_str(&payload_str));
-
-    let client = Client::new();
-
-    let (tx, rx) = oneshot::channel();
-    let spinner = tokio::spawn(spinning_beer(rx));
-
-    let response = client
-        .post(format!("{}v1/responses", get_openai_url()))
-        .bearer_auth(api_key)
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?;
-
-    let _ = tx.send(());
-    let _ = spinner.await;
-
-    if response.status().is_success() {
         let json: Value = response.json().await?;
+        last_usage = json.get("usage").cloned().unwrap_or(Value::Null);
+        last_finish = json
+            .pointer("/output/0/finish_reason")
+            .cloned()
+            .or_else(|| json.get("finish_reason").cloned())
+            .unwrap_or(Value::Null);
 
-        let full_text = if let Some(s) = json.get("output_text").and_then(|v| v.as_str()) {
-            s.to_string()
-        } else {
-            let mut seen = std::collections::HashSet::<String>::new();
-            let mut chunks: Vec<String> = vec![];
+        if tools_mode {
+            let mut tool_calls: Vec<Value> = vec![];
             if let Some(output_arr) = json.get("output").and_then(|o| o.as_array()) {
                 for item in output_arr {
-                    if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
-                        for c in content_arr {
-                            if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
-                                if seen.insert(t.to_string()) {
-                                    chunks.push(t.to_string());
-                                }
-                            } else if let Some(t) = c.get("output_text").and_then(|t| t.as_str()) {
-                                if seen.insert(t.to_string()) {
-                                    chunks.push(t.to_string());
-                                }
-                            }
-                        }
+                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                        tool_calls.push(item.clone());
                     }
                 }
+
+                // The Responses API requires passing model output items back,
+                // including reasoning items. Tiny detail, massive debugging party.
+                input_messages.extend(output_arr.iter().cloned());
             }
-            chunks.join("\n")
-        };
 
-        fs::write(&response_file, full_text.as_bytes())?;
-        println!("🧠 OpenAI response written to file: {}", &response_file);
+            if !tool_calls.is_empty() {
+                for tc in tool_calls {
+                    let call_id = tc
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let fn_name = tc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let raw_args = tc.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                    let parsed_args: Value = serde_json::from_str(raw_args).unwrap_or(json!({}));
 
-        convert_md_to_html_file(&response_file, events_sqls);
+                    println!("🛠  OpenAI tool call: {}({})", fn_name, parsed_args);
+                    debug_note!("OpenAI requested diagnostic tool: name='{}'", fn_name);
 
-        if let Some(usage) = json.get("usage") {
-            println!("Total tokens (OpenAI): {}", usage);
+                    let result = dispatch_tool_call(
+                        &fn_name,
+                        &parsed_args,
+                        collection.as_ref().unwrap(),
+                        stem,
+                    );
+
+                    input_messages.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result
+                    }));
+                }
+
+                if is_last_iteration {
+                    eprintln!(
+                        "⚠️ Tool loop limit reached while model still requested tools. \
+                         Running final synthesis pass without tools."
+                    );
+
+                    input_messages.push(json!({
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": final_synthesis_request() }
+                        ]
+                    }));
+
+                    let compacted = compact_openai_tool_results_for_budget(
+                        vendor_model_lang[1],
+                        &mut input_messages,
+                        openai_tool_payload_budget,
+                    );
+
+                    if compacted > 0 {
+                        eprintln!(
+                            "⚠️ Compacted {} large OpenAI tool result(s) to fit the final synthesis budget.",
+                            compacted
+                        );
+                    }
+
+                    let final_payload = json!({
+                        "model": vendor_model_lang[1],
+                        "input": input_messages,
+                    });
+                    let final_payload_tokens = estimate_tokens_from_value(&final_payload);
+
+                    if final_payload_tokens > openai_tool_payload_budget {
+                        return Err(format!(
+                            "OpenAI tools token budget exhausted: final synthesis payload is ~{} tokens, budget is ~{} tokens. \
+                             Increase --tokens-budget or reduce the initial report/tool scope.",
+                            final_payload_tokens, openai_tool_payload_budget
+                        )
+                        .into());
+                    }
+
+                    println!(
+                        "Estimated OpenAI final synthesis tokens: {}/{}",
+                        final_payload_tokens, openai_tool_payload_budget
+                    );
+
+                    debug_note!(
+                        "OpenAI final synthesis prepared: payload_bytes={}, estimated_tokens={}",
+                        final_payload.to_string().len(),
+                        final_payload_tokens
+                    );
+
+                    let (tx, rx) = oneshot::channel();
+                    let spinner = tokio::spawn(spinning_beer(rx));
+
+                    let final_response = client
+                        .post(format!("{}v1/responses", get_openai_url()))
+                        .bearer_auth(&api_key)
+                        .header("Content-Type", "application/json")
+                        .json(&final_payload)
+                        .send()
+                        .await?;
+
+                    let _ = tx.send(());
+                    let _ = spinner.await;
+
+                    if !final_response.status().is_success() {
+                        eprintln!("Error during final synthesis: {}", final_response.status());
+                        eprintln!("{}", final_response.text().await.unwrap_or_default());
+                        break;
+                    }
+
+                    let final_json: Value = final_response.json().await?;
+                    last_usage = final_json.get("usage").cloned().unwrap_or(Value::Null);
+                    last_finish = final_json
+                        .pointer("/output/0/finish_reason")
+                        .cloned()
+                        .or_else(|| final_json.get("finish_reason").cloned())
+                        .unwrap_or(Value::Null);
+                    final_content = extract_openai_responses_text(&final_json);
+                    break;
+                }
+
+                continue;
+            }
         }
-        if let Some(finish) = json.pointer("/output/0/finish_reason").or_else(|| json.get("finish_reason")) {
-            println!("Finish reason: {}", finish);
-        }
+
+        final_content = extract_openai_responses_text(&json);
+        break;
+    }
+
+    if final_content.is_empty() {
+        debug_note!("OpenAI analysis completed without final content");
+        eprintln!("⚠️  No final content produced");
     } else {
-        eprintln!("Error: {}", response.status());
-        eprintln!("{}", response.text().await.unwrap_or_default());
-    }
-
-    Ok(())
-}
-
-// ###########################
-// JASMIN Assistant Backend
-// ###########################
-#[derive(Deserialize)]
-struct UserMessage {
-    message: String,
-}
-
-#[derive(Serialize)]
-struct AIResponse {
-    reply: String,
-}
-
-#[derive(Clone, Debug)]
-pub enum BackendType {
-    OpenAI,
-    Gemini,
-}
-
-#[async_trait::async_trait]
-trait AIBackend: Send + Sync {
-    async fn initialize(&mut self, toon_str: String) -> anyhow::Result<()>;
-    async fn send_message(&self, message: &str) -> anyhow::Result<String>;
-}
-
-struct OpenAIBackend {
-    client: reqwest::Client,
-    api_key: String,
-    assistant_id: String,
-    thread_id: Option<String>,
-}
-
-impl OpenAIBackend {
-    fn new(api_key: String, assistant_id: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key,
-            assistant_id,
-            thread_id: None,
-        }
-    }
-
-    async fn create_thread_with_file(&self, toon_str: String) -> anyhow::Result<String> {
-        let file_bytes = toon_str.into_bytes();
-        let file_name = "jasmin_report.txt";
-
-        let file_part = Part::bytes(file_bytes)
-            .file_name(file_name)
-            .mime_str("text/plain")?;
-        let form = Form::new()
-            .part("file", file_part)
-            .text("purpose", "assistants");
-        
-        let upload_res = self.client
-            .post(format!("{}v1/files", get_openai_url()))
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
-        
-        let file_id = upload_res.get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Failed to upload file: {:?}", upload_res))?;
-        
-        println!("✅ File uploaded with ID: {}", file_id);
-
-        let thread_res = self.client
-            .post(format!("{}v1/threads", get_openai_url()))
-            .bearer_auth(&self.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .json(&serde_json::json!({
-                "messages": [{
-                    "role": "user",
-                    "content": "Uploading file with performance report"
-                }]
-            }))
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
-        
-        let thread_id = thread_res.get("id")
-            .and_then(|id| id.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Failed to create thread: {:?}", thread_res))?;
-        
-        println!("✅ Thread created: {}", thread_id);
-
-        let message_url = format!("{}v1/threads/{}/messages", get_openai_url(), thread_id);
-        let file_msg_res = self.client
-            .post(&message_url)
-            .bearer_auth(&self.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .json(&serde_json::json!({
-                "role": "user",
-                "content": "Please analyze the attached performance report.",
-                "attachments": [{
-                    "file_id": file_id,
-                    "tools": [{ "type": "file_search" }]
-                }]
-            }))
-            .send()
-            .await?;
-
-        if !file_msg_res.status().is_success() {
-            let status = file_msg_res.status();
-            let err_text = file_msg_res.text().await?;
-            eprintln!("Attach file failed. Status: {}, Response body: {}", status, err_text);
-            return Err(anyhow::anyhow!("Failed to attach file to thread."));
-        }
-
-        println!("📎 File attached to thread.");
-
-        println!("⏳ Waiting for file processing to complete...");
-        self.wait_for_file_processing(&thread_id).await?;
-        
-        println!("✅ File processing completed! Thread is ready for use.");
-        Ok(thread_id.to_string())
-    }
-
-    async fn wait_for_file_processing(&self, thread_id: &str) -> anyhow::Result<()> {
-        let mut attempts = 0;
-        let max_attempts = 30;
-        
-        loop {
-            let thread_url = format!("{}v1/threads/{}", get_openai_url(), thread_id);
-            let thread_res = self.client
-                .get(&thread_url)
-                .bearer_auth(&self.api_key)
-                .header("OpenAI-Beta", "assistants=v2")
-                .send()
-                .await?;
-                
-            if !thread_res.status().is_success() {
-                return Err(anyhow::anyhow!("Failed to get thread details"));
-            }
-            
-            let thread_data = thread_res.json::<serde_json::Value>().await?;
-            
-            if let Some(tool_resources) = thread_data.get("tool_resources") {
-                if let Some(file_search) = tool_resources.get("file_search") {
-                    if let Some(vector_store_ids) = file_search.get("vector_store_ids") {
-                        if let Some(vector_stores) = vector_store_ids.as_array() {
-                            if let Some(vs_id) = vector_stores.first().and_then(|v| v.as_str()) {
-                                match self.check_vector_store_status(vs_id).await? {
-                                    status if status == "completed" => {
-                                        println!("✅ Vector store processing completed!");
-                                        return Ok(());
-                                    }
-                                    status if status == "failed" => {
-                                        return Err(anyhow::anyhow!("Vector store processing failed"));
-                                    }
-                                    status => {
-                                        println!("📊 Vector store status: {} (attempt {}/{})", status, attempts + 1, max_attempts);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            if attempts >= max_attempts {
-                return Err(anyhow::anyhow!("File processing timeout after {} attempts", max_attempts));
-            }
-            
-            sleep(Duration::from_secs(5)).await;
-            attempts += 1;
-        }
-    }
-
-    async fn check_vector_store_status(&self, vector_store_id: &str) -> anyhow::Result<String> {
-        let url = format!("{}v1/vector_stores/{}", get_openai_url(), vector_store_id);
-        
-        let res = self.client
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .send()
-            .await?;
-        
-        if !res.status().is_success() {
-            return Err(anyhow::anyhow!("Failed to check vector store status"));
-        }
-        
-        let json_res = res.json::<serde_json::Value>().await?;
-        
-        let status = json_res["status"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing status in vector store response"))?;
-        
-        Ok(status.to_string())
-    }
-
-    async fn create_message(&self, thread_id: &str, content: &str) -> anyhow::Result<()> {
-        let url = format!("{}v1/threads/{}/messages", get_openai_url(), thread_id);
-
-        let mut body = HashMap::new();
-        body.insert("role", "user");
-        body.insert("content", content);
-
-        self.client.post(&url)
-            .bearer_auth(&self.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .json(&body)
-            .send().await?
-            .error_for_status()?;
-
-        Ok(())
-    }
-
-    async fn run_assistant(&self, thread_id: &str) -> anyhow::Result<String> {
-        let url = format!("{}v1/threads/{}/runs", get_openai_url(), thread_id);
-
-        let mut body = HashMap::new();
-        body.insert("assistant_id", &self.assistant_id);
-
-        let res = self.client.post(&url)
-            .bearer_auth(&self.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .json(&body)
-            .send().await?;
-            
-        if !res.status().is_success() {
-            let status = res.status();
-            let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow::anyhow!("API request failed with status {}: {}", status, error_text));
-        }
-        
-        let json_res = res.json::<serde_json::Value>().await?;
-        let run_id = json_res["id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'id' field in response: {}", json_res))?
-            .to_string();
-
-        Ok(run_id)
-    }
-
-    async fn wait_for_completion(&self, thread_id: &str, run_id: &str) -> anyhow::Result<()> {
-        loop {
-            let url = format!("{}v1/threads/{}/runs/{}", get_openai_url(), thread_id, run_id);
-            let res = self.client
-                .get(&url)
-                .bearer_auth(&self.api_key)
-                .header("OpenAI-Beta", "assistants=v2")
-                .send().await?
-                .json::<serde_json::Value>().await?;
-
-            let status = res.get("status").and_then(|s| s.as_str());
-
-            match status {
-                Some("completed") => return Ok(()),
-                Some("failed") | Some("cancelled") | Some("expired") => {
-                    return Err(anyhow::anyhow!("Run failed or was cancelled/expired:\n {:?}", res))
-                },
-                Some(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                },
-                None => {
-                    return Err(anyhow::anyhow!("Missing 'status' field in response:\n {:?}", res));
-                }
-            }
-        }
-    }
-
-    async fn get_reply(&self, thread_id: &str) -> anyhow::Result<String> {
-        let url = format!("{}v1/threads/{}/messages", get_openai_url(), thread_id);
-
-        let res = self.client
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .header("OpenAI-Beta", "assistants=v2")
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
-
-        if let Some(reply) = res["data"][0]["content"][0]["text"]["value"].as_str() {
-            Ok(reply.to_string())
-        } else {
-            Err(anyhow::anyhow!("Failed to extract assistant reply: {:?}", res))
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl AIBackend for OpenAIBackend {
-    async fn initialize(&mut self, file_path: String) -> anyhow::Result<()> {
-        let thread_id = self.create_thread_with_file(file_path).await?;
-        self.thread_id = Some(thread_id);
-        Ok(())
-    }
-
-    async fn send_message(&self, message: &str) -> anyhow::Result<String> {
-        let thread_id = self.thread_id.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Thread not initialized"))?;
-
-        self.create_message(thread_id, message).await?;
-        let run_id = self.run_assistant(thread_id).await?;
-        self.wait_for_completion(thread_id, &run_id).await?;
-        self.get_reply(thread_id).await
-    }
-}
-
-struct GeminiBackend {
-    client: reqwest::Client,
-    api_key: String,
-    model: String,
-    conversation_history: Vec<GeminiMessage>,
-    file_content: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct GeminiMessage {
-    role: String,
-    parts: Vec<GeminiPart>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum GeminiPart {
-    Text { text: String },
-    InlineData { inline_data: InlineData },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct InlineData {
-    mime_type: String,
-    data: String,
-}
-
-impl GeminiBackend {
-    fn new(api_key: String, gemini_model: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key,
-            model: gemini_model, 
-            conversation_history: Vec::new(),
-            file_content: None,
-        }
-    }
-
-    async fn send_to_gemini(&self, messages: &[GeminiMessage]) -> anyhow::Result<String> {
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
+        fs::write(&response_file, final_content.as_bytes())?;
+        debug_note!(
+            "OpenAI analysis output written: path='{}', bytes={}",
+            response_file,
+            final_content.len()
         );
-
-        let body = serde_json::json!({
-            "contents": messages,
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 8192,
-            }
-        });
-
-        let res = self.client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow::anyhow!("Gemini API request failed with status {}: {}", status, error_text));
-        }
-
-        let json_res = res.json::<serde_json::Value>().await?;
-        
-        if let Some(candidates) = json_res["candidates"].as_array() {
-            if let Some(first_candidate) = candidates.first() {
-                if let Some(content) = first_candidate["content"]["parts"][0]["text"].as_str() {
-                    return Ok(content.to_string());
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!("Failed to extract response from Gemini: {:?}", json_res))
-    }
-}
-
-#[async_trait::async_trait]
-impl AIBackend for GeminiBackend {
-    async fn initialize(&mut self, toon_str: String) -> anyhow::Result<()> {
-        self.file_content = Some(toon_str.clone());
-        
-        let mut spell: String = format!("{}", SPELL);
-        let pr = private_reasonings();
-        if pr.is_some() {
-            spell = format!("{}\n# ADVANCED RULES: {}", spell, pr.unwrap());
-        }
-
-        let initial_message = GeminiMessage {
-            role: "user".to_string(),
-            parts: vec![
-                GeminiPart::Text {
-                    text: format!(
-                        "# INITIALIZATION\n\n\
-                         I am providing you with an Oracle Database performance audit report generated \
-                         by JAS-MIN. This report contains aggregated AWR/STATSPACK statistics including \
-                         wait events, SQL analysis, I/O metrics, segment statistics, anomaly detection, \
-                         and gradient-based regression analysis.\n\n\
-                         ## Your Role\n\
-                         {}\n\n\
-                         ## Instructions\n\
-                         1. Ingest and understand the complete report below\n\
-                         2. Be prepared to answer detailed questions about any aspect of the data\n\
-                         3. When answering questions, always reference specific values, SQL_IDs, \
-                            event names, and snap_ids from the report\n\
-                         4. Detect the language of each question and respond in that same language\n\n\
-                         ## Report Content\n\
-                         ```\n{}\n```",
-                        spell, toon_str
-                    )
-                }
-            ],
-        };
-        
-        self.conversation_history.push(initial_message.clone());
-        
-        let response = self.send_to_gemini(&self.conversation_history).await?;
-        
-        self.conversation_history.push(GeminiMessage {
-            role: "model".to_string(),
-            parts: vec![GeminiPart::Text { text: response.clone() }],
-        });
-        
-        println!("✅ Gemini initialized with file content");
-        Ok(())
+        println!("🧠 OpenAI response written to file: {}", &response_file);
+        convert_md_to_html_file(&response_file, events_sqls);
+        println!("Total tokens (OpenAI): {}", last_usage);
+        println!("Finish reason: {}", last_finish);
     }
 
-    async fn send_message(&self, message: &str) -> anyhow::Result<String> {
-        let mut messages = self.conversation_history.clone();
-        
-        messages.push(GeminiMessage {
-            role: "user".to_string(),
-            parts: vec![GeminiPart::Text { text: message.to_string() }],
-        });
-        
-        let response = self.send_to_gemini(&messages).await?;
-        
-        Ok(response)
-    }
-}
-
-pub struct AppState {
-    backend: Arc<Mutex<Box<dyn AIBackend>>>,
-}
-
-#[tokio::main]
-pub async fn backend_ai(reportfile: String, backend_type: BackendType, model_name: String, toon_str: String) -> anyhow::Result<()> {    
-    let backend: Box<dyn AIBackend> = match backend_type {
-        BackendType::OpenAI => {
-            let api_key = env::var("OPENAI_API_KEY")
-                .expect("You have to set OPENAI_API_KEY variable in .env");
-            let assistant_id = env::var("OPENAI_ASST_ID")
-                .expect("You have to set OPENAI_ASST_ID variable in .env");
-            Box::new(OpenAIBackend::new(api_key, assistant_id))
-        },
-        BackendType::Gemini => {
-            let api_key = env::var("GEMINI_API_KEY")
-                .expect("You have to set GEMINI_API_KEY variable in .env");
-            
-            Box::new(GeminiBackend::new(api_key, model_name))
-        },
-    };
-    
-    let backend_port = env::var("PORT").unwrap_or("3000".to_string());
-    
-    let mut backend_mut = backend;
-    if let Err(e) = backend_mut.initialize(toon_str).await {
-        eprintln!("❌ Backend initialization failed: {:?}", e);
-        return Err(e);
-    }
-    
-    let state = Arc::new(AppState {
-        backend: Arc::new(Mutex::new(backend_mut)),
-    });
-
-    let app = Router::new()
-        .route("/api/chat", post(chat_handler))
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", backend_port)).await?;
-    println!("🚀 Server running on http://127.0.0.1:{}", backend_port);
-    axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn chat_handler(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<UserMessage>,
-) -> impl IntoResponse {
-    let backend = state.backend.lock().await;
-    
-    match backend.send_message(&payload.message).await {
-        Ok(reply) => (StatusCode::OK, Json(AIResponse { reply })).into_response(),
-        Err(err) => {
-            eprintln!("Error processing message: {:?}", err);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to process message").into_response()
-        }
-    }
-}
+#[cfg(test)]
+mod openrouter_response_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn parse_backend_type(args: &str) -> Result<BackendType, String> {
-    let mut btype = args; 
-    if args.contains(":") {
-        btype = args.split(":").collect::<Vec<&str>>()[0];
+    #[test]
+    fn whitespace_only_openrouter_response_is_identified_and_saved() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let response_file = std::env::temp_dir().join(format!(
+            "jas-min-openrouter-response-{}-{unique}.md",
+            std::process::id()
+        ));
+        let response_file = response_file.to_string_lossy().into_owned();
+        let body = "\n         \n\n       \n";
+
+        let error = parse_openrouter_response_json(body, &response_file, "tool_loop").unwrap_err();
+        let debug_path = openrouter_bad_response_path(&response_file, "tool_loop");
+
+        assert!(error
+            .to_string()
+            .contains("empty or whitespace-only response"));
+        assert_eq!(fs::read_to_string(&debug_path).unwrap(), body);
+
+        let _ = fs::remove_file(debug_path);
     }
-    match btype {
-        "openai" => Ok(BackendType::OpenAI),
-        "google" => Ok(BackendType::Gemini),
-        _ => Err(format!("Backend must be 'openai' or 'google' -> found: {}",args)),
+
+    #[test]
+    fn valid_openrouter_response_json_is_accepted() {
+        let parsed = parse_openrouter_response_json(
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+            "unused.md",
+            "tool_loop",
+        )
+        .unwrap();
+
+        assert_eq!(parsed["choices"][0]["message"]["content"], "ok");
+    }
+
+    #[test]
+    fn openrouter_retries_only_transient_http_statuses() {
+        assert!(openrouter_retryable_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(openrouter_retryable_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(openrouter_retryable_status(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(!openrouter_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(!openrouter_retryable_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
     }
 }

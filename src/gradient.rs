@@ -1,39 +1,22 @@
-use std::collections::{BTreeMap, HashSet};
+use crate::debug_note;
 use crate::make_notes;
+use crate::reasonings::{
+    AnomalyDescription, AnomlyCluster, CollinearGroupImpact, CrossModelClassification,
+    DbTimeGradientSection, GradientSettings, GradientTopItem, IOStatsByFunctionSummary,
+    InstanceStatisticCorrelation, LatchActivitySummary, LoadProfileAnomalies, MadAnomaliesEvents,
+    MadAnomaliesSQL, PctOfTimesThisSQLFoundInOtherTopSections, ReportForAI, StatisticsDescription,
+    StatsSummary, Top10SegmentStats, TopBackgroundWaitEvents, TopForegroundWaitEvents,
+    TopPeaksSelected, TopSQLsByElapsedTime, VifDiagnostic, WaitEventsFromASH,
+    WaitEventsWithStrongCorrelation,
+};
 use crate::Args;
-use crate::reasonings::{StatisticsDescription,
-                        TopPeaksSelected,
-                        MadAnomaliesEvents,
-                        MadAnomaliesSQL,
-                        TopForegroundWaitEvents,
-                        TopBackgroundWaitEvents,
-                        PctOfTimesThisSQLFoundInOtherTopSections,
-                        WaitEventsWithStrongCorrelation,
-                        WaitEventsFromASH,
-                        TopSQLsByElapsedTime,
-                        StatsSummary,
-                        IOStatsByFunctionSummary,
-                        LatchActivitySummary,
-                        Top10SegmentStats,
-                        InstanceStatisticCorrelation,
-                        LoadProfileAnomalies,
-                        AnomalyDescription,
-                        AnomlyCluster,
-                        ReportForAI,
-                        AppState,
-                        GradientSettings,
-                        GradientTopItem,
-                        CrossModelClassification,
-                        DbTimeGradientSection,
-                        VifDiagnostic,
-                        CollinearGroupImpact};
+use std::collections::{BTreeMap, HashSet};
 
-use prettytable::{Table, Row, Cell, format, Attr};
-use colored::*;
 use crate::tools::*;
+use colored::*;
+use prettytable::{format, Attr, Cell, Row, Table};
 use rayon::prelude::*;
 use std::time::Instant;
-
 
 /// Named time series: event_name/stat_name/sqlid -> Vec<sample_value>
 /// Each Vec must have the same length as DB Time series.
@@ -42,26 +25,45 @@ pub type EventSeriesMap = BTreeMap<String, Vec<f64>>;
 /// Named vector: event_name/stat_name/sqlid -> scalar_value (coef, impact, mean, std, MAD, etc.)
 pub type EventScalarMap = BTreeMap<String, f64>;
 
+const ELASTIC_NET_CV_FOLDS: usize = 5;
+const ELASTIC_NET_LAMBDA_GRID_SIZE: usize = 40;
+const ELASTIC_NET_MIN_LAMBDA_RATIO: f64 = 1e-3;
+const ELASTIC_NET_FALLBACK_LAMBDA_RATIO: f64 = 0.05;
+const ELASTIC_NET_MIN_CV_SAMPLES: usize = 12;
+
+#[derive(Debug, Clone)]
+pub struct ElasticNetSelection {
+    pub selected_lambda: f64,
+    pub lambda_mode: String,
+    pub lambda_max: f64,
+    pub lambda_ratio: f64,
+    pub cv_folds: usize,
+    pub cv_rule: String,
+    pub cv_mean_loss: Option<f64>,
+    pub nonzero_coefficients: usize,
+    pub target_standardized: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EventImpact {
     pub event_name: String,
     /// Regression coefficient on standardized Δ
     pub gradient_coef: f64,
 
-    /// Legacy/typical impact = |coef| * MAD(Δx)
+    /// Legacy/typical impact = |raw-scale coef| * MAD(raw Δx)
     /// Measures contribution during *typical* variability.
     pub impact: f64,
     /// Signed version of `impact` (preserves direction).
     pub signed_impact: f64,
 
-    /// Active impact = |coef| * P90(|Δx|)
+    /// Active impact = |raw-scale coef| * P90(|raw Δx|)
     /// Measures contribution when the predictor is *actively moving*.
     /// **Primary metric for DB tuning prioritization.**
     pub impact_active: f64,
     /// Signed active impact (positive = true bottleneck contributor).
     pub signed_impact_active: f64,
 
-    /// Peak impact = |coef| * P99(|Δx|)
+    /// Peak impact = |raw-scale coef| * P99(|raw Δx|)
     /// Measures worst-case single-snapshot contribution.
     pub impact_peak: f64,
 
@@ -77,6 +79,7 @@ pub struct DbTimeGradientResult {
     pub ridge_gradient_by_event: EventScalarMap,
     /// Elastic Net coefficients: event -> coef
     pub elastic_net_gradient_by_event: EventScalarMap,
+    pub elastic_net_selection: ElasticNetSelection,
     //Huber robust regression coefficients
     pub huber_gradient_by_event: EventScalarMap,
     //Quantile regression (tau=0.95) coefficients
@@ -109,16 +112,14 @@ pub struct DbTimeGradientResult {
 #[derive(Debug)]
 enum RegressionResult {
     Ridge(Result<EventScalarMap, String>),
-    ElasticNet(EventScalarMap),
+    ElasticNet(Result<(EventScalarMap, ElasticNetSelection), String>),
     Huber(EventScalarMap),
     Quantile95(EventScalarMap),
 }
 
-fn compute_abs_percentile_by_event(
-    series_by_event: &EventSeriesMap,
-    p: f64,
-) -> EventScalarMap {
-    series_by_event.iter()
+fn compute_abs_percentile_by_event(series_by_event: &EventSeriesMap, p: f64) -> EventScalarMap {
+    series_by_event
+        .iter()
         .map(|(name, series)| (name.clone(), abs_percentile(series, p)))
         .collect()
 }
@@ -127,22 +128,47 @@ pub fn compute_db_time_gradient(
     db_time_series: &[f64],
     event_series: &EventSeriesMap,
     ridge_lambda: f64,
-    elastic_net_lambda: f64,
+    elastic_net_lambda: Option<f64>,
     elastic_net_alpha: f64,
     elastic_net_max_iter: usize,
     elastic_net_tol: f64,
 ) -> Result<DbTimeGradientResult, String> {
+    debug_note!(
+        "Starting DB Time gradient computation: samples={}, predictors={}, ridge_lambda={}, en_lambda={:?}, en_alpha={}, max_iter={}, tolerance={}",
+        db_time_series.len(),
+        event_series.len(),
+        ridge_lambda,
+        elastic_net_lambda,
+        elastic_net_alpha,
+        elastic_net_max_iter,
+        elastic_net_tol
+    );
     if db_time_series.len() < 3 {
         return Err("DB Time series must have at least 3 samples.".into());
     }
     if event_series.is_empty() {
         return Err("event_series is empty.".into());
     }
-    if ridge_lambda < 0.0 || elastic_net_lambda < 0.0 {
-        return Err("Regularization lambdas must be >= 0.".into());
+    if !ridge_lambda.is_finite()
+        || ridge_lambda < 0.0
+        || elastic_net_lambda.is_some_and(|lambda| !lambda.is_finite() || lambda < 0.0)
+    {
+        return Err("Regularization lambdas must be finite values >= 0.".into());
     }
-    if !(0.0..=1.0).contains(&elastic_net_alpha) {
-        return Err("Elastic Net alpha must be in [0, 1].".into());
+    if !elastic_net_alpha.is_finite() || !(0.0..=1.0).contains(&elastic_net_alpha) {
+        return Err("Elastic Net alpha must be a finite value in [0, 1].".into());
+    }
+    if elastic_net_lambda.is_none() && elastic_net_alpha <= 0.0 {
+        return Err(
+            "Automatic Elastic Net lambda selection requires alpha > 0; provide a fixed lambda for alpha=0."
+                .into(),
+        );
+    }
+    if elastic_net_max_iter == 0 {
+        return Err("Elastic Net max_iter must be greater than 0.".into());
+    }
+    if !elastic_net_tol.is_finite() || elastic_net_tol <= 0.0 {
+        return Err("Elastic Net tolerance must be a finite value > 0.".into());
     }
 
     let time_len = db_time_series.len();
@@ -163,14 +189,17 @@ pub fn compute_db_time_gradient(
     let db_time_delta: Vec<f64> = db_time_delta_raw.iter().map(|&y| y - y_mean).collect();
     let event_delta_by_event = compute_event_deltas(event_series)?;
     let event_delta_mean_by_event = compute_mean_by_event(&event_delta_by_event);
-    let event_delta_std_by_event = compute_std_by_event(&event_delta_by_event, &event_delta_mean_by_event);
-    let event_delta_standardized_by_event =
-        standardize_by_event(&event_delta_by_event, &event_delta_mean_by_event, &event_delta_std_by_event);
+    let event_delta_std_by_event =
+        compute_std_by_event(&event_delta_by_event, &event_delta_mean_by_event);
+    let event_delta_standardized_by_event = standardize_by_event(
+        &event_delta_by_event,
+        &event_delta_mean_by_event,
+        &event_delta_std_by_event,
+    );
     let event_delta_mad_by_event = compute_mad_by_event(&event_delta_by_event);
     let event_delta_p90_by_event = compute_abs_percentile_by_event(&event_delta_by_event, 0.90);
     let event_delta_p99_by_event = compute_abs_percentile_by_event(&event_delta_by_event, 0.99);
 
- 
     let tasks: Vec<u8> = vec![0, 1, 2, 3]; //4 tasks - 4 models
 
     // Compute Huber delta from median residuals (intercept-only model)
@@ -180,53 +209,59 @@ pub fn compute_db_time_gradient(
     let huber_delta = (1.345 * mad(&median_residuals)).max(1e-6);
 
     let start = Instant::now(); //for counting duration of models computation
-    //parallel regression calculation
-    let results: Vec<RegressionResult> = tasks.par_iter().map(|&task_id| {
-            match task_id {
-                0 => RegressionResult::Ridge(ridge_regression_map(
-                    &event_delta_standardized_by_event,
-                    &db_time_delta,
-                    ridge_lambda,
-                )),
-                1 => RegressionResult::ElasticNet(elastic_net_coordinate_descent_map(
-                    &event_delta_standardized_by_event,
-                    &db_time_delta,
-                    elastic_net_lambda,
-                    elastic_net_alpha,
-                    elastic_net_max_iter,
-                    elastic_net_tol,
-                )),
-                2 => RegressionResult::Huber(huber_regression_map(
-                    &event_delta_standardized_by_event,
-                    &db_time_delta,
-                    huber_delta,
-                    100,
-                    elastic_net_tol,
-                    ridge_lambda,
-                )),
-                3 => RegressionResult::Quantile95(quantile_regression_irls_map(
-                    &event_delta_standardized_by_event,
-                    &db_time_delta,
-                    0.95,
-                    200,
-                    elastic_net_tol,
-                    ridge_lambda,
-                )),
-                _ => unreachable!(),
-            }
-        }).collect();
+                                //parallel regression calculation
+    let results: Vec<RegressionResult> = tasks
+        .par_iter()
+        .map(|&task_id| match task_id {
+            0 => RegressionResult::Ridge(ridge_regression_map(
+                &event_delta_standardized_by_event,
+                &db_time_delta,
+                ridge_lambda,
+            )),
+            1 => RegressionResult::ElasticNet(fit_elastic_net(
+                &event_delta_by_event,
+                &event_delta_standardized_by_event,
+                &db_time_delta_raw,
+                elastic_net_lambda,
+                elastic_net_alpha,
+                elastic_net_max_iter,
+                elastic_net_tol,
+            )),
+            2 => RegressionResult::Huber(huber_regression_map(
+                &event_delta_standardized_by_event,
+                &db_time_delta,
+                huber_delta,
+                100,
+                elastic_net_tol,
+                ridge_lambda,
+            )),
+            3 => RegressionResult::Quantile95(quantile_regression_irls_map(
+                &event_delta_standardized_by_event,
+                &db_time_delta,
+                0.95,
+                200,
+                elastic_net_tol,
+                ridge_lambda,
+            )),
+            _ => unreachable!(),
+        })
+        .collect();
 
-    
     //Unpacking results
     let mut ridge_gradient_by_event = None;
     let mut elastic_net_gradient_by_event = None;
+    let mut elastic_net_selection = None;
     let mut huber_gradient_by_event = None;
     let mut quantile95_gradient_by_event = None;
 
     for result in results {
         match result {
             RegressionResult::Ridge(r) => ridge_gradient_by_event = Some(r?),
-            RegressionResult::ElasticNet(m) => elastic_net_gradient_by_event = Some(m),
+            RegressionResult::ElasticNet(result) => {
+                let (coefficients, selection) = result?;
+                elastic_net_gradient_by_event = Some(coefficients);
+                elastic_net_selection = Some(selection);
+            }
             RegressionResult::Huber(m) => huber_gradient_by_event = Some(m),
             RegressionResult::Quantile95(m) => quantile95_gradient_by_event = Some(m),
         }
@@ -234,19 +269,47 @@ pub fn compute_db_time_gradient(
 
     let ridge_gradient_by_event = ridge_gradient_by_event.unwrap();
     let elastic_net_gradient_by_event = elastic_net_gradient_by_event.unwrap();
+    let elastic_net_selection = elastic_net_selection.unwrap();
     let huber_gradient_by_event = huber_gradient_by_event.unwrap();
     let quantile95_gradient_by_event = quantile95_gradient_by_event.unwrap();
 
-    let ridge_ranking = build_ranking(&ridge_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
-    let elastic_net_ranking = build_ranking(&elastic_net_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
-    let huber_ranking = build_ranking(&huber_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
-    let quantile95_ranking = build_ranking(&quantile95_gradient_by_event, &event_delta_mad_by_event, &event_delta_p90_by_event, &event_delta_p99_by_event);
+    let ridge_ranking = build_ranking(
+        &ridge_gradient_by_event,
+        &event_delta_std_by_event,
+        &event_delta_mad_by_event,
+        &event_delta_p90_by_event,
+        &event_delta_p99_by_event,
+    );
+    let elastic_net_ranking = build_ranking(
+        &elastic_net_gradient_by_event,
+        &event_delta_std_by_event,
+        &event_delta_mad_by_event,
+        &event_delta_p90_by_event,
+        &event_delta_p99_by_event,
+    );
+    let huber_ranking = build_ranking(
+        &huber_gradient_by_event,
+        &event_delta_std_by_event,
+        &event_delta_mad_by_event,
+        &event_delta_p90_by_event,
+        &event_delta_p99_by_event,
+    );
+    let quantile95_ranking = build_ranking(
+        &quantile95_gradient_by_event,
+        &event_delta_std_by_event,
+        &event_delta_mad_by_event,
+        &event_delta_p90_by_event,
+        &event_delta_p99_by_event,
+    );
 
     // VIF diagnostics
     let vif_by_event = compute_vif(&event_delta_standardized_by_event);
     for (event, vif) in &vif_by_event {
         if *vif > 10.0 {
-            println!("  ⚠️  VIF({}) = {:.1} — severe multicollinearity", event, vif);
+            println!(
+                "  ⚠️  VIF({}) = {:.1} — severe multicollinearity",
+                event, vif
+            );
         }
     }
     let end = Instant::now(); //for counting duration of models computation
@@ -260,13 +323,26 @@ pub fn compute_db_time_gradient(
         &event_delta_by_event,
         &db_time_delta,
         &vif_by_event,
-        10.0,  // VIF threshold
-        0.8,   // correlation threshold for grouping
+        10.0, // VIF threshold
+        0.8,  // correlation threshold for grouping
+    );
+
+    debug_note!(
+        "DB Time gradient computation completed: predictors={}, ridge_ranked={}, en_ranked={}, huber_ranked={}, q95_ranked={}, vif_entries={}, collinear_groups={}, elapsed_ms={}",
+        event_series.len(),
+        ridge_ranking.len(),
+        elastic_net_ranking.len(),
+        huber_ranking.len(),
+        quantile95_ranking.len(),
+        vif_by_event.len(),
+        collinear_groups.len(),
+        duration.as_millis()
     );
 
     Ok(DbTimeGradientResult {
         ridge_gradient_by_event,
         elastic_net_gradient_by_event,
+        elastic_net_selection,
         huber_gradient_by_event,
         quantile95_gradient_by_event,
         ridge_ranking,
@@ -282,8 +358,8 @@ pub fn compute_db_time_gradient(
 }
 
 /* =========================================================================================
-   Core computations
-   ========================================================================================= */
+Core computations
+========================================================================================= */
 
 fn compute_time_deltas(series: &[f64]) -> Vec<f64> {
     let mut deltas = Vec::with_capacity(series.len().saturating_sub(1));
@@ -297,7 +373,9 @@ fn compute_event_deltas(event_series: &EventSeriesMap) -> Result<EventSeriesMap,
     let mut deltas = BTreeMap::new();
     for (event_name, series) in event_series.iter() {
         if series.len() < 2 {
-            return Err(format!("Wait event '{event_name}' must have at least 2 samples."));
+            return Err(format!(
+                "Wait event '{event_name}' must have at least 2 samples."
+            ));
         }
         deltas.insert(event_name.clone(), compute_time_deltas(series));
     }
@@ -369,15 +447,14 @@ fn compute_mad_by_event(series_by_event: &EventSeriesMap) -> EventScalarMap {
 }
 
 /* =========================================================================================
-   Ridge regression (map-based)
-   ========================================================================================= */
+Ridge regression (map-based)
+========================================================================================= */
 
-fn ridge_regression_map (
+fn ridge_regression_map(
     standardized_event_deltas: &EventSeriesMap,
     db_time_delta: &[f64],
     lambda: f64,
 ) -> Result<EventScalarMap, String> {
-
     println!("  -> Building Ridge regression");
 
     let n = db_time_delta.len();
@@ -419,8 +496,14 @@ fn ridge_regression_map (
         }
     }
 
-    // Ridge penalty on diagonal
+    // Use the mean-loss convention, matching Elastic Net. This keeps lambda
+    // independent of the number of observations in an otherwise identical dataset.
+    let inverse_sample_count = 1.0 / n as f64;
     for j in 0..p {
+        xty[j] *= inverse_sample_count;
+        for k in 0..p {
+            xtx[j][k] *= inverse_sample_count;
+        }
         xtx[j][j] += lambda;
     }
 
@@ -430,8 +513,354 @@ fn ridge_regression_map (
 }
 
 /* =========================================================================================
-   Elastic Net coordinate descent (map-based)
-   ========================================================================================= */
+Elastic Net coordinate descent (map-based)
+========================================================================================= */
+
+fn mean_and_sample_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if values.len() < 2 {
+        return (mean, 0.0);
+    }
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = *value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    let std = variance.sqrt();
+    if std.is_finite() {
+        (mean, std)
+    } else {
+        (mean, 0.0)
+    }
+}
+
+fn elastic_net_lambda_max(
+    standardized_event_deltas: &EventSeriesMap,
+    standardized_target: &[f64],
+    alpha: f64,
+) -> f64 {
+    if alpha <= f64::EPSILON || standardized_target.is_empty() {
+        return 0.0;
+    }
+    let inverse_sample_count = 1.0 / standardized_target.len() as f64;
+    standardized_event_deltas
+        .values()
+        .map(|series| {
+            series
+                .iter()
+                .zip(standardized_target)
+                .map(|(x, y)| x * y)
+                .sum::<f64>()
+                .abs()
+                * inverse_sample_count
+                / alpha
+        })
+        .filter(|value| value.is_finite())
+        .fold(0.0, f64::max)
+}
+
+fn elastic_net_lambda_ratios() -> Vec<f64> {
+    let log_min = ELASTIC_NET_MIN_LAMBDA_RATIO.ln();
+    (0..ELASTIC_NET_LAMBDA_GRID_SIZE)
+        .map(|index| {
+            let fraction = index as f64 / (ELASTIC_NET_LAMBDA_GRID_SIZE - 1) as f64;
+            (log_min * fraction).exp()
+        })
+        .collect()
+}
+
+fn forward_chaining_folds(sample_count: usize) -> Vec<(usize, usize)> {
+    if sample_count < ELASTIC_NET_MIN_CV_SAMPLES {
+        return Vec::new();
+    }
+    let initial_training_size = (sample_count / 3).max(4);
+    let remaining = sample_count.saturating_sub(initial_training_size);
+    let fold_count = ELASTIC_NET_CV_FOLDS.min(remaining);
+    if fold_count < 2 {
+        return Vec::new();
+    }
+
+    (0..fold_count)
+        .filter_map(|fold| {
+            let validation_start =
+                initial_training_size + remaining.saturating_mul(fold) / fold_count;
+            let validation_end =
+                initial_training_size + remaining.saturating_mul(fold + 1) / fold_count;
+            (validation_end > validation_start).then_some((validation_start, validation_end))
+        })
+        .collect()
+}
+
+fn standardize_elastic_net_fold(
+    raw_event_deltas: &EventSeriesMap,
+    raw_target: &[f64],
+    training_end: usize,
+    validation_end: usize,
+) -> Option<(EventSeriesMap, EventSeriesMap, Vec<f64>, Vec<f64>)> {
+    let (target_mean, target_std) = mean_and_sample_std(&raw_target[..training_end]);
+    if target_std <= f64::EPSILON {
+        return None;
+    }
+    let training_target = raw_target[..training_end]
+        .iter()
+        .map(|value| (*value - target_mean) / target_std)
+        .collect();
+    let validation_target = raw_target[training_end..validation_end]
+        .iter()
+        .map(|value| (*value - target_mean) / target_std)
+        .collect();
+
+    let mut training_events = EventSeriesMap::new();
+    let mut validation_events = EventSeriesMap::new();
+    for (event_name, series) in raw_event_deltas {
+        let (mean, std) = mean_and_sample_std(&series[..training_end]);
+        if std <= f64::EPSILON {
+            training_events.insert(event_name.clone(), vec![0.0; training_end]);
+            validation_events.insert(event_name.clone(), vec![0.0; validation_end - training_end]);
+            continue;
+        }
+        training_events.insert(
+            event_name.clone(),
+            series[..training_end]
+                .iter()
+                .map(|value| (*value - mean) / std)
+                .collect(),
+        );
+        validation_events.insert(
+            event_name.clone(),
+            series[training_end..validation_end]
+                .iter()
+                .map(|value| (*value - mean) / std)
+                .collect(),
+        );
+    }
+
+    Some((
+        training_events,
+        validation_events,
+        training_target,
+        validation_target,
+    ))
+}
+
+fn elastic_net_validation_loss(
+    coefficients: &EventScalarMap,
+    validation_events: &EventSeriesMap,
+    validation_target: &[f64],
+) -> f64 {
+    if validation_target.is_empty() {
+        return f64::INFINITY;
+    }
+    let squared_error = validation_target
+        .iter()
+        .enumerate()
+        .map(|(sample_index, target)| {
+            let prediction = coefficients
+                .iter()
+                .map(|(event_name, coefficient)| {
+                    coefficient * validation_events[event_name][sample_index]
+                })
+                .sum::<f64>();
+            let residual = *target - prediction;
+            residual * residual
+        })
+        .sum::<f64>();
+    squared_error / validation_target.len() as f64
+}
+
+#[derive(Debug)]
+struct AutomaticLambdaChoice {
+    ratio: f64,
+    folds: usize,
+    mean_loss: f64,
+}
+
+fn select_elastic_net_lambda_ratio(
+    raw_event_deltas: &EventSeriesMap,
+    raw_target: &[f64],
+    alpha: f64,
+    max_iter: usize,
+    tol: f64,
+) -> Option<AutomaticLambdaChoice> {
+    let folds = forward_chaining_folds(raw_target.len());
+    if folds.is_empty() {
+        return None;
+    }
+    let lambda_ratios = elastic_net_lambda_ratios();
+    let mut losses_by_ratio = vec![Vec::<f64>::new(); lambda_ratios.len()];
+
+    for (training_end, validation_end) in folds {
+        let Some((training_events, validation_events, training_target, validation_target)) =
+            standardize_elastic_net_fold(
+                raw_event_deltas,
+                raw_target,
+                training_end,
+                validation_end,
+            )
+        else {
+            continue;
+        };
+        let fold_lambda_max = elastic_net_lambda_max(&training_events, &training_target, alpha);
+        let mut warm_start: Option<EventScalarMap> = None;
+
+        for (index, ratio) in lambda_ratios.iter().enumerate() {
+            let lambda = fold_lambda_max * ratio;
+            let coefficients = elastic_net_coordinate_descent_map_with_initial(
+                &training_events,
+                &training_target,
+                lambda,
+                alpha,
+                max_iter,
+                tol,
+                warm_start.as_ref(),
+            );
+            let loss =
+                elastic_net_validation_loss(&coefficients, &validation_events, &validation_target);
+            losses_by_ratio[index].push(loss);
+            warm_start = Some(coefficients);
+        }
+    }
+
+    let actual_folds = losses_by_ratio.first()?.len();
+    if actual_folds < 2 {
+        return None;
+    }
+    let summaries: Vec<(f64, f64)> = losses_by_ratio
+        .iter()
+        .map(|losses| {
+            let mean = losses.iter().sum::<f64>() / losses.len() as f64;
+            let variance = losses
+                .iter()
+                .map(|loss| {
+                    let delta = *loss - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (losses.len() - 1) as f64;
+            let standard_error = variance.sqrt() / (losses.len() as f64).sqrt();
+            (mean, standard_error)
+        })
+        .collect();
+    let best_index = summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, (mean, _))| mean.is_finite())
+        .min_by(|(_, left), (_, right)| left.0.total_cmp(&right.0))?
+        .0;
+    let one_standard_error_limit = summaries[best_index].0 + summaries[best_index].1;
+    let selected_index = summaries
+        .iter()
+        .position(|(mean, _)| mean.is_finite() && *mean <= one_standard_error_limit)
+        .unwrap_or(best_index);
+
+    Some(AutomaticLambdaChoice {
+        ratio: lambda_ratios[selected_index],
+        folds: actual_folds,
+        mean_loss: summaries[selected_index].0,
+    })
+}
+
+fn fit_elastic_net(
+    raw_event_deltas: &EventSeriesMap,
+    standardized_event_deltas: &EventSeriesMap,
+    raw_target: &[f64],
+    fixed_lambda: Option<f64>,
+    alpha: f64,
+    max_iter: usize,
+    tol: f64,
+) -> Result<(EventScalarMap, ElasticNetSelection), String> {
+    let (target_mean, target_std) = mean_and_sample_std(raw_target);
+    let standardized_target = if target_std > f64::EPSILON {
+        raw_target
+            .iter()
+            .map(|value| (*value - target_mean) / target_std)
+            .collect::<Vec<_>>()
+    } else {
+        vec![0.0; raw_target.len()]
+    };
+    let lambda_max = elastic_net_lambda_max(standardized_event_deltas, &standardized_target, alpha);
+
+    let (selected_lambda, lambda_mode, cv_folds, cv_rule, cv_mean_loss) =
+        if let Some(lambda) = fixed_lambda {
+            (
+                lambda,
+                "fixed".to_string(),
+                0,
+                "fixed_override".to_string(),
+                None,
+            )
+        } else if target_std <= f64::EPSILON || lambda_max <= f64::EPSILON {
+            (
+                0.0,
+                "auto".to_string(),
+                0,
+                "constant_or_unrelated_target".to_string(),
+                None,
+            )
+        } else if let Some(choice) =
+            select_elastic_net_lambda_ratio(raw_event_deltas, raw_target, alpha, max_iter, tol)
+        {
+            (
+                lambda_max * choice.ratio,
+                "auto".to_string(),
+                choice.folds,
+                "one_standard_error_forward_chaining".to_string(),
+                Some(choice.mean_loss),
+            )
+        } else {
+            (
+                lambda_max * ELASTIC_NET_FALLBACK_LAMBDA_RATIO,
+                "auto".to_string(),
+                0,
+                "lambda_ratio_fallback_insufficient_samples".to_string(),
+                None,
+            )
+        };
+
+    let mut coefficients = elastic_net_coordinate_descent_map(
+        standardized_event_deltas,
+        &standardized_target,
+        selected_lambda,
+        alpha,
+        max_iter,
+        tol,
+    );
+    // Convert coefficients from standardized target units back to the original
+    // DB Time/DB CPU target units. Predictor unscaling happens in build_ranking.
+    for coefficient in coefficients.values_mut() {
+        *coefficient *= target_std;
+    }
+    let nonzero_coefficients = coefficients
+        .values()
+        .filter(|coefficient| **coefficient != 0.0)
+        .count();
+    let lambda_ratio = if lambda_max > f64::EPSILON {
+        selected_lambda / lambda_max
+    } else {
+        0.0
+    };
+
+    Ok((
+        coefficients,
+        ElasticNetSelection {
+            selected_lambda,
+            lambda_mode,
+            lambda_max,
+            lambda_ratio,
+            cv_folds,
+            cv_rule,
+            cv_mean_loss,
+            nonzero_coefficients,
+            target_standardized: true,
+        },
+    ))
+}
 
 fn elastic_net_coordinate_descent_map(
     standardized_event_deltas: &EventSeriesMap,
@@ -441,19 +870,58 @@ fn elastic_net_coordinate_descent_map(
     max_iter: usize,
     tol: f64,
 ) -> EventScalarMap {
-
     println!("  -> Building Elastic Net regression");
 
+    elastic_net_coordinate_descent_map_with_initial(
+        standardized_event_deltas,
+        db_time_delta,
+        lambda,
+        alpha,
+        max_iter,
+        tol,
+        None,
+    )
+}
+
+fn elastic_net_coordinate_descent_map_with_initial(
+    standardized_event_deltas: &EventSeriesMap,
+    db_time_delta: &[f64],
+    lambda: f64,
+    alpha: f64,
+    max_iter: usize,
+    tol: f64,
+    initial_coefficients: Option<&EventScalarMap>,
+) -> EventScalarMap {
     let sample_count = db_time_delta.len();
     let mut coef_by_event: EventScalarMap = standardized_event_deltas
-        .keys().map(|k| (k.clone(), 0.0)).collect();
+        .keys()
+        .map(|event_name| {
+            let initial = initial_coefficients
+                .and_then(|coefficients| coefficients.get(event_name))
+                .copied()
+                .unwrap_or(0.0);
+            (event_name.clone(), initial)
+        })
+        .collect();
     let mut residual = db_time_delta.to_vec();
+    for (event_name, coefficient) in &coef_by_event {
+        if *coefficient == 0.0 {
+            continue;
+        }
+        for (sample_index, x) in standardized_event_deltas[event_name].iter().enumerate() {
+            residual[sample_index] -= x * coefficient;
+        }
+    }
     let mut feature_norm_by_event: EventScalarMap = BTreeMap::new();
     for (event_name, series) in standardized_event_deltas.iter() {
         let mut s = 0.0;
-        for v in series.iter() { s += v * v; }
+        for v in series.iter() {
+            s += v * v;
+        }
         let mut norm = s / (sample_count as f64).max(1.0);
-        if norm == 0.0 || !norm.is_finite() { norm = 1e-12; }
+        if norm == 0.0 || !norm.is_finite() {
+            norm = 1e-12;
+        }
         feature_norm_by_event.insert(event_name.clone(), norm);
     }
     let l1_penalty = lambda * alpha;
@@ -482,20 +950,26 @@ fn elastic_net_coordinate_descent_map(
             }
             max_change = max_change.max((new_coef - old_coef).abs());
         }
-        if max_change < tol { break; }
+        if max_change < tol {
+            break;
+        }
     }
     coef_by_event
 }
 
 fn soft_threshold(value: f64, threshold: f64) -> f64 {
-    if value > threshold { value - threshold }
-    else if value < -threshold { value + threshold }
-    else { 0.0 }
+    if value > threshold {
+        value - threshold
+    } else if value < -threshold {
+        value + threshold
+    } else {
+        0.0
+    }
 }
 
 /* =========================================================================================
-   Huber robust regression via IRLS (map-based)
-   ========================================================================================= */
+Huber robust regression via IRLS (map-based)
+========================================================================================= */
 fn huber_regression_map(
     x_by_event: &EventSeriesMap,
     y: &[f64],
@@ -514,7 +988,8 @@ fn huber_regression_map(
     }
 
     // Pre-materialize columns
-    let columns: Vec<&[f64]> = event_names.iter()
+    let columns: Vec<&[f64]> = event_names
+        .iter()
         .map(|name| x_by_event[name].as_slice())
         .collect();
 
@@ -535,7 +1010,11 @@ fn huber_regression_map(
                 pred += beta[j] * columns[j][t];
             }
             let r = (y[t] - pred).abs();
-            weights[t] = if r <= delta { 1.0 } else { delta / r.max(1e-15) };
+            weights[t] = if r <= delta {
+                1.0
+            } else {
+                delta / r.max(1e-15)
+            };
         }
 
         xtwx.iter_mut().for_each(|v| *v = 0.0);
@@ -554,6 +1033,13 @@ fn huber_regression_map(
             }
         }
 
+        let inverse_sample_count = 1.0 / n as f64;
+        for value in &mut xtwx {
+            *value *= inverse_sample_count;
+        }
+        for value in &mut xtwy {
+            *value *= inverse_sample_count;
+        }
         for j in 0..p {
             for k in (j + 1)..p {
                 xtwx[k * p + j] = xtwx[j * p + k];
@@ -563,18 +1049,22 @@ fn huber_regression_map(
 
         solve_dense_linear_system_flat(&mut xtwx, &mut xtwy, p, &mut beta);
 
-        let max_change: f64 = beta.iter().zip(beta_old.iter())
+        let max_change: f64 = beta
+            .iter()
+            .zip(beta_old.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
-        if max_change < tol { break; }
+        if max_change < tol {
+            break;
+        }
     }
 
     event_names.into_iter().zip(beta).collect()
 }
 
 /* =========================================================================================
-   Quantile regression via IRLS (map-based, tau=0.95)
-   ========================================================================================= */
+Quantile regression via IRLS (map-based, tau=0.95)
+========================================================================================= */
 
 fn quantile_regression_irls_map(
     x_by_event: &EventSeriesMap,
@@ -594,7 +1084,8 @@ fn quantile_regression_irls_map(
     }
 
     // Pre-materialize columns ONCE — eliminate all BTreeMap lookups
-    let columns: Vec<&[f64]> = event_names.iter()
+    let columns: Vec<&[f64]> = event_names
+        .iter()
         .map(|name| x_by_event[name].as_slice())
         .collect();
 
@@ -603,7 +1094,7 @@ fn quantile_regression_irls_map(
     let q_ridge = (ridge_penalty * 0.01).max(1e-6);
 
     // Pre-allocate matrices ONCE, reuse across iterations
-    let mut xtwx: Vec<f64> = vec![0.0; p * p];  // flat layout for cache
+    let mut xtwx: Vec<f64> = vec![0.0; p * p]; // flat layout for cache
     let mut xtwy: Vec<f64> = vec![0.0; p];
     let mut weights: Vec<f64> = vec![1.0; n];
 
@@ -618,7 +1109,11 @@ fn quantile_regression_irls_map(
             }
             let r = y[t] - pred;
             let abs_r = r.abs().max(eps);
-            weights[t] = if r >= 0.0 { tau / abs_r } else { (1.0 - tau) / abs_r };
+            weights[t] = if r >= 0.0 {
+                tau / abs_r
+            } else {
+                (1.0 - tau) / abs_r
+            };
         }
 
         // Zero out — much faster than reallocating
@@ -640,6 +1135,16 @@ fn quantile_regression_irls_map(
             }
         }
 
+        // Normalize the weighted loss before adding regularization so lambda does
+        // not change meaning when the same observations are duplicated.
+        let inverse_sample_count = 1.0 / n as f64;
+        for value in &mut xtwx {
+            *value *= inverse_sample_count;
+        }
+        for value in &mut xtwy {
+            *value *= inverse_sample_count;
+        }
+
         // Mirror upper triangle to lower + add ridge
         for j in 0..p {
             for k in (j + 1)..p {
@@ -651,7 +1156,9 @@ fn quantile_regression_irls_map(
         // Solve in-place (reusing xtwx as augmented matrix)
         solve_dense_linear_system_flat(&mut xtwx, &mut xtwy, p, &mut beta);
 
-        let max_change: f64 = beta.iter().zip(beta_old.iter())
+        let max_change: f64 = beta
+            .iter()
+            .zip(beta_old.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
         if max_change < tol {
@@ -663,14 +1170,16 @@ fn quantile_regression_irls_map(
 }
 
 /* =========================================================================================
-   Dense linear system solver with partial pivoting
-   ========================================================================================= */
-/// Solves Ax = b in-place. 
+Dense linear system solver with partial pivoting
+========================================================================================= */
+/// Solves Ax = b in-place.
 /// `a` is p×p flat row-major (DESTROYED during solve).
 /// `b` is the RHS (DESTROYED, becomes scratch).
 /// `x` receives the solution.
 fn solve_dense_linear_system_flat(a: &mut [f64], b: &mut [f64], p: usize, x: &mut [f64]) {
-    if p == 0 { return; }
+    if p == 0 {
+        return;
+    }
 
     // We need the augmented column, but instead of building [A|b],
     // we keep b separate and apply the same row operations.
@@ -697,7 +1206,9 @@ fn solve_dense_linear_system_flat(a: &mut [f64], b: &mut [f64], p: usize, x: &mu
         }
 
         let pivot = a[col * p + col];
-        if pivot.abs() < 1e-15 { continue; }
+        if pivot.abs() < 1e-15 {
+            continue;
+        }
 
         for row in (col + 1)..p {
             let factor = a[row * p + col] / pivot;
@@ -714,21 +1225,30 @@ fn solve_dense_linear_system_flat(a: &mut [f64], b: &mut [f64], p: usize, x: &mu
         for j in (i + 1)..p {
             sum -= a[i * p + j] * x[j];
         }
-        x[i] = if a[i * p + i].abs() > 1e-15 { sum / a[i * p + i] } else { 0.0 };
+        x[i] = if a[i * p + i].abs() > 1e-15 {
+            sum / a[i * p + i]
+        } else {
+            0.0
+        };
     }
 }
 
 fn solve_dense_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let n = b.len();
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
 
     // Build augmented matrix
-    let mut aug: Vec<Vec<f64>> = a.iter().enumerate()
+    let mut aug: Vec<Vec<f64>> = a
+        .iter()
+        .enumerate()
         .map(|(i, row)| {
             let mut r = row.clone();
             r.push(b[i]);
             r
-        }).collect();
+        })
+        .collect();
 
     // Forward elimination with partial pivoting
     for col in 0..n {
@@ -738,7 +1258,9 @@ fn solve_dense_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         aug.swap(col, max_row);
 
         let pivot = aug[col][col];
-        if pivot.abs() < 1e-15 { continue; }
+        if pivot.abs() < 1e-15 {
+            continue;
+        }
 
         for row in (col + 1)..n {
             let factor = aug[row][col] / pivot;
@@ -755,18 +1277,22 @@ fn solve_dense_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         for j in (i + 1)..n {
             sum -= aug[i][j] * x[j];
         }
-        x[i] = if aug[i][i].abs() > 1e-15 { sum / aug[i][i] } else { 0.0 };
+        x[i] = if aug[i][i].abs() > 1e-15 {
+            sum / aug[i][i]
+        } else {
+            0.0
+        };
     }
     x
 }
 
 /* =========================================================================================
-   Ranking / reporting helpers
-   ========================================================================================= */
+Ranking / reporting helpers
+========================================================================================= */
 
 /* =========================================================================================
-   Variance Inflation Factor (VIF) diagnostics
-   ========================================================================================= */
+Variance Inflation Factor (VIF) diagnostics
+========================================================================================= */
 
 /// Compute Variance Inflation Factor for each predictor.
 /// VIF_j = 1 / (1 - R²_j), where R²_j is from regressing x_j on all other x's.
@@ -775,11 +1301,7 @@ pub fn compute_vif(x_by_event: &EventSeriesMap) -> EventScalarMap {
     println!("  -> Computing VIF");
     let event_names: Vec<String> = x_by_event.keys().cloned().collect();
     let p = event_names.len();
-    let n = x_by_event
-        .values()
-        .next()
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let n = x_by_event.values().next().map(|v| v.len()).unwrap_or(0);
 
     if p <= 1 || n < p + 1 {
         return event_names.iter().map(|e| (e.clone(), 1.0)).collect();
@@ -792,77 +1314,80 @@ pub fn compute_vif(x_by_event: &EventSeriesMap) -> EventScalarMap {
         .map(|name| x_by_event[name].as_slice())
         .collect();
 
-    let vif_entries: Vec<(String, f64)> = (0..p).into_par_iter().map(|target_idx| {
-        let target_name = &event_names[target_idx];
-        let y_j: &[f64] = all_columns[target_idx];
+    let vif_entries: Vec<(String, f64)> = (0..p)
+        .into_par_iter()
+        .map(|target_idx| {
+            let target_name = &event_names[target_idx];
+            let y_j: &[f64] = all_columns[target_idx];
 
-        // Build slice of "other" columns (everything except target_idx)
-        let other_columns: Vec<&[f64]> = all_columns
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != target_idx)
-            .map(|(_, col)| *col)
-            .collect();
-        let q = other_columns.len();
+            // Build slice of "other" columns (everything except target_idx)
+            let other_columns: Vec<&[f64]> = all_columns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != target_idx)
+                .map(|(_, col)| *col)
+                .collect();
+            let q = other_columns.len();
 
-        // Flat row-major X'X (q×q) and X'y (q)
-        let mut xtx: Vec<f64> = vec![0.0; q * q];
-        let mut xty: Vec<f64> = vec![0.0; q];
-        let mut yty: f64 = 0.0;
-        let mut y_sum: f64 = 0.0;
+            // Flat row-major X'X (q×q) and X'y (q)
+            let mut xtx: Vec<f64> = vec![0.0; q * q];
+            let mut xty: Vec<f64> = vec![0.0; q];
+            let mut yty: f64 = 0.0;
+            let mut y_sum: f64 = 0.0;
 
-        for t in 0..n {
-            let yt = y_j[t];
-            y_sum += yt;
-            yty += yt * yt;
-            for a in 0..q {
-                let xa = other_columns[a][t];
-                xty[a] += xa * yt;
-                // Upper triangle only — mirror later
-                for b in a..q {
-                    xtx[a * q + b] += xa * other_columns[b][t];
+            for t in 0..n {
+                let yt = y_j[t];
+                y_sum += yt;
+                yty += yt * yt;
+                for a in 0..q {
+                    let xa = other_columns[a][t];
+                    xty[a] += xa * yt;
+                    // Upper triangle only — mirror later
+                    for b in a..q {
+                        xtx[a * q + b] += xa * other_columns[b][t];
+                    }
                 }
             }
-        }
 
-        // Mirror upper triangle to lower + add tiny ridge for numerical stability
-        for a in 0..q {
-            for b in (a + 1)..q {
-                xtx[b * q + a] = xtx[a * q + b];
-            }
-            xtx[a * q + a] += 1e-8;
-        }
-
-        // Solve (X'X + εI) β = X'y using the fast flat solver
-        let mut beta: Vec<f64> = vec![0.0; q];
-        solve_dense_linear_system_flat(&mut xtx, &mut xty, q, &mut beta);
-
-        let y_mean_val = y_sum / n as f64;
-        let ss_tot = yty - n as f64 * y_mean_val * y_mean_val;
-
-        let mut ss_res = 0.0;
-        for t in 0..n {
-            let mut pred = 0.0;
+            // Mirror upper triangle to lower + add tiny ridge for numerical stability
             for a in 0..q {
-                pred += beta[a] * other_columns[a][t];
+                for b in (a + 1)..q {
+                    xtx[b * q + a] = xtx[a * q + b];
+                }
+                xtx[a * q + a] += 1e-8;
             }
-            let r = y_j[t] - pred;
-            ss_res += r * r;
-        }
 
-        let r_squared = if ss_tot > 1e-15 {
-            (1.0 - ss_res / ss_tot).max(0.0)
-        } else {
-            0.0
-        };
-        let vif = if r_squared < 1.0 - 1e-15 {
-            1.0 / (1.0 - r_squared)
-        } else {
-            1e6
-        };
+            // Solve (X'X + εI) β = X'y using the fast flat solver
+            let mut beta: Vec<f64> = vec![0.0; q];
+            solve_dense_linear_system_flat(&mut xtx, &mut xty, q, &mut beta);
 
-        (target_name.clone(), vif)
-    }).collect();
+            let y_mean_val = y_sum / n as f64;
+            let ss_tot = yty - n as f64 * y_mean_val * y_mean_val;
+
+            let mut ss_res = 0.0;
+            for t in 0..n {
+                let mut pred = 0.0;
+                for a in 0..q {
+                    pred += beta[a] * other_columns[a][t];
+                }
+                let r = y_j[t] - pred;
+                ss_res += r * r;
+            }
+
+            let r_squared = if ss_tot > 1e-15 {
+                (1.0 - ss_res / ss_tot).max(0.0)
+            } else {
+                0.0
+            };
+            let vif = if r_squared < 1.0 - 1e-15 {
+                1.0 / (1.0 - r_squared)
+            } else {
+                1e6
+            };
+
+            (target_name.clone(), vif)
+        })
+        .collect();
 
     vif_entries.into_iter().collect()
 }
@@ -990,32 +1515,42 @@ pub fn compute_grouped_impacts(
 
 fn build_ranking(
     coef_by_event: &EventScalarMap,
+    std_by_event: &EventScalarMap,
     mad_by_event: &EventScalarMap,
     p90_by_event: &EventScalarMap,
     p99_by_event: &EventScalarMap,
 ) -> Vec<EventImpact> {
-    let mut ranking: Vec<EventImpact> = coef_by_event.iter().map(|(event_name, coef)| {
-        let mad_val = *mad_by_event.get(event_name).unwrap_or(&0.0);
-        let p90_val = *p90_by_event.get(event_name).unwrap_or(&0.0);
-        let p99_val = *p99_by_event.get(event_name).unwrap_or(&0.0);
+    let mut ranking: Vec<EventImpact> = coef_by_event
+        .iter()
+        .map(|(event_name, coef)| {
+            let mad_val = *mad_by_event.get(event_name).unwrap_or(&0.0);
+            let p90_val = *p90_by_event.get(event_name).unwrap_or(&0.0);
+            let p99_val = *p99_by_event.get(event_name).unwrap_or(&0.0);
+            let std_val = *std_by_event.get(event_name).unwrap_or(&0.0);
+            let raw_scale_coef = if std_val > f64::EPSILON {
+                *coef / std_val
+            } else {
+                0.0
+            };
+            let abs_raw_scale_coef = raw_scale_coef.abs();
 
-        let abs_coef = coef.abs();
-
-        EventImpact {
-            event_name: event_name.clone(),
-            gradient_coef: *coef,
-            impact: abs_coef * mad_val,
-            signed_impact: *coef * mad_val,
-            impact_active: abs_coef * p90_val,
-            signed_impact_active: *coef * p90_val,
-            impact_peak: abs_coef * p99_val,
-            impact_share: 0.0, // fill below
-        }
-    }).collect();
+            EventImpact {
+                event_name: event_name.clone(),
+                gradient_coef: *coef,
+                impact: abs_raw_scale_coef * mad_val,
+                signed_impact: raw_scale_coef * mad_val,
+                impact_active: abs_raw_scale_coef * p90_val,
+                signed_impact_active: raw_scale_coef * p90_val,
+                impact_peak: abs_raw_scale_coef * p99_val,
+                impact_share: 0.0, // fill below
+            }
+        })
+        .collect();
 
     // Compute share of active impact (only over positive contributors —
     // negative coefs are usually confounders, not bottlenecks)
-    let total_positive_active: f64 = ranking.iter()
+    let total_positive_active: f64 = ranking
+        .iter()
         .filter(|r| r.gradient_coef > 0.0)
         .map(|r| r.impact_active)
         .sum();
@@ -1040,8 +1575,8 @@ fn build_ranking(
 }
 
 /* =========================================================================================
-   Cross-model triangulation / classification
-   ========================================================================================= */
+Cross-model triangulation / classification
+========================================================================================= */
 
 /// Classify events/stats/SQLs by cross-referencing all 4 model rankings.
 /// Returns a list of classifications sorted by confidence (confirmed bottlenecks first).
@@ -1049,31 +1584,40 @@ pub fn cross_model_classify(
     section: &DbTimeGradientSection,
     top_n: usize,
 ) -> Vec<CrossModelClassification> {
-    let ridge_set: HashSet<String> = section.ridge_top.iter()
+    let ridge_set: HashSet<String> = section
+        .ridge_top
+        .iter()
         .take(top_n)
         .filter(|i| i.impact >= 0.0 && i.gradient_coef > 0.0)
         .map(|i| i.event_name.clone())
         .collect();
 
-    let en_set: HashSet<String> = section.elastic_net_top.iter()
+    let en_set: HashSet<String> = section
+        .elastic_net_top
+        .iter()
         .take(top_n)
         .filter(|i| i.impact >= 0.0 && i.gradient_coef > 0.0)
         .map(|i| i.event_name.clone())
         .collect();
 
-    let huber_set: HashSet<String> = section.huber_top.iter()
+    let huber_set: HashSet<String> = section
+        .huber_top
+        .iter()
         .take(top_n)
         .filter(|i| i.impact >= 0.0 && i.gradient_coef > 0.0)
         .map(|i| i.event_name.clone())
         .collect();
 
-    let q95_set: HashSet<String> = section.quantile95_top.iter()
+    let q95_set: HashSet<String> = section
+        .quantile95_top
+        .iter()
         .take(top_n)
         .filter(|i| i.impact >= 0.0 && i.gradient_coef > 0.0)
         .map(|i| i.event_name.clone())
         .collect();
 
-    let all_events: HashSet<String> = ridge_set.iter()
+    let all_events: HashSet<String> = ridge_set
+        .iter()
         .chain(en_set.iter())
         .chain(huber_set.iter())
         .chain(q95_set.iter())
@@ -1088,56 +1632,76 @@ pub fn cross_model_classify(
         let in_huber = huber_set.contains(event);
         let in_q95 = q95_set.contains(event);
 
-        let model_count = [in_ridge, in_en, in_huber, in_q95].iter().filter(|&&b| b).count();
-        let ridge_impact = section.ridge_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
-                                               .unwrap_or(0.0);
-        let en_impact = section.elastic_net_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
-                                               .unwrap_or(0.0);
-        let huber_impact = section.huber_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
-                                               .unwrap_or(0.0);
-        let q95_impact = section.quantile95_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
-                                               .unwrap_or(0.0);
+        let model_count = [in_ridge, in_en, in_huber, in_q95]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+        let ridge_impact = section
+            .ridge_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+            .unwrap_or(0.0);
+        let en_impact = section
+            .elastic_net_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+            .unwrap_or(0.0);
+        let huber_impact = section
+            .huber_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+            .unwrap_or(0.0);
+        let q95_impact = section
+            .quantile95_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_active))
+            .unwrap_or(0.0);
         let combined_impact = ridge_impact + en_impact + huber_impact + q95_impact;
 
-        let ridge_peak_impact = section.ridge_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
-                                               .unwrap_or(0.0);
-        let en_peak_impact = section.elastic_net_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
-                                               .unwrap_or(0.0);
-        let huber_peak_impact = section.huber_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
-                                               .unwrap_or(0.0);
-        let q95_peak_impact = section.quantile95_top.iter() 
-                                               .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
-                                               .unwrap_or(0.0);
+        let ridge_peak_impact = section
+            .ridge_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+            .unwrap_or(0.0);
+        let en_peak_impact = section
+            .elastic_net_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+            .unwrap_or(0.0);
+        let huber_peak_impact = section
+            .huber_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+            .unwrap_or(0.0);
+        let q95_peak_impact = section
+            .quantile95_top
+            .iter()
+            .find_map(|r| (&r.event_name == event).then(|| r.impact_peak))
+            .unwrap_or(0.0);
 
-        let combined_peak_impact = ridge_peak_impact + en_peak_impact + huber_peak_impact + q95_peak_impact;
+        let combined_peak_impact =
+            ridge_peak_impact + en_peak_impact + huber_peak_impact + q95_peak_impact;
 
         let (classification, priority) = if in_ridge && in_en && in_huber && in_q95 {
             // All 4 models agree
             ("CONFIRMED_BOTTLENECK", 0)
         } else if in_ridge && in_huber && in_q95 && !in_en {
-            // Ridge + Huber + Q95 but NOT EN → EN zeroed it due to collinearity with another 
-            // dominant event. Still very high confidence since 3 independent models agree 
+            // Ridge + Huber + Q95 but NOT EN → EN zeroed it due to collinearity with another
+            // dominant event. Still very high confidence since 3 independent models agree
             // including the tail-risk model.
             ("CONFIRMED_BOTTLENECK_EN_COLLINEAR", 1)
         } else if in_ridge && in_en && in_huber && !in_q95 {
             // Strong across average behavior, not dominant in tail
             ("STRONG_CONTRIBUTOR", 2)
         } else if in_ridge && in_huber && !in_en && !in_q95 {
-            // Stable systematic contributor, but EN dropped it (collinear) 
+            // Stable systematic contributor, but EN dropped it (collinear)
             // and not a tail risk
             ("STABLE_CONTRIBUTOR", 3)
         } else if in_q95 && !in_ridge {
             // Worst-case only — hidden danger
             ("TAIL_RISK", 4)
         } else if in_q95 && in_ridge && !in_huber {
-            // High in Ridge and Q95 but NOT in Huber → impact comes from extreme 
+            // High in Ridge and Q95 but NOT in Huber → impact comes from extreme
             // snapshots that also happen to be the worst ones
             ("TAIL_OUTLIER", 4)
         } else if in_ridge && !in_huber {
@@ -1157,45 +1721,54 @@ pub fn cross_model_classify(
         };
 
         let description = match classification {
-            "CONFIRMED_BOTTLENECK" => 
+            "CONFIRMED_BOTTLENECK" => {
                 "Present in ALL 4 models (Ridge, ElasticNet, Huber, Q95). Highest confidence — \
-                 systematic, robust bottleneck affecting both average and worst-case DB Time.",
-            "CONFIRMED_BOTTLENECK_EN_COLLINEAR" => 
+                 systematic, robust bottleneck affecting both average and worst-case DB Time."
+            }
+            "CONFIRMED_BOTTLENECK_EN_COLLINEAR" => {
                 "Present in Ridge, Huber, and Q95 but NOT in ElasticNet. Very high confidence — \
                  3 independent models agree. ElasticNet likely zeroed it due to collinearity with \
                  another correlated event. Treat as confirmed bottleneck; check EN for which \
-                 correlated event was selected instead.",
-            "STRONG_CONTRIBUTOR" => 
+                 correlated event was selected instead."
+            }
+            "STRONG_CONTRIBUTOR" => {
                 "Present in Ridge, ElasticNet, and Huber but not Q95. Reliable systematic \
-                 contributor to DB Time, but not especially dominant in tail/worst-case scenarios.",
-            "STABLE_CONTRIBUTOR" => 
+                 contributor to DB Time, but not especially dominant in tail/worst-case scenarios."
+            }
+            "STABLE_CONTRIBUTOR" => {
                 "Present in Ridge and Huber (both agree = robust finding) but absent from \
                  ElasticNet (collinearity) and Q95 (not a tail driver). A steady, moderate \
-                 contributor to DB Time.",
-            "TAIL_RISK" => 
+                 contributor to DB Time."
+            }
+            "TAIL_RISK" => {
                 "Present in Quantile95 but NOT in Ridge. Usually behaves fine but causes \
                  catastrophic DB Time spikes in the worst 5% of snapshots. Investigate \
-                 specific peak periods.",
-            "TAIL_OUTLIER" => 
+                 specific peak periods."
+            }
+            "TAIL_OUTLIER" => {
                 "Present in Ridge and Q95 but NOT in Huber. Impact is concentrated in \
                  extreme snapshots that are also the worst-performing ones. A high-severity \
-                 outlier problem — find and fix those specific periods.",
-            "OUTLIER_DRIVEN" => 
+                 outlier problem — find and fix those specific periods."
+            }
+            "OUTLIER_DRIVEN" => {
                 "Present in Ridge but NOT in Huber (outlier-resistant). Its apparent impact \
                  is driven by a few extreme snapshots, not systematic behavior. Examine \
-                 those specific snapshots.",
-            "SPARSE_DOMINANT" => 
+                 those specific snapshots."
+            }
+            "SPARSE_DOMINANT" => {
                 "Present in ElasticNet but NOT in Ridge top. One of a small number of truly \
                  dominant factors selected by L1 sparsity. May be correlated with other \
-                 contributors that Ridge spreads weight across.",
-            "ROBUST_ONLY" => 
+                 contributors that Ridge spreads weight across."
+            }
+            "ROBUST_ONLY" => {
                 "Present only in Huber. Stable background contributor visible only when \
-                 outliers are downweighted. Low priority but worth monitoring.",
-            "MULTI_MODEL_MINOR" => 
+                 outliers are downweighted. Low priority but worth monitoring."
+            }
+            "MULTI_MODEL_MINOR" => {
                 "Appeared in at least 2 models but with no clear dominant pattern. Minor \
-                 contributor worth noting.",
-            _ => 
-                "Appeared in only one model with low confidence.",
+                 contributor worth noting."
+            }
+            _ => "Appeared in only one model with low confidence.",
         };
 
         results.push(CrossModelClassification {
@@ -1212,7 +1785,26 @@ pub fn cross_model_classify(
         });
     }
 
-    results.sort_by_key(|r| r.priority);
+    // `all_events` is a HashSet, so sorting by priority alone leaves equal-priority
+    // rows in a process-random order. Downstream compact views used to take the
+    // first few rows and could therefore hide the largest contributor. Keep the
+    // classification priority primary, then rank equal-priority signals by their
+    // measured active and peak impact, with the name as a deterministic tie-break.
+    results.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| {
+                b.combined_impact
+                    .partial_cmp(&a.combined_impact)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.combined_peak_impact
+                    .partial_cmp(&a.combined_peak_impact)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.event_name.cmp(&b.event_name))
+    });
     results
 }
 
@@ -1223,8 +1815,15 @@ pub fn print_cross_model_table(
     logfile_name: &str,
     args: &Args,
 ) -> String {
-    make_notes!(logfile_name, args.quiet, 0, "\n{}\n",
-        format!("-- Cross-Model Triangulation: {} --", section_label).bold().bright_magenta());
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "\n{}\n",
+        format!("-- Cross-Model Triangulation: {} --", section_label)
+            .bold()
+            .bright_magenta()
+    );
 
     let mut table = Table::new();
     table.set_titles(Row::new(vec![
@@ -1240,25 +1839,43 @@ pub fn print_cross_model_table(
     ]));
 
     for c in classifications {
-        let yn = |b: bool| -> &str { if b { "Yes" } else { "-" } };
+        let yn = |b: bool| -> &str {
+            if b {
+                "Yes"
+            } else {
+                "-"
+            }
+        };
         if let Some(desc) = c.description.clone() {
             table.add_row(Row::new(vec![
-            Cell::new(&c.event_name),
-            Cell::new(&c.classification),
-            Cell::new(yn(c.in_ridge)),
-            Cell::new(yn(c.in_elastic_net)),
-            Cell::new(yn(c.in_huber)),
-            Cell::new(yn(c.in_quantile95)),
-            Cell::new(&format!("{:.2}",c.combined_impact)),
-            Cell::new(&format!("{:.2}",c.combined_peak_impact)),
-            Cell::new(&desc),
-        ]));
+                Cell::new(&c.event_name),
+                Cell::new(&c.classification),
+                Cell::new(yn(c.in_ridge)),
+                Cell::new(yn(c.in_elastic_net)),
+                Cell::new(yn(c.in_huber)),
+                Cell::new(yn(c.in_quantile95)),
+                Cell::new(&format!("{:.2}", c.combined_impact)),
+                Cell::new(&format!("{:.2}", c.combined_peak_impact)),
+                Cell::new(&desc),
+            ]));
         }
-        
     }
 
-
-    let mut html = table_to_html_string(&table, &format!("Cross-Model Triangulation: {}", section_label), &["Event/Stat/SQL", "Classification", "Ridge", "EN", "Huber", "Q95", "Combined Impact","Combined Peak Impact","Description"]);
+    let mut html = table_to_html_string(
+        &table,
+        &format!("Cross-Model Triangulation: {}", section_label),
+        &[
+            "Event/Stat/SQL",
+            "Classification",
+            "Ridge",
+            "EN",
+            "Huber",
+            "Q95",
+            "Combined Impact",
+            "Combined Peak Impact",
+            "Description",
+        ],
+    );
     html = format!(r#"<div>{html}</div>"#);
 
     /* Removing description before printing on screen, because it doesn't look good */
@@ -1273,22 +1890,32 @@ pub fn print_cross_model_table(
     html
 }
 
-
 /* =========================================================================================
-   build_db_time_gradient_section — now includes Huber + Q95 + cross-model
-   ========================================================================================= */
+build_db_time_gradient_section — now includes Huber + Q95 + cross-model
+========================================================================================= */
 
 pub fn build_db_time_gradient_section(
     db_time_series: &[f64],
     event_series: &BTreeMap<String, Vec<f64>>,
     ridge_lambda: f64,
-    elastic_net_lambda: f64,
+    elastic_net_lambda: Option<f64>,
     elastic_net_alpha: f64,
     elastic_net_max_iter: usize,
     elastic_net_tol: f64,
     units_desc: &str,
+    top_n: usize,
 ) -> Result<DbTimeGradientSection, String> {
-    println!("\n\nBuilding gradient for {units_desc} - {} stats", event_series.len());
+    debug_note!(
+        "Building gradient section: label='{}', samples={}, predictors={}, top_n={}",
+        units_desc,
+        db_time_series.len(),
+        event_series.len(),
+        top_n
+    );
+    println!(
+        "\n\nBuilding gradient for {units_desc} - {} stats",
+        event_series.len()
+    );
     if db_time_series.len() < 3 {
         return Err("Not enough DB Time samples (need >= 3).".into());
     }
@@ -1300,21 +1927,28 @@ pub fn build_db_time_gradient_section(
         if series.len() != expected_len {
             return Err(format!(
                 "Event '{}' length mismatch: got {}, expected {}.",
-                event_name, series.len(), expected_len
+                event_name,
+                series.len(),
+                expected_len
             ));
         }
     }
 
     let gradient_result = compute_db_time_gradient(
-        db_time_series, event_series,
-        ridge_lambda, elastic_net_lambda, elastic_net_alpha,
-        elastic_net_max_iter, elastic_net_tol,
+        db_time_series,
+        event_series,
+        ridge_lambda,
+        elastic_net_lambda,
+        elastic_net_alpha,
+        elastic_net_max_iter,
+        elastic_net_tol,
     )?;
 
     let make_top = |ranking: &[EventImpact], filter_zero: bool| -> Vec<GradientTopItem> {
-        ranking.iter()
+        ranking
+            .iter()
             .filter(|x| !filter_zero || x.gradient_coef != 0.0)
-            .take(50)
+            .take(top_n)
             .map(|x| GradientTopItem {
                 event_name: x.event_name.clone(),
                 gradient_coef: x.gradient_coef,
@@ -1334,7 +1968,19 @@ pub fn build_db_time_gradient_section(
     let mut section = DbTimeGradientSection {
         settings: GradientSettings {
             ridge_lambda,
-            elastic_net_lambda,
+            elastic_net_lambda: gradient_result.elastic_net_selection.selected_lambda,
+            elastic_net_lambda_mode: gradient_result.elastic_net_selection.lambda_mode.clone(),
+            elastic_net_lambda_max: gradient_result.elastic_net_selection.lambda_max,
+            elastic_net_lambda_ratio: gradient_result.elastic_net_selection.lambda_ratio,
+            elastic_net_cv_folds: gradient_result.elastic_net_selection.cv_folds,
+            elastic_net_cv_rule: gradient_result.elastic_net_selection.cv_rule.clone(),
+            elastic_net_cv_mean_loss: gradient_result.elastic_net_selection.cv_mean_loss,
+            elastic_net_nonzero_coefficients: gradient_result
+                .elastic_net_selection
+                .nonzero_coefficients,
+            elastic_net_target_standardized: gradient_result
+                .elastic_net_selection
+                .target_standardized,
             elastic_net_alpha,
             elastic_net_max_iter,
             elastic_net_tol,
@@ -1354,12 +2000,14 @@ pub fn build_db_time_gradient_section(
     section.cross_model_classifications = cross_model_classify(&section, 50);
 
     // VIF diagnostics
-    section.vif_diagnostics = gradient_result.vif_by_event.iter()
-        .filter(|(_, &vif)| vif > 5.0)  // Only report VIF > 5 (moderate+)
+    section.vif_diagnostics = gradient_result
+        .vif_by_event
+        .iter()
+        .filter(|(_, &vif)| vif > 100.0) // Only report VIF > 100 (high+)
         .map(|(name, &vif)| {
-            let interpretation = if vif > 100.0 {
+            let interpretation = if vif > 1000.0 {
                 "SEVERE_COLLINEARITY".to_string()
-            } else if vif > 10.0 {
+            } else if vif > 100.0 {
                 "HIGH_COLLINEARITY".to_string()
             } else {
                 "MODERATE_COLLINEARITY".to_string()
@@ -1371,28 +2019,58 @@ pub fn build_db_time_gradient_section(
             }
         })
         .collect();
-    section.vif_diagnostics.sort_by(|a, b| b.vif.partial_cmp(&a.vif).unwrap());
+    section
+        .vif_diagnostics
+        .sort_by(|a, b| b.vif.partial_cmp(&a.vif).unwrap());
+    section.vif_diagnostics = section
+        .vif_diagnostics
+        .iter()
+        .take(top_n)
+        .cloned()
+        .collect();
 
     // Collinear group impacts
-    section.collinear_group_impacts = gradient_result.collinear_groups.iter()
-        .map(|(names, impact, coef)| {
-            CollinearGroupImpact {
-                group_members: names.clone(),
-                combined_impact: *impact,
-                combined_coef: *coef,
-            }
+    section.collinear_group_impacts = gradient_result
+        .collinear_groups
+        .iter()
+        .map(|(names, impact, coef)| CollinearGroupImpact {
+            group_members: names.clone(),
+            combined_impact: *impact,
+            combined_coef: *coef,
         })
         .collect();
+
+    debug_note!(
+        "Gradient section ready: label='{}', cross_model={}, vif={}, collinear_groups={}",
+        units_desc,
+        section.cross_model_classifications.len(),
+        section.vif_diagnostics.len(),
+        section.collinear_group_impacts.len()
+    );
 
     Ok(section)
 }
 
 /* =========================================================================================
-   Print functions
-   ========================================================================================= */
+Print functions
+========================================================================================= */
 
-pub fn print_db_time_gradient_tables(section: &DbTimeGradientSection, print_settings: bool, logfile_name: &str, args: &Args) -> String {
-    make_notes!(logfile_name, args.quiet, 0, "\n{} \n\t- {}", "==== DB TIME GRADIENT (Ridge / Elastic Net / Huber / Quantile95) ====".bold().bright_cyan(), section.settings.input_wait_event_unit);
+pub fn print_db_time_gradient_tables(
+    section: &DbTimeGradientSection,
+    print_settings: bool,
+    logfile_name: &str,
+    args: &Args,
+) -> String {
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "\n{} \n\t- {}",
+        "==== DB TIME GRADIENT (Ridge / Elastic Net / Huber / Quantile95) ===="
+            .bold()
+            .bright_cyan(),
+        section.settings.input_wait_event_unit
+    );
 
     if print_settings {
         let mut settings_table = Table::new();
@@ -1400,14 +2078,82 @@ pub fn print_db_time_gradient_tables(section: &DbTimeGradientSection, print_sett
             Cell::new("Setting").with_style(Attr::Bold),
             Cell::new("Value").with_style(Attr::Bold),
         ]));
-        settings_table.add_row(Row::new(vec![Cell::new("ridge_lambda"), Cell::new(&format!("{:.6}", section.settings.ridge_lambda))]));
-        settings_table.add_row(Row::new(vec![Cell::new("elastic_net_lambda"), Cell::new(&format!("{:.6}", section.settings.elastic_net_lambda))]));
-        settings_table.add_row(Row::new(vec![Cell::new("elastic_net_alpha"), Cell::new(&format!("{:.6}", section.settings.elastic_net_alpha))]));
-        settings_table.add_row(Row::new(vec![Cell::new("elastic_net_max_iter"), Cell::new(&format!("{}", section.settings.elastic_net_max_iter))]));
-        settings_table.add_row(Row::new(vec![Cell::new("elastic_net_tol"), Cell::new(&format!("{:.6e}", section.settings.elastic_net_tol))]));
-        settings_table.add_row(Row::new(vec![Cell::new("input_event_unit"), Cell::new(&section.settings.input_wait_event_unit)]));
-        settings_table.add_row(Row::new(vec![Cell::new("input_db_time_unit"), Cell::new(&section.settings.input_db_time_unit)]));
-        make_notes!(logfile_name, args.quiet, 0, "{}", "\n-- Settings --".bold().bright_white());
+        settings_table.add_row(Row::new(vec![
+            Cell::new("ridge_lambda"),
+            Cell::new(&format!("{:.6}", section.settings.ridge_lambda)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_lambda"),
+            Cell::new(&format!("{:.6}", section.settings.elastic_net_lambda)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_lambda_mode"),
+            Cell::new(&section.settings.elastic_net_lambda_mode),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_lambda_max"),
+            Cell::new(&format!("{:.6}", section.settings.elastic_net_lambda_max)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_lambda_ratio"),
+            Cell::new(&format!("{:.6}", section.settings.elastic_net_lambda_ratio)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_cv_rule"),
+            Cell::new(&section.settings.elastic_net_cv_rule),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_cv_folds"),
+            Cell::new(&format!("{}", section.settings.elastic_net_cv_folds)),
+        ]));
+        if let Some(mean_loss) = section.settings.elastic_net_cv_mean_loss {
+            settings_table.add_row(Row::new(vec![
+                Cell::new("elastic_net_cv_mean_loss"),
+                Cell::new(&format!("{mean_loss:.6}")),
+            ]));
+        }
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_nonzero_coefficients"),
+            Cell::new(&format!(
+                "{}",
+                section.settings.elastic_net_nonzero_coefficients
+            )),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_target_standardized"),
+            Cell::new(if section.settings.elastic_net_target_standardized {
+                "true"
+            } else {
+                "false"
+            }),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_alpha"),
+            Cell::new(&format!("{:.6}", section.settings.elastic_net_alpha)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_max_iter"),
+            Cell::new(&format!("{}", section.settings.elastic_net_max_iter)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("elastic_net_tol"),
+            Cell::new(&format!("{:.6e}", section.settings.elastic_net_tol)),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("input_event_unit"),
+            Cell::new(&section.settings.input_wait_event_unit),
+        ]));
+        settings_table.add_row(Row::new(vec![
+            Cell::new("input_db_time_unit"),
+            Cell::new(&section.settings.input_db_time_unit),
+        ]));
+        make_notes!(
+            logfile_name,
+            args.quiet,
+            0,
+            "{}",
+            "\n-- Settings --".bold().bright_white()
+        );
         for table_line in settings_table.to_string().lines() {
             make_notes!(logfile_name, args.quiet, 0, "{}\n", table_line);
         }
@@ -1415,28 +2161,64 @@ pub fn print_db_time_gradient_tables(section: &DbTimeGradientSection, print_sett
 
     let mut gradient_html = r#"<div class="tables-grid">"#.to_string();
     // Ridge
-    make_notes!(logfile_name, args.quiet, 0, "{}", "\n-- Ridge TOP --\n".bold().bright_white());
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "{}",
+        "\n-- Ridge TOP --\n".bold().bright_white()
+    );
     let r_html = print_top_items_table("Ridge", &section.ridge_top, logfile_name, args);
     gradient_html += &format!(r#"<div>{}</div>"#, r_html);
 
     // Elastic Net
-    make_notes!(logfile_name, args.quiet, 0, "{}", "\n-- Elastic Net TOP --\n".bold().bright_white());
-    let en_nonzero: Vec<GradientTopItem> = section.elastic_net_top.iter()
-        .cloned().filter(|x| x.gradient_coef != 0.0).collect();
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "{}",
+        "\n-- Elastic Net TOP --\n".bold().bright_white()
+    );
+    let en_nonzero: Vec<GradientTopItem> = section
+        .elastic_net_top
+        .iter()
+        .cloned()
+        .filter(|x| x.gradient_coef != 0.0)
+        .collect();
     if en_nonzero.is_empty() {
-        make_notes!(logfile_name, args.quiet, 0, "{}", "Elastic Net produced no non-zero coefficients.\n".yellow());
+        make_notes!(
+            logfile_name,
+            args.quiet,
+            0,
+            "{}",
+            "Elastic Net produced no non-zero coefficients.\n".yellow()
+        );
     } else {
         let en_html = print_top_items_table("ElasticNet", &en_nonzero, logfile_name, args);
         gradient_html += &format!(r#"<div>{}</div>"#, en_html);
     }
 
     //Huber
-    make_notes!(logfile_name, args.quiet, 0, "{}", "\n-- Huber Robust TOP --\n".bold().bright_white());
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "{}",
+        "\n-- Huber Robust TOP --\n".bold().bright_white()
+    );
     let huber_html = print_top_items_table("Huber", &section.huber_top, logfile_name, args);
     gradient_html += &format!(r#"<div>{}</div>"#, huber_html);
 
     //Quantile 95
-    make_notes!(logfile_name, args.quiet, 0, "{}", "\n-- Quantile 95 TOP (worst 5% of snapshots) --\n".bold().bright_white());
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "{}",
+        "\n-- Quantile 95 TOP (worst 5% of snapshots) --\n"
+            .bold()
+            .bright_white()
+    );
     let q95_html = print_top_items_table("Quantile95", &section.quantile95_top, logfile_name, args);
     gradient_html += &format!(r#"<div>{}</div>"#, q95_html);
 
@@ -1454,8 +2236,15 @@ pub fn print_db_time_gradient_tables(section: &DbTimeGradientSection, print_sett
 
     // VIF diagnostics table
     if !section.vif_diagnostics.is_empty() {
-        make_notes!(logfile_name, args.quiet, 0, "{}",
-            "\n-- VIF Diagnostics (Multicollinearity) --\n".bold().bright_yellow());
+        make_notes!(
+            logfile_name,
+            args.quiet,
+            0,
+            "{}",
+            "\n-- VIF Diagnostics (Multicollinearity) --\n"
+                .bold()
+                .bright_yellow()
+        );
         let mut vif_table = Table::new();
         vif_table.set_titles(Row::new(vec![
             Cell::new("Event/Stat/SQL").with_style(Attr::Bold),
@@ -1482,8 +2271,13 @@ pub fn print_db_time_gradient_tables(section: &DbTimeGradientSection, print_sett
 
     // Collinear group impacts table
     if !section.collinear_group_impacts.is_empty() {
-        make_notes!(logfile_name, args.quiet, 0, "{}",
-            "\n-- Collinear Group Impacts --\n".bold().bright_yellow());
+        make_notes!(
+            logfile_name,
+            args.quiet,
+            0,
+            "{}",
+            "\n-- Collinear Group Impacts --\n".bold().bright_yellow()
+        );
         let mut grp_table = Table::new();
         grp_table.set_titles(Row::new(vec![
             Cell::new("Group Members").with_style(Attr::Bold),
@@ -1531,8 +2325,13 @@ pub fn print_top_items_table(
         table.add_row(Row::new(vec![
             Cell::new(&format!("{}", idx + 1)),
             Cell::new(&item.event_name),
-            Cell::new(&format!("{} {:+.6}",
-                if item.gradient_coef > 0.0 { "↑" } else { "↓" },
+            Cell::new(&format!(
+                "{} {:+.6}",
+                if item.gradient_coef > 0.0 {
+                    "↑"
+                } else {
+                    "↓"
+                },
                 item.gradient_coef
             )),
             Cell::new(&format!("{:.6}", item.impact_active)),
@@ -1541,21 +2340,32 @@ pub fn print_top_items_table(
             Cell::new(&format!("{:.6}", item.impact)),
         ]));
     }
-    make_notes!(logfile_name, args.quiet, 0, "{}",
-        format!("{} table (Top {})\n", title, items.len()).bright_black());
+    make_notes!(
+        logfile_name,
+        args.quiet,
+        0,
+        "{}",
+        format!("{} table (Top {})\n", title, items.len()).bright_black()
+    );
     for table_line in table.to_string().lines() {
         make_notes!(logfile_name, args.quiet, 0, "{}\n", table_line);
     }
     let mut html = table_to_html_string(
         &table,
         title,
-        &["#", "Wait Event/Statistic", "Coef", "Active Impact (P90)",
-          "Peak Impact (P99)", "Share %", "Typical Impact (MAD)"],
+        &[
+            "#",
+            "Wait Event/Statistic",
+            "Coef",
+            "Active Impact (P90)",
+            "Peak Impact (P99)",
+            "Share %",
+            "Typical Impact (MAD)",
+        ],
     );
     html = format!(r#"<div>{html}</div>"#);
     html
 }
-
 
 pub struct GradientSectionSpec<'a> {
     /// Target time series (e.g. DB Time or DB CPU)
@@ -1573,7 +2383,7 @@ pub struct GradientSectionSpec<'a> {
 pub fn run_gradient_section(
     spec: &GradientSectionSpec,
     ridge_lambda: f64,
-    elastic_net_lambda: f64,
+    elastic_net_lambda: Option<f64>,
     elastic_net_alpha: f64,
     elastic_net_max_iter: usize,
     elastic_net_tol: f64,
@@ -1589,23 +2399,42 @@ pub fn run_gradient_section(
         elastic_net_max_iter,
         elastic_net_tol,
         &spec.label,
+        args.top_gradient,
     ) {
         Ok(section) => {
+            debug_note!(
+                "Gradient section succeeded: name='{}', predictors={}, target_samples={}",
+                spec.display_name,
+                spec.features.len(),
+                spec.target.len()
+            );
             make_notes!(
-                logfile_name, false, 1,
+                logfile_name,
+                false,
+                1,
                 "\n\n{}",
                 format!("{} attached to ReportForAI", spec.display_name)
-                    .bold().green()
+                    .bold()
+                    .green()
             );
-            let html = print_db_time_gradient_tables(
-                &section, spec.is_events, logfile_name, args,
-            );
+            let html = print_db_time_gradient_tables(&section, spec.is_events, logfile_name, args);
             (Some(section), html)
         }
         Err(err) => {
+            debug_note!(
+                "Gradient section skipped: name='{}', predictors={}, target_samples={}, reason={}",
+                spec.display_name,
+                spec.features.len(),
+                spec.target.len(),
+                err
+            );
             make_notes!(
-                logfile_name, false, 1,
-                "\n\n{} skipped: {}", spec.display_name, err
+                logfile_name,
+                false,
+                1,
+                "\n\n{} skipped: {}",
+                spec.display_name,
+                err
             );
             (None, String::new())
         }
@@ -1634,6 +2463,7 @@ pub fn build_gradient_html(
     main_heading: &str,
     sections: Vec<GradientHtmlSection>,
 ) -> String {
+    let brand = jasmin_brand_banner_html();
     // Combine all non-empty sections into a single HTML block
     let sections_html: String = sections
         .into_iter()
@@ -1670,14 +2500,14 @@ pub fn build_gradient_html(
             text-align: center;
         }}
         th {{
-            background-color: #632e4f;
+            background-color: #111111;
             color: white;
             cursor: pointer;
             user-select: none;
             position: relative;
         }}
         th:hover {{
-            background-color: #7a3a62;
+            background-color: #c52228;
         }}
         th.sort-asc::after {{
             content: " \25B2";
@@ -1819,10 +2649,7 @@ pub fn build_gradient_html(
 </head>
 <body>
     <div class="content">
-        <p><a href="https://github.com/ora600pl/jas-min" target="_blank">
-            <img src="https://raw.githubusercontent.com/rakustow/jas-min/main/img/jasmin_LOGO_white.png"
-                 width="150" alt="JAS-MIN" onerror="this.style.display='none';"/>
-        </a></p>
+        {brand}
         <p><span style="font-size:20px;font-weight:bold;">{main_heading}</span></p>
 {sections_html}
     </div>
@@ -1830,4 +2657,232 @@ pub fn build_gradient_html(
 </html>
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(left: f64, right: f64) {
+        let tolerance = 1e-8 * left.abs().max(right.abs()).max(1.0);
+        assert!(
+            (left - right).abs() <= tolerance,
+            "expected {left} and {right} to differ by at most {tolerance}"
+        );
+    }
+
+    fn duplicated(values: &[f64]) -> Vec<f64> {
+        values.iter().chain(values.iter()).copied().collect()
+    }
+
+    #[test]
+    fn impact_is_invariant_to_raw_predictor_scale() {
+        let db_time = vec![0.0, 1.0, 3.0, 6.0, 10.0, 15.0, 21.0, 28.0, 36.0, 45.0];
+        let driver = vec![0.0, 1.0, 3.0, 6.0, 10.0, 15.0, 21.0, 28.0, 36.0, 45.0];
+        let noise = vec![0.0, 2.0, 1.0, 3.0, 2.0, 4.0, 3.0, 5.0, 4.0, 6.0];
+        let base_series = EventSeriesMap::from([
+            ("driver".to_string(), driver.clone()),
+            ("noise".to_string(), noise.clone()),
+        ]);
+        let scaled_series = EventSeriesMap::from([
+            (
+                "driver".to_string(),
+                driver.iter().map(|value| value * 1000.0).collect(),
+            ),
+            ("noise".to_string(), noise),
+        ]);
+
+        let base =
+            compute_db_time_gradient(&db_time, &base_series, 0.5, Some(0.1), 0.3, 2000, 1e-9)
+                .unwrap();
+        let scaled =
+            compute_db_time_gradient(&db_time, &scaled_series, 0.5, Some(0.1), 0.3, 2000, 1e-9)
+                .unwrap();
+
+        for (base_ranking, scaled_ranking) in [
+            (&base.ridge_ranking, &scaled.ridge_ranking),
+            (&base.elastic_net_ranking, &scaled.elastic_net_ranking),
+            (&base.huber_ranking, &scaled.huber_ranking),
+            (&base.quantile95_ranking, &scaled.quantile95_ranking),
+        ] {
+            let base_driver = base_ranking
+                .iter()
+                .find(|item| item.event_name == "driver")
+                .unwrap();
+            let scaled_driver = scaled_ranking
+                .iter()
+                .find(|item| item.event_name == "driver")
+                .unwrap();
+            assert_close(base_driver.gradient_coef, scaled_driver.gradient_coef);
+            assert_close(base_driver.impact, scaled_driver.impact);
+            assert_close(base_driver.impact_active, scaled_driver.impact_active);
+            assert_close(base_driver.impact_peak, scaled_driver.impact_peak);
+        }
+    }
+
+    #[test]
+    fn regularization_is_invariant_to_duplicate_observations() {
+        let x = EventSeriesMap::from([("driver".to_string(), vec![-1.5, -0.5, 0.5, 1.5])]);
+        let y = vec![-3.0, -1.0, 1.0, 3.0];
+        let duplicated_x =
+            EventSeriesMap::from([("driver".to_string(), duplicated(x.get("driver").unwrap()))]);
+        let duplicated_y = duplicated(&y);
+
+        let ridge = ridge_regression_map(&x, &y, 0.5).unwrap();
+        let ridge_duplicated = ridge_regression_map(&duplicated_x, &duplicated_y, 0.5).unwrap();
+        assert_close(ridge["driver"], ridge_duplicated["driver"]);
+
+        let elastic = elastic_net_coordinate_descent_map(&x, &y, 0.5, 0.3, 2000, 1e-10);
+        let elastic_duplicated =
+            elastic_net_coordinate_descent_map(&duplicated_x, &duplicated_y, 0.5, 0.3, 2000, 1e-10);
+        assert_close(elastic["driver"], elastic_duplicated["driver"]);
+
+        let huber = huber_regression_map(&x, &y, 1.0, 100, 1e-10, 0.5);
+        let huber_duplicated =
+            huber_regression_map(&duplicated_x, &duplicated_y, 1.0, 100, 1e-10, 0.5);
+        assert_close(huber["driver"], huber_duplicated["driver"]);
+
+        let quantile = quantile_regression_irls_map(&x, &y, 0.95, 200, 1e-10, 0.5);
+        let quantile_duplicated =
+            quantile_regression_irls_map(&duplicated_x, &duplicated_y, 0.95, 200, 1e-10, 0.5);
+        assert_close(quantile["driver"], quantile_duplicated["driver"]);
+    }
+
+    fn cumulative_series(deltas: &[f64]) -> Vec<f64> {
+        let mut total = 0.0;
+        let mut values = Vec::with_capacity(deltas.len() + 1);
+        values.push(total);
+        for delta in deltas {
+            total += delta;
+            values.push(total);
+        }
+        values
+    }
+
+    fn automatic_selection_fixture() -> (Vec<f64>, EventSeriesMap) {
+        let driver_deltas: Vec<f64> = (0..90)
+            .map(|index| ((index * 7 % 19) as f64 - 9.0) / 3.0)
+            .collect();
+        let noise_deltas: Vec<f64> = (0..90)
+            .map(|index| ((index * 11 % 23) as f64 - 11.0) / 5.0)
+            .collect();
+        let target_deltas: Vec<f64> = driver_deltas
+            .iter()
+            .zip(&noise_deltas)
+            .map(|(driver, noise)| 4.0 * driver + 0.05 * noise)
+            .collect();
+        (
+            cumulative_series(&target_deltas),
+            EventSeriesMap::from([
+                ("driver".to_string(), cumulative_series(&driver_deltas)),
+                ("noise".to_string(), cumulative_series(&noise_deltas)),
+            ]),
+        )
+    }
+
+    #[test]
+    fn automatic_elastic_net_lambda_uses_forward_chaining_and_keeps_signal() {
+        let (target, events) = automatic_selection_fixture();
+        let result =
+            compute_db_time_gradient(&target, &events, 0.05, None, 0.2, 2000, 1e-9).unwrap();
+
+        assert_eq!(result.elastic_net_selection.lambda_mode, "auto");
+        assert_eq!(result.elastic_net_selection.cv_folds, 5);
+        assert_eq!(
+            result.elastic_net_selection.cv_rule,
+            "one_standard_error_forward_chaining"
+        );
+        assert!(result.elastic_net_selection.selected_lambda > 0.0);
+        assert!(
+            result.elastic_net_selection.selected_lambda <= result.elastic_net_selection.lambda_max
+        );
+        assert!(result.elastic_net_selection.nonzero_coefficients > 0);
+        assert!(result.elastic_net_gradient_by_event["driver"].abs() > 1.0);
+        assert!(
+            result.elastic_net_gradient_by_event["driver"].abs()
+                > result.elastic_net_gradient_by_event["noise"].abs()
+        );
+    }
+
+    #[test]
+    fn elastic_net_target_standardization_preserves_output_units() {
+        let (target, events) = automatic_selection_fixture();
+        let scaled_target: Vec<f64> = target.iter().map(|value| value * 100.0).collect();
+        let base = compute_db_time_gradient(&target, &events, 0.05, None, 0.2, 2000, 1e-9).unwrap();
+        let scaled =
+            compute_db_time_gradient(&scaled_target, &events, 0.05, None, 0.2, 2000, 1e-9).unwrap();
+
+        assert_close(
+            base.elastic_net_selection.selected_lambda,
+            scaled.elastic_net_selection.selected_lambda,
+        );
+        assert_close(
+            base.elastic_net_selection.lambda_max,
+            scaled.elastic_net_selection.lambda_max,
+        );
+        assert_close(
+            base.elastic_net_gradient_by_event["driver"] * 100.0,
+            scaled.elastic_net_gradient_by_event["driver"],
+        );
+        let base_driver = base
+            .elastic_net_ranking
+            .iter()
+            .find(|item| item.event_name == "driver")
+            .unwrap();
+        let scaled_driver = scaled
+            .elastic_net_ranking
+            .iter()
+            .find(|item| item.event_name == "driver")
+            .unwrap();
+        assert_close(
+            base_driver.impact_active * 100.0,
+            scaled_driver.impact_active,
+        );
+    }
+
+    #[test]
+    fn fixed_elastic_net_lambda_bypasses_automatic_selection() {
+        let (target, events) = automatic_selection_fixture();
+        let result =
+            compute_db_time_gradient(&target, &events, 0.05, Some(0.125), 0.2, 2000, 1e-9).unwrap();
+
+        assert_eq!(result.elastic_net_selection.lambda_mode, "fixed");
+        assert_eq!(result.elastic_net_selection.selected_lambda, 0.125);
+        assert_eq!(result.elastic_net_selection.cv_folds, 0);
+        assert_eq!(result.elastic_net_selection.cv_rule, "fixed_override");
+        assert_eq!(result.elastic_net_selection.cv_mean_loss, None);
+    }
+
+    #[test]
+    fn automatic_lambda_rejects_pure_l2_but_fixed_lambda_allows_it() {
+        let (target, events) = automatic_selection_fixture();
+        let error =
+            compute_db_time_gradient(&target, &events, 0.05, None, 0.0, 2000, 1e-9).unwrap_err();
+        assert!(error.contains("requires alpha > 0"));
+
+        let fixed =
+            compute_db_time_gradient(&target, &events, 0.05, Some(0.05), 0.0, 2000, 1e-9).unwrap();
+        assert_eq!(fixed.elastic_net_selection.lambda_mode, "fixed");
+    }
+
+    #[test]
+    fn short_series_uses_documented_lambda_ratio_fallback() {
+        let target = cumulative_series(&[1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+        let events = EventSeriesMap::from([(
+            "driver".to_string(),
+            cumulative_series(&[0.5, -0.5, 1.0, -1.0, 1.5, -1.5]),
+        )]);
+        let result =
+            compute_db_time_gradient(&target, &events, 0.05, None, 0.2, 2000, 1e-9).unwrap();
+
+        assert_eq!(result.elastic_net_selection.cv_folds, 0);
+        assert_eq!(
+            result.elastic_net_selection.cv_rule,
+            "lambda_ratio_fallback_insufficient_samples"
+        );
+        assert_close(
+            result.elastic_net_selection.lambda_ratio,
+            ELASTIC_NET_FALLBACK_LAMBDA_RATIO,
+        );
+    }
 }
