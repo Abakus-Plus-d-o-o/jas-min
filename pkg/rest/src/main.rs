@@ -18,7 +18,6 @@ struct RunParams {
     directory: Option<String>,
     plot: Option<String>, // 1 or 0
     time_cpu_ratio: Option<String>,
-    mad_threshold: Option<String>,
     mad_window_size: Option<String>,
     security_level: Option<String>,
     parallel: Option<String>,
@@ -81,7 +80,6 @@ async fn run(data: web::Data<Arc<AppState>>, query: web::Query<RunParams>) -> im
     if let Some(ref v) = query.directory { cmd.arg("--directory").arg(v); }
     if let Some(ref v) = query.plot { cmd.arg("--plot").arg(v); }
     if let Some(ref v) = query.time_cpu_ratio { cmd.arg("--time-cpu-ratio").arg(v); }
-    if let Some(ref v) = query.mad_threshold { cmd.arg("--mad-threshold").arg(v); }
     if let Some(ref v) = query.mad_window_size { cmd.arg("--mad-window-size").arg(v); }
     if let Some(ref v) = query.parallel { cmd.arg("--parallel").arg(v); }
     if let Some(ref v) = query.security_level { cmd.arg("--security-level").arg(v); }
