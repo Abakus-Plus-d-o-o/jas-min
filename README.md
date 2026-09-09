@@ -35,6 +35,7 @@ The tool can also send a compact `ReportForAI` representation to supported AI pr
 | Gradient analysis | Runs Ridge, Elastic Net, Huber, and Quantile-95 regression models over DB Time and DB CPU drivers. |
 | Custom gradient | Builds extra gradient pages for a selected SQL ID or wait event with `--gradient-custom`. |
 | AI reports | Supports OpenAI, Google Gemini, OpenRouter, and a two-session local agent served by LM Studio. |
+| Analytical report atlas | Linked active/peak bubble plots, four-model selection matrices, per-instance synthesis and scoped anomaly windows in MCP/API reports. See [the report atlas guide](docs/report-signal-atlas.md). |
 | AI tools mode | Enables function/tool-call loops for cloud providers with `--tools-mode`; local analysis always uses tools. |
 | MCP server | Retains a parsed collection in memory and exposes interactive evidence, diagnostic guidance, and stable report-building tools through local Streamable HTTP. |
 | Security | Controls whether object names and SQL text are stored with `--security-level`. |
@@ -843,3 +844,26 @@ See [LICENSE](LICENSE).
 <p align="center">
   <em>If you need expert Oracle performance tuning, reach out to <a href="https://www.ora-600.pl/en/">ora-600.pl</a></em>
 </p>
+
+### Reading AI reports during an incident
+
+AI reports now use an action-ranked summary, clearly separated finding headings,
+visible decision boundaries and expandable technical evidence. The full tables
+and provenance remain available, with expand/collapse controls and links that
+reveal their target. Identical actions are consolidated; verified methodology
+quotations appear once. The eleven-section evidence contract remains intact.
+
+MCP and classic API providers share the [report writing contract](src/report_writing.md).
+MCP additionally returns non-blocking editorial feedback in
+`get_report_status.readability_review`. See [report presentation and replay](docs/mcp-server.md#findings)
+for details. Rebuild the binary and restart the MCP process to use changed server
+instructions; existing HTML files require regeneration.
+
+
+AI reports now support explicit **issues** that join distinct findings under one
+short decision summary. New MCP sessions use `record_issue` after recording
+findings, and every recommendation identifies evidence capture, mitigation or
+a durable fix. Updating a member finding requires reviewing its issue summary
+again. Classic APIs and the local reviewer use the same validated decision
+metadata and renderer. See [issue authoring and migration](docs/report-issues.md)
+for required fields, legacy compatibility and export validation.

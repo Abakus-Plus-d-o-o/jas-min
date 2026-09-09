@@ -484,6 +484,12 @@ plans in large attachments.
 
 ### MCP workflow tools
 
+Schema `2026-09-09.1` renders a [source-backed analytical atlas](report-signal-atlas.md)
+in section 9. Record the structured cross-signal synthesis before its concise
+finding; validated numeric tables satisfy the exact-signal requirement without
+requiring duplicate numbers in the narrative. JSON export includes the derived
+`signal_atlas`. The full evidence and readiness contract remain in force.
+
 | Tool | State effect |
 |---|---|
 | `list_performance_projects` | Lists immutable project manifests without creating an analysis. |
@@ -496,6 +502,8 @@ plans in large attachments.
 | `compare_project_sql` | Registers a same-SQL cross-project comparison as evidence. |
 | `configure_report` | Updates report presentation settings. |
 | `record_finding` | Creates or replaces an evidence-backed finding. |
+| `record_issue` | Atomically groups existing findings into one reviewed decision brief. |
+| `delete_issue` | Removes a grouping while retaining every finding and evidence record. |
 | `record_report_table` | Creates or replaces a provenance-validated structured analysis table. |
 | `set_report_assessment` | Stores one mandatory final assessment. |
 | `get_report_status` | Validates report coverage without rendering it. |
@@ -508,7 +516,7 @@ Every successful measurement tool call is wrapped in an evidence envelope:
 
 ```json
 {
-  "schema_version": "2026-08-23.4",
+  "schema_version": "2026-09-09.1",
   "analysis_id": "A-20260804T100000Z-0001",
   "project_id": "before-upgrade",
   "evidence_id": "E-0002",
@@ -803,6 +811,18 @@ variants remain in a compact coverage disclosure. SQL IDs and wait events link
 directly to each project-specific JAS-MIN detail page, and HTML export rejects
 missing local link targets.
 
+### Explicit issues and findings
+
+New sessions default to explicit issue grouping. Record findings first, then
+use `record_issue` to supply a concise decision brief, scope, grouping rationale,
+canonical finding and member finding IDs. `delete_issue` removes only the grouping.
+Every recommendation has kind `evidence_capture`, `mitigation` or `durable_fix`.
+The completion checklist also requires no missing issue assignments,
+unclassified actions or stale issue summaries after a finding update.
+
+See [the issue contract and migration guide](report-issues.md) for MCP and API
+schemas, atomic validation, legacy compatibility and reproducible replay.
+
 ### Findings
 
 `record_finding` requires:
@@ -861,23 +881,72 @@ server creates a new identifier instead of overwriting arbitrary state.
 Recommendations are structured as an owner (`DBA`, `Developer`, or
 `Management`), a priority (`immediate`, `high`, `medium`, or `low`), an action,
 the evidence-backed `rationale` for that action and priority, and a measurable
-`success_criterion` including a regression guard. The renderer groups actions
-by accountable owner rather than emitting one flat list.
+`success_criterion` including a regression guard. The renderer orders actions by priority, labels the accountable owner, and
+consolidates exact duplicates while retaining links to every supporting finding.
 
 Accepted finding categories are `performance_profile`, `wait_events`, `sql`,
 `segments`, `latches`, `io`, `undo_redo`, `gradients_anomalies`, `parameters`,
 and `limitations`. The structured JSON retains all categories. The numbered
 Markdown body maps the first nine analytical categories to sections 2 through
-10; a high-severity `limitations` finding can appear in the executive summary
-but currently has no dedicated numbered section.
+10; `limitations` findings have canonical anchors in an expandable coverage
+block, so action and summary links can reach them.
 
-The deterministic Markdown renderer leads every section with diagnostic
-findings and follows them with the exhaustive structured evidence tables. The
-executive summary repeats the mechanism, affected workload, temporal pattern,
-and evidence boundary for the five leading findings; a one-sentence register
-alone is not considered a sufficient summary. `compact` omits a finding's
-`details` field, `standard` keeps it in a disclosure below the diagnostic
-synthesis, and `deep` renders it inline.
+The deterministic Markdown renderer uses three reading layers:
+
+1. **Decision queue:** at most five explicitly grouped issues, ordered by the
+   earliest action priority and then issue ID. Each has a short decision summary,
+   next action/owner/kind, scope, decision boundary and canonical finding link.
+   The prior finding-based queue remains available in legacy mode.
+2. **Finding:** conclusion, decisive measurements, workload/time scope, next
+   action and decision-changing limitations stay visible. Mechanism, source
+   links, provenance and extended narrative are in a disclosure.
+3. **Technical evidence:** all required tables remain in expandable blocks.
+   Verbatim guidance quotations are deduplicated by reference and exact text,
+   printed once in the methodology appendix and linked where applied. Applied
+   quotations remain available even if the optional consulted-guidance catalog
+   is disabled.
+
+`compact` omits the free-form `details` field, `standard` retains it in a nested
+context disclosure, and `deep` retains the entire field within supporting
+evidence. All three initially collapse technical evidence; depth controls
+content, not urgency. The eleven sections and all completeness gates remain.
+
+The shared [writing contract](../src/report_writing.md) also reaches classic
+OpenAI, Google and OpenRouter instructions (with and without tools), the local
+reviewer's final report, MCP initialization, the analysis prompt and the report
+contract. It asks for concise titles, one canonical issue per mechanism/workload,
+clear observation versus hypothesis, concise decisive measurements and measured
+acceptance criteria. Existing findings are not automatically rewritten or
+semantically merged. Explicit references and action kinds are validated before
+publication in MCP and new API output; synthesis quality remains model-dependent.
+
+`get_report_status.readability_review` gives non-blocking editorial feedback
+for titles over 12 words and decision fields over 180 words. These warnings
+request revision without changing `ready_to_finalize`, deleting facts or
+weakening evidence requirements. Investigations remain complete even when a
+complex finding legitimately needs more words.
+
+The shared HTML renderer removes blanket highlighting of bold-led paragraphs,
+upgrades the legacy numbered summary format into headings, preserves explicit
+Markdown heading IDs, starts the TOC with sections, provides expand/collapse
+controls, opens enclosing disclosures for fragment links and expands evidence
+for printing (restoring the reader's state afterward). It requires no external
+assets or network access. Keyboard-accessible native disclosures also work
+without JavaScript.
+
+An optional archived-data replay test reads customer fixtures outside the repo:
+
+```bash
+JASMIN_REPORT_FIXTURE=/path/to/archived-evidence \
+JASMIN_REPORT_PREVIEW=/path/to/new-preview.html \
+  cargo test replay_archived_report -- --ignored --nocapture
+```
+
+The fixture contains `finalized-report.json`, `finalized.md`,
+`evidence-full.json` and `guidance.json`; source report directories must resolve
+beside the preview. The replay preserves the archived provenance verbatim,
+checks local links/fragments and creates new files only. It is a rendering
+regression, not a new model investigation or proof of live provider behavior.
 
 ### Mandatory assessments
 

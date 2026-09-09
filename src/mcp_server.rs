@@ -10,6 +10,7 @@ use crate::awr::AWRSCollection;
 use crate::debug_note;
 use crate::local_agent::{build_case_seed, dispatch_precomputed_analysis, GuidanceLibrary};
 use crate::reasonings::{CrossModelClassification, DbTimeGradientSection, ReportForAI};
+use crate::report_issues::{self, ActionKind, IssueAction, ReportIssue};
 use crate::tools::{get_safe_filename, render_markdown_html_document};
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
@@ -46,7 +47,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-const MCP_ANALYSIS_SCHEMA_VERSION: &str = "2026-08-23.4";
+const MCP_ANALYSIS_SCHEMA_VERSION: &str = "2026-09-09.1";
 const SEED_EVIDENCE_ID: &str = "SEED-E0001";
 const DEFAULT_GUIDANCE_LIMIT_CHARS: usize = 8 * 1024;
 const MAX_MCP_MARKDOWN_BYTES: usize = 4 * 1024 * 1024;
@@ -378,12 +379,14 @@ struct GuidanceRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct GuidanceQuotation {
     guidance_ref: String,
     quote: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct ReportConfig {
     output_format: String,
     language: String,
@@ -392,6 +395,12 @@ struct ReportConfig {
     detail_overrides: BTreeMap<String, String>,
     include_evidence_appendix: bool,
     include_guidance_appendix: bool,
+    #[serde(default = "legacy_issue_grouping")]
+    issue_grouping: String,
+}
+
+fn legacy_issue_grouping() -> String {
+    "legacy".to_string()
 }
 
 impl Default for ReportConfig {
@@ -406,12 +415,16 @@ impl Default for ReportConfig {
             // Human reports opt in to technical appendices explicitly.
             include_evidence_appendix: false,
             include_guidance_appendix: false,
+            issue_grouping: "explicit".to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct Recommendation {
+    #[serde(default)]
+    kind: ActionKind,
     owner: String,
     priority: String,
     action: String,
@@ -420,6 +433,7 @@ struct Recommendation {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct ReportFinding {
     finding_id: String,
     category: String,
@@ -440,6 +454,7 @@ struct ReportFinding {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct ReportAssessment {
     assessment: String,
     status: String,
@@ -451,12 +466,14 @@ struct ReportAssessment {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct ReportTableRow {
     cells: BTreeMap<String, String>,
     evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct ReportTable {
     table_id: String,
     kind: String,
@@ -506,7 +523,7 @@ const ANOMALY_CLUSTER_TABLE_COLUMNS: &[(&str, &str)] = &[
 const ANALYTIC_SYNTHESIS_TABLE_COLUMNS: &[(&str, &str)] = &[
     ("project_id", "Project"),
     ("entity", "Analytical focus"),
-    ("signal_families", "Independent signal families"),
+    ("signal_families", "Signal families compared"),
     ("target_metrics", "Target metrics"),
     ("dominant_gradient_signals", "Dominant gradient signals"),
     ("model_agreement", "Model agreement / classification"),
@@ -646,6 +663,8 @@ struct AnalysisSession {
     evidence_cache: HashMap<String, String>,
     guidance: BTreeMap<String, GuidanceRecord>,
     findings: BTreeMap<String, ReportFinding>,
+    issues: BTreeMap<String, ReportIssue>,
+    issue_finding_snapshots: BTreeMap<String, BTreeMap<String, Value>>,
     assessments: BTreeMap<String, ReportAssessment>,
     report_tables: BTreeMap<String, ReportTable>,
     next_evidence: u64,
@@ -671,6 +690,8 @@ impl AnalysisSession {
             evidence_cache: HashMap::new(),
             guidance: BTreeMap::new(),
             findings: BTreeMap::new(),
+            issues: BTreeMap::new(),
+            issue_finding_snapshots: BTreeMap::new(),
             assessments: BTreeMap::new(),
             report_tables: BTreeMap::new(),
             next_evidence: 2,
@@ -1677,6 +1698,16 @@ impl AnalysisRuntime {
             .lock()
             .map_err(|_| tool_error("SESSION_LOCK", "analysis session lock is poisoned"))?;
 
+        if let Some(mode) = arguments.get("issue_grouping").and_then(Value::as_str) {
+            validate_enum("issue_grouping", mode, &["explicit", "legacy"])?;
+            if mode == "legacy" && !state.issues.is_empty() {
+                return Err(tool_error(
+                    "ISSUES_PRESENT",
+                    "Delete explicit groupings before choosing legacy mode; findings are retained.",
+                ));
+            }
+            state.config.issue_grouping = mode.to_string();
+        }
         if let Some(format) = arguments.get("output_format").and_then(Value::as_str) {
             validate_enum("output_format", format, &["markdown", "json", "both"])?;
             state.config.output_format = format.to_string();
@@ -1843,6 +1874,59 @@ impl AnalysisRuntime {
             "findings_total": state.findings.len(),
             "message": "Evidence-backed finding stored. Reuse finding_id to replace it after deeper investigation."
         }))
+    }
+
+    fn record_issue(&self, arguments: &Map<String, Value>) -> std::result::Result<Value, Value> {
+        let analysis_id = Self::analysis_id(arguments)?.to_string();
+        let session = self.session(&analysis_id)?;
+        let mut fields = arguments.clone();
+        fields.remove("analysis_id");
+        let issue: ReportIssue = serde_json::from_value(Value::Object(fields))
+            .map_err(|error| tool_error("INVALID_ISSUE", error.to_string()))?;
+        let mut state = session
+            .lock()
+            .map_err(|_| tool_error("SESSION_LOCK", "analysis session lock is poisoned"))?;
+        let mut candidate = state.issues.clone();
+        candidate.insert(issue.issue_id.clone(), issue.clone());
+        let known = state
+            .findings
+            .keys()
+            .map(|id| report_issues::finding_anchor(id))
+            .collect();
+        report_issues::validate_issues(&candidate.values().cloned().collect::<Vec<_>>(), &known)
+            .map_err(|error| tool_error("INVALID_ISSUE_REFERENCES", error))?;
+        let snapshot = issue_finding_snapshot(&state, &issue);
+        state
+            .issue_finding_snapshots
+            .insert(issue.issue_id.clone(), snapshot);
+        state.issues = candidate;
+        state.config.issue_grouping = "explicit".into();
+        state.finalized_markdown = None;
+        Ok(
+            json!({"schema_version": MCP_ANALYSIS_SCHEMA_VERSION, "analysis_id": analysis_id,
+            "issue_id": issue.issue_id, "issues_total": state.issues.len(),
+            "message": "Explicit issue stored. Findings, evidence and per-instance boundaries remain separate. Check get_report_status before finalization."}),
+        )
+    }
+
+    fn delete_issue(&self, arguments: &Map<String, Value>) -> std::result::Result<Value, Value> {
+        let analysis_id = Self::analysis_id(arguments)?.to_string();
+        let session = self.session(&analysis_id)?;
+        let id = required_string(arguments, "issue_id", 64)?;
+        let mut state = session
+            .lock()
+            .map_err(|_| tool_error("SESSION_LOCK", "analysis session lock is poisoned"))?;
+        if state.issues.remove(&id).is_none() {
+            return Err(tool_error(
+                "UNKNOWN_ISSUE",
+                format!("Unknown issue_id: {id}"),
+            ));
+        }
+        state.issue_finding_snapshots.remove(&id);
+        state.finalized_markdown = None;
+        Ok(
+            json!({"analysis_id": analysis_id,"deleted_issue_id": id,"message":"Grouping removed; findings and evidence retained. Reassign the findings before finalizing explicit mode."}),
+        )
     }
 
     fn record_report_table(
@@ -2025,7 +2109,7 @@ impl AnalysisRuntime {
             .filter_map(|project_id| self.projects.get(project_id))
             .map(|project| project.dataset_manifest())
             .collect::<Vec<_>>();
-        let report_document = json!({
+        let mut report_document = json!({
             "schema_version": MCP_ANALYSIS_SCHEMA_VERSION,
             "analysis_id": analysis_id,
             "revision": state.report_revision,
@@ -2035,12 +2119,22 @@ impl AnalysisRuntime {
             "datasets": datasets,
             "config": state.config,
             "section_index": report_section_index(&state),
-            "findings": state.findings.values().collect::<Vec<_>>(),
+            "issues": state.issues.values().collect::<Vec<_>>(),
+            "findings": state.findings.values().map(|finding| {
+                let mut value = serde_json::to_value(finding).expect("report finding is serializable");
+                value["issue_id"] = json!(issue_for_finding(&state, &finding.finding_id).map(|issue| &issue.issue_id));
+                value
+            }).collect::<Vec<_>>(),
             "structured_tables": state.report_tables.values().collect::<Vec<_>>(),
             "mandatory_assessments": state.assessments,
             "coverage": status
         });
         let entity_links = ReportEntityLinks::build(&state.project_ids, &self.projects);
+        report_document["signal_atlas"] = json!(report_signal_adapter::build_signal_atlas(
+            &report_document,
+            &state,
+            &entity_links
+        ));
         let markdown = render_markdown(&report_document, &state, &entity_links);
         state.finalized_markdown = Some(markdown.clone());
         let mut output = json!({
@@ -2180,12 +2274,13 @@ impl AnalysisRuntime {
                 })
             })
             .collect::<Vec<_>>();
-        let html = render_markdown_html_document(
+        let html = crate::tools::try_render_markdown_html_document(
             markdown,
             report_directory_reference,
             &report_directory.to_string_lossy(),
             HashMap::new(),
-        );
+        )
+        .map_err(|error| tool_error("INVALID_ISSUE_MANIFEST", error))?;
         validate_resolved_html_navigation(&html)?;
         let validated_local_links = validate_local_html_targets(&html, output_directory)?;
 
@@ -2274,6 +2369,8 @@ impl AnalysisRuntime {
             "get_diagnostic_guidance" => self.diagnostic_guidance(&arguments),
             "configure_report" => self.configure_report(&arguments),
             "record_finding" => self.record_finding(&arguments),
+            "record_issue" => self.record_issue(&arguments),
+            "delete_issue" => self.delete_issue(&arguments),
             "record_report_table" => self.record_report_table(&arguments),
             "set_report_assessment" => self.set_assessment(&arguments),
             "get_report_status" => self.report_status(&arguments),
@@ -2665,8 +2762,9 @@ impl ServerHandler for JasminMcpServer {
                 ),
         )
         .with_instructions(format!(
-            "This server has {} loaded performance project(s). Call list_performance_projects first when more than one project is available, then call start_performance_analysis with the intended project_ids. Pass analysis_id to every later tool and project_id to project-specific evidence calls in comparative sessions. Use compare_project_metric and compare_project_sql for normalized cross-project evidence. Use narrow evidence calls and compare peaks with quiet baselines. Diagnostic guidance is methodology, never observed evidence. On AIX, obtain entitlement evidence before a CPU-pressure conclusion. Distinguish latency from workload volume, correlation from causation, and unknown from absent. Every finding must synthesize the measured symptom into a mechanism, temporal pattern, named affected workload and explicit evidence limitation; a conclusion plus a table dump is incomplete. Store findings with evidence_refs plus a reader-facing evidence_summary containing exact values. Every recommendation must name an owner and priority, explain why it follows from the finding, and define a measurable success criterion. Complete every stable category. Record gradients, anomalies and anomaly clusters as separate table kinds. When multiple analytic families are available, analytic_signal_synthesis and its gradients_anomalies finding must name at least three exact top-five contributors from at least two target families, distinguish typical from peak influence, reproduce at least two concrete model names plus an exact classification, and localize exact anomaly and cluster windows; generic statements that detectors merely converge on activity are rejected. For every foreground wait reaching 10% DB Time, call get_wait_event_sql_contributors and record the wait-to-SQL relationships; follow the strongest material contributor through SQL text, timeline and plan applicability. Correlation or ASH attribution is association evidence, not blocker/waiter proof. Inspect every supplied execution artifact. Review every unique SQL plan hash, but classify PL/SQL entry points as not_applicable_plsql because a top-level row-source plan is not expected; profile their inner SQL instead of requesting DBMS_XPLAN recapture. Choose an explicit recommendation type with artifact-specific rationale and action; generic 'validate actual rows' prose is rejected. Inspect every child-cursor diagnostic. Parse every non-empty alert attachment with include_parse_error_details=true, reproduce every error_summary code, and cite parse-error evidence in an SQL finding. Record every segment hotspot and a cross-statistic segment_synthesis. Review every collected performance parameter value; missing parameters require no row and only concern/critical ratings are reader-facing. get_report_status lists every missing item and blocks finalization until the deterministic lists are empty. In comparative prose, label every project or instance value explicitly; never use an unlabeled X/Y shorthand. Treat a zero-byte attachment as missing coverage. Use each alert attachment's observed first/last timestamp rather than assuming AWR-period coverage. A zero-match literal proves only that exact filter. If guidance is applied, include a verified verbatim quotation. Complete mandatory assessments and finish through finalize_report. For HTML, finalize Markdown first and pass it unchanged to convert_markdown_to_html. Reader-facing material waits and SQL_IDs must link to every existing project-specific detail report with meaningful instance labels.",
-            self.runtime.projects.len()
+            "This server has {} loaded performance project(s). Call list_performance_projects first when more than one project is available, then call start_performance_analysis with the intended project_ids. Pass analysis_id to every later tool and project_id to project-specific evidence calls in comparative sessions. Use compare_project_metric and compare_project_sql for normalized cross-project evidence. Use narrow evidence calls and compare peaks with quiet baselines. Diagnostic guidance is methodology, never observed evidence. On AIX, obtain entitlement evidence before a CPU-pressure conclusion. Distinguish latency from workload volume, correlation from causation, and unknown from absent. Every finding must synthesize the measured symptom into a mechanism, temporal pattern, named affected workload and explicit evidence limitation; a conclusion plus a table dump is incomplete. Store findings with evidence_refs plus a reader-facing evidence_summary containing exact values. Every recommendation must name an owner and priority, explain why it follows from the finding, and define a measurable success criterion. Complete every stable category. Record gradients, anomalies and anomaly clusters as separate table kinds. When multiple analytic families are available, record analytic_signal_synthesis before the gradients_anomalies finding. The structured synthesis must name at least three exact top-five contributors from at least two target families, distinguish active from peak influence, reproduce concrete model names and classification, and localize anomaly and cluster windows. The finding can then state the decision and its boundary briefly without repeating the numeric fields. Generic statements that detectors merely converge on activity are rejected. For every foreground wait reaching 10% DB Time, call get_wait_event_sql_contributors and record the wait-to-SQL relationships; follow the strongest material contributor through SQL text, timeline and plan applicability. Correlation or ASH attribution is association evidence, not blocker/waiter proof. Inspect every supplied execution artifact. Review every unique SQL plan hash, but classify PL/SQL entry points as not_applicable_plsql because a top-level row-source plan is not expected; profile their inner SQL instead of requesting DBMS_XPLAN recapture. Choose an explicit recommendation type with artifact-specific rationale and action; generic 'validate actual rows' prose is rejected. Inspect every child-cursor diagnostic. Parse every non-empty alert attachment with include_parse_error_details=true, reproduce every error_summary code, and cite parse-error evidence in an SQL finding. Record every segment hotspot and a cross-statistic segment_synthesis. Review every collected performance parameter value; missing parameters require no row and only concern/critical ratings are reader-facing. get_report_status lists every missing item and blocks finalization until the deterministic lists are empty. In comparative prose, label every project or instance value explicitly; never use an unlabeled X/Y shorthand. Treat a zero-byte attachment as missing coverage. Use each alert attachment's observed first/last timestamp rather than assuming AWR-period coverage. A zero-match literal proves only that exact filter. If guidance is applied, include a verified verbatim quotation. Complete mandatory assessments and finish through finalize_report. For HTML, finalize Markdown first and pass it unchanged to convert_markdown_to_html. Reader-facing material waits and SQL_IDs must link to every existing project-specific detail report with meaningful instance labels.\n\n{}",
+            self.runtime.projects.len(),
+            include_str!("report_writing.md")
         ))
     }
 
@@ -2761,7 +2859,8 @@ impl ServerHandler for JasminMcpServer {
             Ok(GetPromptResult::new(vec![PromptMessage::new_text(
                 Role::User,
                 format!(
-                    "Investigate {focus} using the JAS-MIN MCP server. Begin with list_performance_projects when multiple projects may be loaded, then call start_performance_analysis with the intended project_ids and use its analysis_id for all evidence calls. In comparative sessions pass project_id to project-specific tools and use compare_project_metric or compare_project_sql for cross-project evidence. Form competing hypotheses and falsify them with timelines, snapshots, SQL text, plans, child-cursor reasons, alert log and AIX evidence when available. For gradient/anomaly synthesis, name the dominant exact contributors across target families, distinguish typical from peak influence, state which Ridge, Elastic Net, Huber or Quantile-95 models agree, reproduce the server classification, and anchor the conclusion to exact anomaly and cluster windows; a generic statement that independent detectors converge on activity is not analysis. Fetch reasonings.txt guidance only for concrete symptoms and never cite it as measurement evidence. Store evidence-backed findings with exact reader-facing evidence summaries instead of exposing raw evidence IDs as prose. Every applied guidance reference requires a verbatim quote from the retrieved section. Complete every mandatory assessment, validate report status and finalize the stable report. Write finding content in {language}. If the user requests HTML, finalize Markdown output first and pass the returned Markdown unchanged to convert_markdown_to_html; ensure comparative output links every source project report."
+                    "Investigate {focus} using the JAS-MIN MCP server. Begin with list_performance_projects when multiple projects may be loaded, then call start_performance_analysis with the intended project_ids and use its analysis_id for all evidence calls. In comparative sessions pass project_id to project-specific tools and use compare_project_metric or compare_project_sql for cross-project evidence. Form competing hypotheses and falsify them with timelines, snapshots, SQL text, plans, child-cursor reasons, alert log and AIX evidence when available. For gradient/anomaly synthesis, name the dominant exact contributors across target families, distinguish typical from peak influence, state which Ridge, Elastic Net, Huber or Quantile-95 models agree, reproduce the server classification, and anchor the conclusion to exact anomaly and cluster windows; a generic statement that independent detectors converge on activity is not analysis. Fetch reasonings.txt guidance only for concrete symptoms and never cite it as measurement evidence. Store evidence-backed findings with exact reader-facing evidence summaries instead of exposing raw evidence IDs as prose. Every applied guidance reference requires a verbatim quote from the retrieved section. Complete every mandatory assessment, validate report status and finalize the stable report. Write finding content in {language}. If the user requests HTML, finalize Markdown output first and pass the returned Markdown unchanged to convert_markdown_to_html; ensure comparative output links every source project report.\n\n{}",
+                    include_str!("report_writing.md")
                 ),
             )])
             .with_description("Tool-first Oracle performance investigation workflow")
@@ -3075,7 +3174,8 @@ fn mcp_control_definitions() -> Vec<Value> {
                     "detail_level": {"type": "string", "enum": ["compact", "standard", "deep"]},
                     "detail_overrides": {"type": "object", "additionalProperties": {"type": "string", "enum": ["compact", "standard", "deep"]}},
                     "include_evidence_appendix": {"type": "boolean"},
-                    "include_guidance_appendix": {"type": "boolean"}
+                    "include_guidance_appendix": {"type": "boolean"},
+                    "issue_grouping": {"type":"string", "enum":["explicit","legacy"], "default":"explicit"}
                 }
             }),
         ),
@@ -3101,11 +3201,13 @@ fn mcp_control_definitions() -> Vec<Value> {
                     "evidence_refs": {"type": "array", "items": {"type": "string"}},
                     "guidance_refs": {"type": "array", "items": {"type": "string"}},
                     "guidance_quotes": {"type": "array", "items": {"type": "object", "additionalProperties": false, "properties": {"guidance_ref": {"type": "string"}, "quote": {"type": "string", "description": "Contiguous verbatim excerpt from the retrieved guidance section."}}, "required": ["guidance_ref", "quote"]}},
-                    "recommendations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "properties": {"owner": {"type": "string", "enum": ["DBA", "Developer", "Management"]}, "priority": {"type": "string", "enum": ["immediate", "high", "medium", "low"]}, "action": {"type": "string"}, "rationale": {"type": "string", "description": "Why this action follows from the measured finding and why it has this priority."}, "success_criterion": {"type": "string", "description": "A measurable before/after acceptance criterion including the relevant metric and regression guard."}}, "required": ["owner", "priority", "action", "rationale", "success_criterion"]}}
+                    "recommendations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "properties": {"kind":{"type":"string","enum":["evidence_capture","mitigation","durable_fix"],"description":"Required for explicit issue reports. Omitted legacy values remain unclassified, never inferred."}, "owner": {"type": "string", "enum": ["DBA", "Developer", "Management"]}, "priority": {"type": "string", "enum": ["immediate", "high", "medium", "low"]}, "action": {"type": "string"}, "rationale": {"type": "string", "description": "Why this action follows from the measured finding and why it has this priority."}, "success_criterion": {"type": "string", "description": "A measurable before/after acceptance criterion including the relevant metric and regression guard."}}, "required": ["owner", "priority", "action", "rationale", "success_criterion"]}}
                 },
                 "required": ["category", "title", "severity", "confidence", "conclusion", "mechanism", "temporal_pattern", "affected_workload", "evidence_limitations", "evidence_summary", "evidence_refs"]
             }),
         ),
+        function_definition("record_issue", "Creates or replaces an explicit issue linking existing findings. State a short decision_summary, decision_boundary, scope, grouping_rationale and one canonical finding; a shared SQL_ID is not sufficient. This never merges evidence or removes category coverage.", report_issues::issue_schema()),
+        function_definition("delete_issue", "Removes an issue grouping while preserving every finding and evidence record. Explicit mode requires reassignment before finalization.", json!({"type":"object","additionalProperties":false,"properties":{"issue_id":{"type":"string"}},"required":["issue_id"]})),
         function_definition(
             "record_report_table",
             "Creates or replaces one structured analysis block. Runtime validation enforces exact columns, project scope, enumerated values, evidence provenance and entity matching. Gradient, anomaly and cluster signals are separate kinds with a mandatory cross-signal synthesis when multiple families exist. Execution-plan rows require a concrete recommendation or evidence-backed no_change outcome. Alert rows reproduce deterministic error_summary values. Parameter rows cover collected values internally; the renderer exposes only concern/critical ratings.",
@@ -3512,17 +3614,20 @@ fn report_contract(config: &ReportConfig) -> Value {
             {"number": 10, "id": "parameters", "title": "Relevant Initialization Parameters"},
             {"number": 11, "id": "recommendations", "title": "Prioritized Actions and Mandatory Assessments"}
         ],
+        "reader_workflow": include_str!("report_writing.md"),
+        "issue_schema": report_issues::issue_schema(),
+        "issue_policy": "New sessions use explicit grouping: record findings first, then record_issue with a canonical finding and distinct evidence perspectives. All findings require assignment, every action requires kind, and duplicate membership or unknown references are rejected. Legacy mode is an explicit compatibility option; old archives retain their layout without inferred grouping.",
         "required_finding_categories": REQUIRED_REPORT_CATEGORIES,
         "diagnostic_synthesis_policy": {
             "required_fields": ["mechanism", "temporal_pattern", "affected_workload", "evidence_limitations"],
             "narrative_order": "Lead with the diagnosis. Connect symptom to mechanism, named workload and time pattern before the exhaustive structured evidence tables.",
             "causality_boundary": "Correlation, gradient selection and ASH attribution are association evidence. evidence_limitations must state the missing runtime proof and relevant counterevidence.",
-            "executive_summary": "The five leading findings include mechanism, workload scope, timing and evidence boundary; a one-sentence register alone is insufficient.",
-            "gradient_anomaly_finding": "A cross-family finding must name at least three exact top-five gradient contributors from at least two target families, at least two concrete models, an exact cross-model classification, and exact anomaly/cluster windows. Generic convergence or activity prose is rejected."
+            "executive_summary": "At most five action-ranked findings: next action and owner, conclusion and decision-changing boundary, with links to the canonical detail. Do not repeat the full mechanism and evidence narrative.",
+            "gradient_anomaly_finding": "Record a validated analytic_signal_synthesis table first: exact contributors across families, model selections and anomaly/cluster windows belong there. The linked finding may be brief. Without the structured synthesis, the finding must itself reproduce these exact signals. Generic convergence prose is never sufficient."
         },
         "recommendation_policy": {
             "required_fields": ["owner", "priority", "action", "rationale", "success_criterion"],
-            "rendering": "Group actions by accountable owner and show why the action follows plus a measurable acceptance criterion."
+            "rendering": "Sort actions by priority before owner; consolidate identical actions with links to all supporting findings. Show rationale and measurable acceptance criteria."
         },
         "required_precomputed_sections": REQUIRED_PRECOMPUTED_SECTIONS,
         "required_structured_table_kinds": REQUIRED_STRUCTURED_TABLE_KINDS,
@@ -3598,6 +3703,8 @@ fn report_contract(config: &ReportConfig) -> Value {
             "recommendation_rationale_and_success_criterion_required": true,
             "raw_evidence_ids_reader_facing": false,
             "guidance_requires_verbatim_quote": true,
+            "guidance_quotations_rendered_once": true,
+            "technical_evidence_collapsed_by_default": true,
             "technical_appendices_default": false,
             "comparative_values_explicitly_labeled": true,
             "empty_attachment_links_reader_facing": false,
@@ -4477,7 +4584,47 @@ fn report_status_value(
         .difference(&present_table_kinds)
         .cloned()
         .collect::<Vec<_>>();
-    let ready = missing_categories.is_empty()
+    let missing_issue_assignments = if state.config.issue_grouping == "explicit" {
+        state
+            .findings
+            .keys()
+            .filter(|id| issue_for_finding(state, id).is_none())
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let unclassified_actions = if state.config.issue_grouping == "explicit" {
+        state
+            .findings
+            .values()
+            .flat_map(|finding| {
+                finding
+                    .recommendations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, action)| action.kind == ActionKind::Unclassified)
+                    .map(move |(index, _)| {
+                        format!("{}:recommendation:{}", finding.finding_id, index + 1)
+                    })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let stale_issues = state
+        .issues
+        .values()
+        .filter(|issue| {
+            state.issue_finding_snapshots.get(&issue.issue_id)
+                != Some(&issue_finding_snapshot(state, issue))
+        })
+        .map(|issue| issue.issue_id.clone())
+        .collect::<Vec<_>>();
+    let ready = stale_issues.is_empty()
+        && missing_issue_assignments.is_empty()
+        && unclassified_actions.is_empty()
+        && missing_categories.is_empty()
         && missing_assessments.is_empty()
         && missing_evidence.is_empty()
         && missing_table_kinds.is_empty()
@@ -4495,6 +4642,12 @@ fn report_status_value(
         "structured_tables": state.report_tables.len(),
         "guidance_refs": state.guidance.len(),
         "recommendation_actions": actions,
+        "issues": state.issues.len(),
+        "issue_grouping": state.config.issue_grouping,
+        "missing_issue_assignments": missing_issue_assignments,
+        "unclassified_actions": unclassified_actions,
+        "stale_issues": stale_issues,
+        "readability_review": report_readability_review(state),
         "present_categories": present_categories,
         "missing_required_categories": missing_categories,
         "required_structured_table_kinds": required_table_kinds,
@@ -4504,8 +4657,85 @@ fn report_status_value(
         "missing_structured_table_rows": missing_table_rows,
         "completed_assessments": state.assessments.keys().collect::<Vec<_>>(),
         "missing_assessments": missing_assessments,
-        "next_step": if ready { "Call finalize_report." } else { "Collect every listed evidence item, record every structured table row, store all required category findings, and complete mandatory assessments." }
+        "next_step": if ready { "Call finalize_report." } else { "Collect every listed evidence item, record every structured table row, store all required category findings, complete mandatory assessments, explicitly group findings with record_issue and classify every action kind; refresh stale issues with record_issue after reviewing changed findings." }
     })
+}
+
+/// Editorial feedback is separate from factual completeness: it can request
+/// clearer writing but must never encourage dropping measurements to finalize.
+fn report_readability_review(state: &AnalysisSession) -> Value {
+    let mut warnings = Vec::new();
+    for finding in state.findings.values() {
+        if finding.title.split_whitespace().count() > 12 {
+            warnings.push(json!({"finding_id": finding.finding_id, "code": "LONG_FINDING_TITLE",
+                "suggestion": "Aim for 12 words; move chronology and qualifications into the finding body."}));
+        }
+        let words = [
+            &finding.conclusion,
+            &finding.affected_workload,
+            &finding.temporal_pattern,
+            &finding.evidence_summary,
+            &finding.evidence_limitations,
+        ]
+        .iter()
+        .map(|text| text.split_whitespace().count())
+        .sum::<usize>();
+        if words > 180 {
+            warnings.push(json!({"finding_id": finding.finding_id, "code": "LONG_DECISION_LAYER", "words": words,
+                "suggestion": "Keep decisive measurements and the decision-changing boundary visible; move repeated explanation into details. Do not truncate facts."}));
+        }
+    }
+    json!({"blocking": false, "warnings": warnings,
+        "instruction": "Review editorial warnings before finalizing. Preserve all evidence and deterministic coverage; these are writing targets, not completeness failures."})
+}
+
+fn issue_finding_snapshot(state: &AnalysisSession, issue: &ReportIssue) -> BTreeMap<String, Value> {
+    state
+        .findings
+        .values()
+        .filter(|finding| {
+            issue
+                .finding_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&finding.finding_id))
+        })
+        .map(|finding| {
+            (
+                finding.finding_id.clone(),
+                serde_json::to_value(finding).expect("finding is serializable"),
+            )
+        })
+        .collect()
+}
+
+fn issue_for_finding<'a>(state: &'a AnalysisSession, id: &str) -> Option<&'a ReportIssue> {
+    state.issues.values().find(|issue| {
+        issue
+            .finding_ids
+            .iter()
+            .any(|member| member.eq_ignore_ascii_case(id))
+    })
+}
+
+fn issue_actions_for_report(state: &AnalysisSession) -> Vec<IssueAction> {
+    state
+        .findings
+        .values()
+        .flat_map(|finding| {
+            finding
+                .recommendations
+                .iter()
+                .map(move |action| IssueAction {
+                    finding_id: finding.finding_id.clone(),
+                    kind: action.kind,
+                    owner: action.owner.clone(),
+                    priority: action.priority.clone(),
+                    action: action.action.clone(),
+                    rationale: action.rationale.clone(),
+                    success_criterion: action.success_criterion.clone(),
+                })
+        })
+        .collect()
 }
 
 fn report_section_index(state: &AnalysisSession) -> Value {
@@ -4539,6 +4769,7 @@ fn report_section_index(state: &AnalysisSession) -> Value {
                 json!({
                     "number": number,
                     "section_id": section_id,
+                    "issue_ids": finding_ids.iter().filter_map(|id| issue_for_finding(state, id).map(|issue| &issue.issue_id)).collect::<BTreeSet<_>>(),
                     "finding_ids": finding_ids,
                     "table_ids": category.map(|category| {
                         state.report_tables.values()
@@ -4596,36 +4827,55 @@ fn render_markdown(
     output.push_str("<div class=\"severity-legend\" role=\"note\" aria-label=\"Finding severity legend\"><strong>Finding severity</strong><span class=\"legend-chip legend-critical\">CRITICAL</span><span class=\"legend-chip legend-high\">HIGH</span><span class=\"legend-chip legend-medium\">MEDIUM</span><span class=\"legend-chip legend-info\">INFORMATIONAL</span><span>Confidence remains stated in every finding title.</span></div>\n\n");
 
     output.push_str("## 1. Executive Summary\n\n");
-    let mut leading = state.findings.values().collect::<Vec<_>>();
-    leading.sort_by_key(|finding| severity_rank(&finding.severity));
+    if !state.issues.is_empty() {
+        let issues = state.issues.values().cloned().collect::<Vec<_>>();
+        output.push_str(&report_issues::render_issue_queue(
+            &issues,
+            &issue_actions_for_report(state),
+        ));
+        output.push_str(&report_issues::render_issue_register(&issues));
+    }
+    let mut leading = state
+        .findings
+        .values()
+        .filter(|finding| issue_for_finding(state, &finding.finding_id).is_none())
+        .collect::<Vec<_>>();
+    leading.sort_by_key(|finding| {
+        (
+            finding
+                .recommendations
+                .iter()
+                .map(|action| priority_rank(&action.priority))
+                .min()
+                .unwrap_or(usize::MAX),
+            severity_rank(&finding.severity),
+            finding.finding_id.as_str(),
+        )
+    });
     if leading.is_empty() {
-        output.push_str("No evidence-backed findings have been recorded.\n\n");
-    } else {
-        let leading = leading.into_iter().take(5).collect::<Vec<_>>();
-        output.push_str("**At-a-glance finding register:**\n\n");
-        output.push_str("| Priority finding | Severity | Confidence |\n");
-        output.push_str("|---|---|---|\n");
-        for finding in &leading {
-            output.push_str(&format!(
-                "| {} | {} | {} |\n",
-                finding.title.replace('|', "\\|").replace('\n', " "),
-                finding.severity,
-                finding.confidence
-            ));
+        if state.findings.is_empty() {
+            output.push_str("No evidence-backed findings have been recorded.\n\n");
         }
-        output.push('\n');
+    } else {
+        if state.config.issue_grouping == "explicit" {
+            output.push_str("**Draft: these findings still need explicit issue assignment.**\n\n");
+        }
+        let leading = leading.into_iter().take(5).collect::<Vec<_>>();
+        output.push_str("Start with the next action. Priority describes urgency; severity describes impact; confidence describes the evidence. [Complete action register](#action-register).\n\n");
         for (index, finding) in leading.into_iter().enumerate() {
             output.push_str(&format!(
-                "**{}. {} [{} / {}]** — {}\n\n**Mechanism:** {}\n\n**Affected workload:** {}\n\n**Temporal pattern:** {}\n\n**Evidence boundary:** {}\n\n",
+                "<section class=\"decision-card\">\n\n### {}. {}\n\n{}\n\n",
                 index + 1,
                 finding.title,
-                finding.severity,
-                finding.confidence,
                 finding.conclusion,
-                finding.mechanism,
-                finding.affected_workload,
-                finding.temporal_pattern,
-                finding.evidence_limitations
+            ));
+            output.push_str(&render_next_action(finding));
+            output.push_str(&format!(
+                "<p class=\"decision-boundary\"><strong>Decision boundary:</strong> {}</p>\n\n<p class=\"decision-meta\">Severity: {} · Confidence: {} · <a href=\"#finding-{}\">Finding and evidence</a></p>\n\n</section>\n\n",
+                encode_text(&finding.evidence_limitations),
+                encode_text(&finding.severity),
+                encode_text(&finding.confidence),
+                evidence_anchor(&finding.finding_id),
             ));
         }
     }
@@ -4647,6 +4897,17 @@ fn render_markdown(
     ];
     for (number, category, title) in sections {
         output.push_str(&format!("## {number}. {title}\n\n"));
+        let signal_atlas = if category == "gradients_anomalies" {
+            report_signal_adapter::build_signal_atlas(document, state, entity_links)
+        } else {
+            None
+        };
+        if let Some(atlas) = &signal_atlas {
+            output.push_str(&crate::report_signals::render(
+                atlas,
+                state.config.include_evidence_appendix,
+            ));
+        }
         let mut findings = state
             .findings
             .values()
@@ -4663,24 +4924,48 @@ fn render_markdown(
             .map(String::as_str)
             .unwrap_or(&state.config.detail_level);
         for finding in findings {
+            output.push_str("<article class=\"report-finding\">\n\n");
+            if let Some(issue) = issue_for_finding(state, &finding.finding_id) {
+                output.push_str(&format!(
+                    "**Issue:** [{}](#issue-detail-{}) · [Canonical finding](#{})\n\n",
+                    issue.title,
+                    issue.issue_id.to_ascii_lowercase(),
+                    report_issues::finding_anchor(&issue.canonical_finding_id)
+                ));
+            }
             output.push_str(&format!(
-                "### {} [{} / {}]\n\n{}\n\n**Diagnostic mechanism:** {}\n\n**Affected workload:** {}\n\n**Temporal pattern:** {}\n\n**Evidence basis:** {}\n\n**Evidence boundary and counterevidence:** {}\n\n",
+                "<a id=\"finding-{}\"></a>\n\n### {} [{} / {}]\n\n{}\n\n",
+                evidence_anchor(&finding.finding_id),
                 finding.title,
                 finding.severity,
                 finding.confidence,
                 finding.conclusion,
-                finding.mechanism,
-                finding.affected_workload,
-                finding.temporal_pattern,
-                finding.evidence_summary,
-                finding.evidence_limitations
             ));
-            output.push_str(&render_finding_entity_shortcuts(
-                finding,
-                state,
-                &project_labels,
-                entity_links,
+            if signal_atlas.is_none() {
+                output.push_str(&render_finding_entity_shortcuts(
+                    finding,
+                    state,
+                    &project_labels,
+                    entity_links,
+                ));
+            }
+            if signal_atlas.is_none() {
+                output.push_str(&format!("<div class=\"finding-context\">\n\n**Affected workload:** {}\n\n**Temporal pattern:** {}\n\n</div>\n\n**Evidence basis:** {}\n\n",finding.affected_workload,finding.temporal_pattern,finding.evidence_summary));
+            }
+            output.push_str(&render_next_action(finding));
+            output.push_str(&format!(
+                "**Decision boundary:** {}\n\n<details class=\"finding-evidence\"><summary>Measurements, mechanism and supporting evidence</summary>\n\n**Diagnostic mechanism:** {}\n\n",
+                finding.evidence_limitations, finding.mechanism
             ));
+            if signal_atlas.is_some() {
+                output.push_str(&format!("**Affected workload:** {}\n\n**Temporal pattern:** {}\n\n**Evidence basis:** {}\n\n",finding.affected_workload,finding.temporal_pattern,finding.evidence_summary));
+                output.push_str(&render_finding_entity_shortcuts(
+                    finding,
+                    state,
+                    &project_labels,
+                    entity_links,
+                ));
+            }
             output.push_str(&render_guidance_quotes(&finding.guidance_quotes, state));
             if state.config.include_evidence_appendix && !finding.evidence_refs.is_empty() {
                 output.push_str(&format!(
@@ -4699,6 +4984,7 @@ fn render_markdown(
                     ));
                 }
             }
+            output.push_str("</details>\n\n</article>\n\n");
         }
 
         let tables = state
@@ -4713,9 +4999,9 @@ fn render_markdown(
         let mut grouped_tables = by_kind.into_iter().collect::<Vec<_>>();
         grouped_tables.sort_by_key(|(kind, _)| report_table_render_rank(kind));
         if !grouped_tables.is_empty() {
-            output.push_str("### Structured technical evidence\n\n");
-            output.push_str("The tables below preserve deterministic coverage; the diagnostic findings above remain the decision layer.\n\n");
+            output.push_str("<details class=\"technical-evidence\"><summary>Structured technical evidence — complete tables</summary>\n\n### Structured technical evidence\n\n");
         }
+        let has_tables = !grouped_tables.is_empty();
         for (kind, source_tables) in grouped_tables {
             let merged = ReportTable {
                 table_id: format!("rendered-{kind}"),
@@ -4737,8 +5023,28 @@ fn render_markdown(
                 entity_links,
             ));
         }
+        if has_tables {
+            output.push_str("</details>\n\n");
+        }
     }
 
+    let limitations = state
+        .findings
+        .values()
+        .filter(|finding| finding.category == "limitations")
+        .collect::<Vec<_>>();
+    if !limitations.is_empty() {
+        output.push_str("<details class=\"coverage-detail\"><summary>Evidence coverage and limitations</summary>\n\n");
+        for finding in limitations {
+            output.push_str(&format!("<a id=\"finding-{}\"></a>\n\n### {}\n\n{}\n\n**Evidence basis:** {}\n\n**Decision boundary:** {}\n\n{}\n\n",
+                evidence_anchor(&finding.finding_id), finding.title, finding.conclusion,
+                finding.evidence_summary, finding.evidence_limitations, finding.details));
+            output.push_str(&render_guidance_quotes(&finding.guidance_quotes, state));
+        }
+        output.push_str("</details>\n\n");
+    }
+
+    output.push_str("<a id=\"action-register\"></a>\n\n");
     output.push_str("## 11. Prioritized Actions and Mandatory Assessments\n\n");
     let mut actions = state
         .findings
@@ -4754,25 +5060,58 @@ fn render_markdown(
         .sort_by_key(|(finding, action)| (priority_rank(&action.priority), finding.title.as_str()));
     if actions.is_empty() {
         output.push_str("No prioritized actions were recorded.\n\n");
+    } else if state.config.issue_grouping == "explicit" {
+        output.push_str(&report_issues::render_action_register(
+            &issue_actions_for_report(state),
+        ));
     } else {
-        for owner in ["DBA", "Developer", "Management"] {
-            let owned = actions
+        for priority in ["immediate", "high", "medium", "low"] {
+            let selected = actions
                 .iter()
-                .filter(|(_, action)| action.owner == owner)
+                .filter(|(_, action)| action.priority == priority)
                 .collect::<Vec<_>>();
-            if owned.is_empty() {
+            if selected.is_empty() {
                 continue;
             }
-            output.push_str(&format!("### {owner} Actions\n\n"));
-            for (finding, action) in owned {
+            output.push_str(&format!(
+                "### {} priority\n\n",
+                priority.to_ascii_uppercase()
+            ));
+            let mut rendered = BTreeSet::new();
+            for (_, action) in &selected {
+                // Merge only exact duplicates. Different scope, acceptance criteria
+                // or rationale can describe different actions and must survive.
+                let key = (
+                    &action.owner,
+                    &action.action,
+                    &action.rationale,
+                    &action.success_criterion,
+                );
+                if !rendered.insert(key) {
+                    continue;
+                }
+                let supports = selected
+                    .iter()
+                    .filter(|(_, other)| {
+                        (
+                            &other.owner,
+                            &other.action,
+                            &other.rationale,
+                            &other.success_criterion,
+                        ) == key
+                    })
+                    .map(|(finding, _)| {
+                        format!(
+                            "[{}](#finding-{})",
+                            finding.title,
+                            evidence_anchor(&finding.finding_id)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 output.push_str(&format!(
-                    "- **{} — {}**  \n  **Why:** {}  \n  **Success criterion:** {}  \n  *Supports: {} ({})*\n",
-                    action.priority.to_ascii_uppercase(),
-                    action.action,
-                    action.rationale,
-                    action.success_criterion,
-                    finding.title,
-                    finding.finding_id
+                    "- **{} — {}**  \n  **Why:** {}  \n  **Success criterion:** {}  \n  *Supports: {}*\n",
+                    action.owner, action.action, action.rationale, action.success_criterion, supports
                 ));
             }
             output.push('\n');
@@ -4827,19 +5166,36 @@ fn render_markdown(
         }
         output.push_str("</ul></details>\n\n");
     }
-    if state.config.include_guidance_appendix {
+    let quotations = unique_guidance_quotes(state);
+    if state.config.include_guidance_appendix || !quotations.is_empty() {
         output.push_str("## Appendix B. Diagnostic Guidance Consulted\n\n");
-        if state.guidance.is_empty() {
-            output.push_str("No external diagnostic guidance was consulted.\n\n");
-        } else {
-            for (reference, guidance) in &state.guidance {
-                output.push_str(&format!(
-                    "- **{reference} — {}** — methodology only; quoted verbatim where applied, never used as measurement evidence.\n",
-                    guidance.title
-                ));
+        output.push_str("<details class=\"methodology\"><summary>Diagnostic methodology — verified quotations</summary>\n\nMethodology explains the investigation; measurements support the findings. Each applied quotation appears once.\n\n");
+        for (index, (reference, quote)) in quotations.iter().enumerate() {
+            let title = state
+                .guidance
+                .get(*reference)
+                .map(|record| record.title.as_str())
+                .unwrap_or("Diagnostic guidance");
+            output.push_str(&format!(
+                "<a id=\"guidance-quote-{}\"></a>\n\n**{} — {}**\n\n",
+                index + 1,
+                reference,
+                title
+            ));
+            for line in quote.lines() {
+                output.push_str(&format!("> {}\n", line));
             }
             output.push('\n');
         }
+        if state.config.include_guidance_appendix {
+            for (reference, guidance) in &state.guidance {
+                output.push_str(&format!(
+                    "- **{} — {}** — consulted methodology.\n",
+                    reference, guidance.title
+                ));
+            }
+        }
+        output.push_str("\n</details>\n\n");
     }
     output.push_str("Generated by JAS-MIN · https://github.com/ora600pl/jas-min · expert performance tuning at ora-600.pl\n");
     output
@@ -5010,10 +5366,7 @@ fn render_finding_entity_shortcuts(
                 "background_wait" => "background wait",
                 _ => "detail",
             };
-            shortcuts.push(format!(
-                "[{} — {}: {}](<{}>)",
-                label, kind_label, entity, target
-            ));
+            shortcuts.push((label, format!("{kind_label}: {entity}"), target.clone()));
         }
     }
     shortcuts.sort();
@@ -5022,10 +5375,24 @@ fn render_finding_entity_shortcuts(
     if shortcuts.is_empty() {
         String::new()
     } else {
-        format!(
-            "**Interactive evidence shortcuts:** {}\n\n",
-            shortcuts.join(" · ")
-        )
+        let mut result = "<nav class=\"evidence-shortcuts\" aria-label=\"Interactive evidence shortcuts\"><span>OPEN SOURCE EVIDENCE</span>".to_string();
+        let mut previous = String::new();
+        for (label, name, target) in shortcuts {
+            if previous != label {
+                if !previous.is_empty() {
+                    result.push_str("</div>");
+                }
+                result.push_str(&format!("<div><b>{}</b>", encode_text(&label)));
+                previous = label.to_string();
+            }
+            result.push_str(&format!(
+                "<a href=\"{}\">{} ↗</a>",
+                html_escape::encode_double_quoted_attribute(&target),
+                encode_text(&name)
+            ));
+        }
+        result.push_str("</div></nav>\n\n");
+        result
     }
 }
 
@@ -5879,7 +6246,13 @@ fn parse_recommendations(value: Option<&Value>) -> std::result::Result<Vec<Recom
                 ("rationale", &rationale),
                 ("success_criterion", &success_criterion),
             ])?;
+            let kind = match object.get("kind") {
+                None => ActionKind::Unclassified,
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|error| tool_error("INVALID_ACTION_KIND", error.to_string()))?,
+            };
             Ok(Recommendation {
+                kind,
                 owner,
                 priority,
                 action,
@@ -6200,6 +6573,35 @@ fn validate_gradient_anomaly_finding_synthesis(
     for project_id in project_ids {
         let sections = cited_analytic_sections(state, evidence_refs, project_id);
         if sections.len() < 2 || !sections.contains("full_gradients") {
+            continue;
+        }
+        // A validated structured synthesis already carries the exact contributors,
+        // model names and windows. Requiring the same values in the finding prose
+        // encouraged unreadable numerical paragraphs without adding evidence.
+        if let Some(row) = state
+            .report_tables
+            .values()
+            .filter(|table| table.kind == "analytic_signal_synthesis")
+            .flat_map(|table| &table.rows)
+            .find(|row| row.cells.get("project_id").map(String::as_str) == Some(project_id))
+        {
+            validate_cross_family_analytic_text(
+                state,
+                &row.evidence_refs,
+                project_id,
+                row.cells
+                    .get("dominant_gradient_signals")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                row.cells
+                    .get("model_agreement")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                row.cells
+                    .get("temporal_evidence")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            )?;
             continue;
         }
         validate_cross_family_analytic_text(
@@ -7301,26 +7703,50 @@ fn evidence_links(evidence: &[String]) -> String {
         .join(", ")
 }
 
-fn render_guidance_quotes(quotations: &[GuidanceQuotation], state: &AnalysisSession) -> String {
-    let mut output = String::new();
-    for quotation in quotations {
-        let title = state
-            .guidance
-            .get(&quotation.guidance_ref)
-            .map(|record| record.title.as_str())
-            .unwrap_or("Diagnostic guidance");
-        output.push_str(&format!(
-            "> **JAS-MIN diagnostic rule ({} — {}):**\n>\n",
-            quotation.guidance_ref, title
-        ));
-        for line in quotation.quote.lines() {
-            output.push_str("> “");
-            output.push_str(line);
-            output.push_str("”\n");
-        }
-        output.push('\n');
+fn render_next_action(finding: &ReportFinding) -> String {
+    match finding.recommendations.iter().min_by_key(|action| priority_rank(&action.priority)) {
+        Some(action) => format!("**Next action — {} / {} / {}:** {}\n\n", action.owner, action.priority.to_ascii_uppercase(), action.kind.label(), action.action),
+        None => "**Next action:** No action recorded; review the evidence boundary before intervening.\n\n".to_string(),
     }
-    output
+}
+
+fn unique_guidance_quotes(state: &AnalysisSession) -> Vec<(&str, &str)> {
+    state
+        .findings
+        .values()
+        .flat_map(|finding| &finding.guidance_quotes)
+        .chain(
+            state
+                .assessments
+                .values()
+                .flat_map(|assessment| &assessment.guidance_quotes),
+        )
+        .map(|quote| (quote.guidance_ref.as_str(), quote.quote.as_str()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn render_guidance_quotes(quotations: &[GuidanceQuotation], state: &AnalysisSession) -> String {
+    let registry = unique_guidance_quotes(state);
+    let links = quotations
+        .iter()
+        .filter_map(|quotation| {
+            registry
+                .iter()
+                .position(|entry| {
+                    *entry == (quotation.guidance_ref.as_str(), quotation.quote.as_str())
+                })
+                .map(|index| format!("[Rule {}](#guidance-quote-{})", index + 1, index + 1))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if links.is_empty() {
+        String::new()
+    } else {
+        format!("**Methodology:** {}\n\n", links.join(", "))
+    }
 }
 
 fn cited_evidence_refs(state: &AnalysisSession) -> BTreeSet<String> {
@@ -7543,7 +7969,7 @@ mod tests {
         WaitEventsWithStrongCorrelation,
     };
 
-    fn runtime() -> AnalysisRuntime {
+    pub(super) fn runtime() -> AnalysisRuntime {
         let mut awr = AWR::default();
         awr.snap_info = SnapInfo {
             begin_snap_id: 10,
@@ -8445,6 +8871,39 @@ mod tests {
             "Physical write (blocks) deviated at 24-Jul-26 15:30:17; cluster SNAP_ID 156679 at 20-Jul-26 00:00:28 also contains flashback log file write",
         )
         .unwrap();
+        let short_finding = |state: &AnalysisSession| {
+            validate_gradient_anomaly_finding_synthesis(
+                state,
+                &refs,
+                "Reduce recurring monitoring work and isolate pin incidents.",
+                "Two distinct mechanisms need matched runtime tests.",
+                "The captured historical window.",
+                "Monitoring and import workloads.",
+                "See the structured signal comparison.",
+                "The exclusive holder is not yet identified.",
+            )
+        };
+        assert!(short_finding(&state).is_err());
+        state.report_tables.insert("SYNTHESIS".into(), ReportTable {
+            table_id: "SYNTHESIS".into(), kind: "analytic_signal_synthesis".into(), category: "gradients_anomalies".into(), title: "Validated synthesis".into(),
+            rows: vec![ReportTableRow { cells:BTreeMap::from([
+                ("project_id".into(),project_id.into()),
+                ("dominant_gradient_signals".into(),"session logical reads and 7ud94ccmpaz8u dominate typical work; cursor: pin S wait on X is a peak signal".into()),
+                ("model_agreement".into(),"Huber and Ridge: CONFIRMED_BOTTLENECK_EN_COLLINEAR".into()),
+                ("temporal_evidence".into(),"Physical write (blocks) at 24-Jul-26 15:30:17; cluster 156679 contains flashback log file write".into())
+            ]), evidence_refs:refs.clone() }]
+        });
+        assert!(short_finding(&state).is_ok());
+        state.report_tables.get_mut("SYNTHESIS").unwrap().rows[0]
+            .cells
+            .insert(
+                "dominant_gradient_signals".into(),
+                "Several signals agree".into(),
+            );
+        assert!(
+            short_finding(&state).is_err(),
+            "A generic structured row must not bypass exact-signal validation"
+        );
     }
 
     #[test]
@@ -9153,6 +9612,7 @@ mod tests {
         for (index, category) in REQUIRED_REPORT_CATEGORIES.iter().enumerate() {
             let recommendations = if index == 0 {
                 json!([{
+                    "kind": "evidence_capture",
                     "owner": "DBA",
                     "priority": "high",
                     "action": "Validate the change in a controlled window.",
@@ -9233,6 +9693,25 @@ mod tests {
                 ]),
             )
             .unwrap();
+        let ids = runtime
+            .session(&analysis_id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .findings
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in ids {
+            runtime.call_tool("record_issue", serde_json::from_value(json!({
+                "analysis_id": analysis_id, "issue_id": format!("I-{id}"),
+                "title": format!("Decision for {id}"), "decision_summary": "Investigate the measured seed signal.",
+                "decision_boundary": "This fixture does not establish production causality.",
+                "scope": "The single synthetic project and its captured window.",
+                "grouping_rationale": "One issue per independent synthetic finding.", "confidence": "medium",
+                "canonical_finding_id": id, "finding_ids": [id]
+            })).unwrap()).unwrap();
+        }
         let status = runtime
             .call_tool(
                 "get_report_status",
@@ -9248,16 +9727,30 @@ mod tests {
             )
             .unwrap();
         let markdown = final_report["markdown"].as_str().unwrap();
+        let report = &final_report["report"];
+        let issues = report["issues"].as_array().unwrap();
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(issues.len(), findings.len());
+        for finding in findings {
+            let issue = issues
+                .iter()
+                .find(|issue| issue["issue_id"] == finding["issue_id"])
+                .unwrap();
+            assert_eq!(issue["canonical_finding_id"], finding["finding_id"]);
+            for action in finding["recommendations"].as_array().unwrap() {
+                assert_eq!(action["kind"], "evidence_capture");
+            }
+        }
         for section in 1..=11 {
             assert!(markdown.contains(&format!("## {section}.")));
         }
         assert!(markdown.contains("**Evidence basis:**"));
-        assert!(markdown.contains("**Mechanism:**"));
+        assert!(markdown.contains("class=\"decision-card\""));
         assert!(markdown.contains("**Diagnostic mechanism:**"));
         assert!(markdown.contains("**Affected workload:**"));
         assert!(markdown.contains("**Temporal pattern:**"));
-        assert!(markdown.contains("**Evidence boundary and counterevidence:**"));
-        assert!(markdown.contains("### DBA Actions"));
+        assert!(markdown.contains("**Decision boundary:**"));
+        assert!(markdown.contains("### HIGH priority"));
         assert!(markdown.contains("**Why:**"));
         assert!(markdown.contains("**Success criterion:**"));
         assert!(markdown.contains("## 9. Gradient and Anomaly Synthesis"));
@@ -9599,3 +10092,14 @@ mod tests {
         std::fs::remove_dir_all(test_directory).unwrap();
     }
 }
+
+#[path = "report_signal_adapter.rs"]
+mod report_signal_adapter;
+
+#[cfg(test)]
+#[path = "report_reader_tests.rs"]
+mod report_reader_tests;
+
+#[cfg(test)]
+#[path = "report_issue_tests.rs"]
+mod report_issue_tests;
