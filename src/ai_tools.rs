@@ -26,8 +26,9 @@ use toon::encode;
 
 use crate::awr::{AWRSCollection, AWR};
 use crate::debug_note;
+use crate::measurements::{self, DbLoadMetric};
 
-const JASMIN_TOOLS_SCHEMA_VERSION: &str = "2026-08-23.4";
+const JASMIN_TOOLS_SCHEMA_VERSION: &str = "2026-09-13.3";
 const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_TOP_N: usize = 10;
 const MAX_LIMIT: usize = 500;
@@ -52,9 +53,14 @@ const MAX_AIX_RECURSION_DEPTH: usize = 4;
 ///
 /// Keep descriptions explicit: the model uses them as its routing table. Yes,
 /// apparently we now write documentation for probabilistic parrots. Here we are.
-pub fn tools_schema(stem: &str) -> Value {
+pub fn tools_schema(stem: &str, include_nmon: bool) -> Value {
     debug_note!("Building AI tool schema for stem '{}'", stem);
     let mut tools = json!([
+        {"type":"function","function":{
+            "name":"get_access_path_diagnostics",
+            "description":"Optional follow-up for SQL costs and supplied structural/intervention evidence after scan or row-continuation signals emerge in gradients/degradation. Not required to form a hypothesis. Instance counters and model labels cannot confirm a segment mechanism.",
+            "parameters":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"offset":{"type":"integer","minimum":0},"sql_id":{"type":"string"},"evidence_offset":{"type":"integer","minimum":0},"evidence_limit":{"type":"integer","minimum":1,"maximum":100}}}
+        }},
         // ====================================================================
         // 0. GLOBAL OVERVIEW / TRIAGE
         // ====================================================================
@@ -343,7 +349,7 @@ pub fn tools_schema(stem: &str) -> Value {
             "type": "function",
             "function": {
                 "name": "get_metric_time_series",
-                "description": "Returns a time series across all snapshots for a load profile metric, instance statistic, wait event, time model statistic, host CPU field or I/O function metric. Use list_available_metrics first if exact names are uncertain.",
+                "description": "Returns a time series across all snapshots for a load profile metric, instance statistic, wait event, time model statistic, host CPU field or I/O function metric. DB Time/DB CPU load_profile queries prefer Time Model seconds / snapshot duration with Load Profile fallback; raw snapshot data is unchanged. Use list_available_metrics first if exact names are uncertain.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -354,7 +360,7 @@ pub fn tools_schema(stem: &str) -> Value {
                         "name":  { "type": "string", "description": "stat / event / function name. For host_cpu use 'host_cpu'." },
                         "field": {
                             "type": "string",
-                            "description": "For wait events: pct_dbtime|total_wait_time_s|avg_wait|waits. For host_cpu: pct_user|pct_system|pct_wio|pct_idle|load_avg_begin|load_avg_end|cpus|cores|sockets. For io_stats_byfunc: reads_data|reads_req_s|reads_data_s|writes_data|writes_req_s|writes_data_s|waits_count|avg_time."
+                            "description": "For instance_stat: value (raw interval total) or per_second (normalized by actual snapshot duration; current gauges retain their level). For wait events: pct_dbtime|total_wait_time_s|avg_wait|waits. For host_cpu: pct_user|pct_system|pct_wio|pct_idle|load_avg_begin|load_avg_end|cpus|cores|sockets. For io_stats_byfunc: reads_data|reads_req_s|reads_data_s|writes_data|writes_req_s|writes_data_s|waits_count|avg_time."
                         }
                     },
                     "required": ["kind", "name"]
@@ -667,11 +673,71 @@ pub fn tools_schema(stem: &str) -> Value {
 
         println!("✅ Found AIX OS attachments in {}", aix_dir.display());
     }
+    if include_nmon {
+        let nmon_tools = json!([
+            {"type":"function","function":{
+                "name":"get_host_configuration",
+                "description":"Returns prepared NMON host, AIX/LPAR, memory and capture metadata plus bounded import diagnostics. Start here for host-capacity questions. This never reparses raw NMON files.",
+                "parameters":{"type":"object","properties":{}}
+            }},
+            {"type":"function","function":{
+                "name":"get_host_overview",
+                "description":"Returns a compact prepared NMON overview: capture coverage, LPAR metadata, devices/interfaces and selected CPU, entitlement, run-queue and paging summaries.",
+                "parameters":{"type":"object","properties":{}}
+            }},
+            {"type":"function","function":{
+                "name":"list_host_metrics",
+                "description":"Lists prepared NMON metrics and precomputed statistics. Filter by domain, entity or original NMON section before requesting time-series detail.",
+                "parameters":{"type":"object","properties":{
+                    "domain":{"type":"string","description":"Optional domain such as cpu_all, lpar, memory, vm, process, disk, network."},
+                    "entity":{"type":"string","description":"Optional exact device, interface or CPU entity, for example hdisk2 or en0."},
+                    "section":{"type":"string","description":"Optional original NMON section such as DISKREAD or DISKWAIT."},
+                    "offset":{"type":"integer","minimum":0},
+                    "limit":{"type":"integer","minimum":1,"maximum":1000}
+                }}
+            }},
+            {"type":"function","function":{
+                "name":"get_host_metric_summary",
+                "description":"Returns metadata, unit, observed/derived identity and precomputed statistics for one NMON metric key.",
+                "parameters":{"type":"object","properties":{"metric_key":{"type":"string"}},"required":["metric_key"]}
+            }},
+            {"type":"function","function":{
+                "name":"get_host_peak_periods",
+                "description":"Returns precomputed sustained NMON peak buckets. Optionally filter by metric and duration (300, 900 or 3600 seconds).",
+                "parameters":{"type":"object","properties":{
+                    "metric_key":{"type":"string"},
+                    "duration_seconds":{"type":"integer","enum":[300,900,3600]},
+                    "limit":{"type":"integer","minimum":1,"maximum":1000}
+                }}
+            }},
+            {"type":"function","function":{
+                "name":"get_host_metric_time_series",
+                "description":"Returns a bounded prepared NMON series. Prefer 5m/15m/1h aggregates; use raw only for a narrow time range. Timestamps have no invented timezone.",
+                "parameters":{"type":"object","properties":{
+                    "metric_key":{"type":"string"},
+                    "from":{"type":"string","description":"Inclusive ISO local timestamp, e.g. 2026-09-10T14:00:00."},
+                    "to":{"type":"string","description":"Inclusive ISO local timestamp."},
+                    "resolution":{"type":"string","enum":["raw","5m","15m","1h"],"default":"15m"},
+                    "limit":{"type":"integer","minimum":1,"maximum":1000}
+                },"required":["metric_key"]}
+            }},
+            {"type":"function","function":{
+                "name":"get_nmon_disk_validation",
+                "description":"Returns compact per-device statistics using original NMON section names and units for comparison with NMONVisualizer. Does not infer an Oracle role from an hdisk name.",
+                "parameters":{"type":"object","properties":{"device":{"type":"string","description":"Optional exact disk device, e.g. hdisk2."}}}
+            }}
+        ]);
+        tools
+            .as_array_mut()
+            .expect("tools must be a JSON array")
+            .extend(nmon_tools.as_array().cloned().unwrap_or_default());
+    }
     debug_note!(
-        "AI tool schema ready: stem='{}', tool_count={}, aix_attachments={}",
+        "AI tool schema ready: stem='{}', tool_count={}, aix_attachments={}, nmon={}",
         stem,
         tools.as_array().map_or(0, Vec::len),
-        aix_dir.is_dir()
+        aix_dir.is_dir(),
+        include_nmon
     );
     tools
 }
@@ -679,6 +745,67 @@ pub fn tools_schema(stem: &str) -> Value {
 // ----------------------------------------------------------------------------
 // Dispatcher
 // ----------------------------------------------------------------------------
+
+fn with_nmon(
+    collection: &AWRSCollection,
+    query: fn(&crate::nmon::NmonDataset) -> Value,
+) -> Value {
+    collection.nmon.as_ref().map_or_else(
+        || {
+            json!({
+                "error": "this JAS-MIN dataset does not contain NMON data; regenerate it with --nmon <directory>",
+                "error_code": "NMON_NOT_LOADED"
+            })
+        },
+        query,
+    )
+}
+
+fn with_nmon_args(
+    collection: &AWRSCollection,
+    args: &Value,
+    query: fn(&crate::nmon::NmonDataset, &Value) -> Value,
+) -> Value {
+    collection.nmon.as_ref().map_or_else(
+        || {
+            json!({
+                "error": "this JAS-MIN dataset does not contain NMON data; regenerate it with --nmon <directory>",
+                "error_code": "NMON_NOT_LOADED"
+            })
+        },
+        |dataset| query(dataset, args),
+    )
+}
+
+fn tool_get_prepared_cpu_entitlement_summary(dataset: &crate::nmon::NmonDataset) -> Value {
+    let summaries = dataset
+        .summaries
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "cpu_all.user_pct"
+                    | "cpu_all.sys_pct"
+                    | "cpu_all.wait_pct"
+                    | "cpu_all.idle_pct"
+                    | "cpu_all.busy"
+                    | "lpar.physicalcpu"
+                    | "lpar.entitled"
+                    | "lpar.entitlement_utilization_pct"
+                    | "process.runnable"
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    json!({
+        "schema_version": JASMIN_TOOLS_SCHEMA_VERSION,
+        "source": "prepared_nmon_dataset",
+        "host": dataset.metadata.host,
+        "lpar": dataset.metadata.lpar,
+        "capture": dataset.capture,
+        "summaries": summaries,
+        "note": "Statistics were precomputed during dataset generation; the MCP/tool call did not reparse raw NMON files."
+    })
+}
 
 /// Routes a tool call to the matching implementation and returns structured JSON.
 ///
@@ -700,6 +827,16 @@ pub fn dispatch_tool_call_value(
     );
     let result = match name {
         // Global overview
+        "get_access_path_diagnostics" => {
+            let range = (0, u64::MAX);
+            let report = crate::access_path::build(
+                collection,
+                &range,
+                crate::degradation::detected(collection, &range),
+                Default::default(),
+            );
+            crate::access_path::query(Some(&report), args)
+        }
         "get_database_load_summary" => tool_get_database_load_summary(args, collection),
 
         // Point lookups
@@ -720,7 +857,25 @@ pub fn dispatch_tool_call_value(
         "get_alertlog_errors" => tool_get_alertlog_errors(args, stem),
         "list_aix_os_attachments" => tool_list_aix_os_attachments(args, stem),
         "get_aix_os_attachment" => tool_get_aix_os_attachment(args, stem),
-        "get_aix_cpu_entitlement_summary" => tool_get_aix_cpu_entitlement_summary(args, stem),
+        "get_aix_cpu_entitlement_summary" => collection.nmon.as_ref().map_or_else(
+            || tool_get_aix_cpu_entitlement_summary(args, stem),
+            tool_get_prepared_cpu_entitlement_summary,
+        ),
+        "get_host_configuration" => with_nmon(collection, crate::nmon::query::configuration),
+        "get_host_overview" => with_nmon(collection, crate::nmon::query::overview),
+        "list_host_metrics" => with_nmon_args(collection, args, crate::nmon::query::list_metrics),
+        "get_host_metric_summary" => {
+            with_nmon_args(collection, args, crate::nmon::query::metric_summary)
+        }
+        "get_host_peak_periods" => {
+            with_nmon_args(collection, args, crate::nmon::query::peak_periods)
+        }
+        "get_host_metric_time_series" => {
+            with_nmon_args(collection, args, crate::nmon::query::time_series)
+        }
+        "get_nmon_disk_validation" => {
+            with_nmon_args(collection, args, crate::nmon::query::disk_validation)
+        }
 
         // Aggregations
         "list_snapshots" | "list_snapshots_in_range" => tool_list_snapshots(args, collection),
@@ -1958,19 +2113,11 @@ fn detect_alertlog_event(
 }
 
 fn db_time_of(awr: &AWR) -> f64 {
-    awr.time_model_stats
-        .iter()
-        .find(|t| t.stat_name.eq_ignore_ascii_case("DB time"))
-        .map(|t| t.time_s)
-        .unwrap_or(0.0)
+    measurements::db_load_seconds(awr, DbLoadMetric::DbTime).unwrap_or(f64::NAN)
 }
 
 fn db_cpu_of(awr: &AWR) -> f64 {
-    awr.time_model_stats
-        .iter()
-        .find(|t| t.stat_name.eq_ignore_ascii_case("DB CPU"))
-        .map(|t| t.time_s)
-        .unwrap_or(0.0)
+    measurements::db_load_seconds(awr, DbLoadMetric::DbCpu).unwrap_or(f64::NAN)
 }
 
 fn error_missing_arg(name: &str) -> Value {
@@ -1988,18 +2135,23 @@ fn snapshot_header(awr: &AWR) -> Value {
         "begin_snap_time": awr.snap_info.begin_snap_time,
         "end_snap_time": awr.snap_info.end_snap_time,
         "file_name": awr.file_name,
+        "data_availability": awr.data_availability,
+        "host_cpu_available": crate::measurements::host_cpu_available(awr),
+        "interval_seconds": crate::measurements::seconds(awr),
+        "db_time_rate": measurements::db_load_rate(awr, DbLoadMetric::DbTime),
+        "db_cpu_rate": measurements::db_load_rate(awr, DbLoadMetric::DbCpu),
         "db_time_s": db_time,
         "db_cpu_s": db_cpu,
-        "db_cpu_dbtime_ratio": if db_time > 0.0 { db_cpu / db_time } else { 0.0 },
-        "host_cpu_cpus": awr.host_cpu.cpus,
-        "host_cpu_cores": awr.host_cpu.cores,
-        "host_cpu_sockets": awr.host_cpu.sockets,
-        "host_cpu_load_avg_begin": awr.host_cpu.load_avg_begin,
-        "host_cpu_load_avg_end": awr.host_cpu.load_avg_end,
-        "host_cpu_pct_user": awr.host_cpu.pct_user,
-        "host_cpu_pct_system": awr.host_cpu.pct_system,
-        "host_cpu_pct_wio": awr.host_cpu.pct_wio,
-        "host_cpu_pct_idle": awr.host_cpu.pct_idle
+        "db_cpu_dbtime_ratio": (db_time > 0.0 && db_cpu.is_finite()).then_some(db_cpu / db_time),
+        "host_cpu_cpus": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.cpus),
+        "host_cpu_cores": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.cores),
+        "host_cpu_sockets": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.sockets),
+        "host_cpu_load_avg_begin": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.load_avg_begin),
+        "host_cpu_load_avg_end": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.load_avg_end),
+        "host_cpu_pct_user": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.pct_user),
+        "host_cpu_pct_system": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.pct_system),
+        "host_cpu_pct_wio": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.pct_wio),
+        "host_cpu_pct_idle": crate::measurements::host_cpu_available(awr).then_some(awr.host_cpu.pct_idle)
     })
 }
 
@@ -2035,18 +2187,20 @@ fn tool_get_database_load_summary(args: &Value, c: &AWRSCollection) -> Value {
                 "snap_id": a.snap_info.begin_snap_id,
                 "begin_snap_time": a.snap_info.begin_snap_time,
                 "end_snap_time": a.snap_info.end_snap_time,
+                "db_time_rate": measurements::db_load_rate(a, DbLoadMetric::DbTime),
+                "db_cpu_rate": measurements::db_load_rate(a, DbLoadMetric::DbCpu),
                 "db_time_s": db_time,
                 "db_cpu_s": db_cpu,
-                "db_cpu_dbtime_ratio": if db_time > 0.0 { db_cpu / db_time } else { 0.0 },
-                "host_cpu_cpus": a.host_cpu.cpus,
-                "host_cpu_cores": a.host_cpu.cores,
-                "host_cpu_sockets": a.host_cpu.sockets,
-                "host_cpu_load_avg_begin": a.host_cpu.load_avg_begin,
-                "host_cpu_load_avg_end": a.host_cpu.load_avg_end,
-                "host_cpu_pct_user": a.host_cpu.pct_user,
-                "host_cpu_pct_system": a.host_cpu.pct_system,
-                "host_cpu_pct_wio": a.host_cpu.pct_wio,
-                "host_cpu_pct_idle": a.host_cpu.pct_idle,
+                "db_cpu_dbtime_ratio": (db_time > 0.0 && db_cpu.is_finite()).then_some(db_cpu / db_time),
+                "host_cpu_cpus": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.cpus),
+                "host_cpu_cores": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.cores),
+                "host_cpu_sockets": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.sockets),
+                "host_cpu_load_avg_begin": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.load_avg_begin),
+                "host_cpu_load_avg_end": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.load_avg_end),
+                "host_cpu_pct_user": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.pct_user),
+                "host_cpu_pct_system": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.pct_system),
+                "host_cpu_pct_wio": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.pct_wio),
+                "host_cpu_pct_idle": crate::measurements::host_cpu_available(a).then_some(a.host_cpu.pct_idle),
                 "top_fg_event": top_fg
             })
         })
@@ -2096,7 +2250,8 @@ fn tool_get_database_load_summary(args: &Value, c: &AWRSCollection) -> Value {
         "last_snapshot": c.awrs.last().map(snapshot_header),
         "total_db_time_s": total_db_time_s,
         "total_db_cpu_s": total_db_cpu_s,
-        "global_db_cpu_dbtime_ratio": if total_db_time_s > 0.0 { total_db_cpu_s / total_db_time_s } else { 0.0 },
+        "global_db_cpu_dbtime_ratio": (total_db_time_s > 0.0 && total_db_cpu_s.is_finite()).then_some(total_db_cpu_s / total_db_time_s),
+        "db_load_sources": measurements::db_load_sources(c, &(0, u64::MAX)),
         "sql_text_count": c.sql_text.len(),
         "init_parameter_count": c.initialization_parameters.len(),
         "busiest_snapshots_by_db_time": snapshots.into_iter().take(top_n).collect::<Vec<_>>(),
@@ -2135,7 +2290,7 @@ fn tool_get_snapshot_summary(args: &Value, c: &AWRSCollection) -> Value {
         "top_foreground_waits": top_waits.into_iter().take(DEFAULT_TOP_N).collect::<Vec<_>>(),
         "top_sql_elapsed": top_sql_elapsed.into_iter().take(DEFAULT_TOP_N).collect::<Vec<_>>(),
         "load_profile": awr.load_profile,
-        "host_cpu": awr.host_cpu
+        "host_cpu": crate::measurements::host_cpu_json(awr)
     })
 }
 
@@ -2167,6 +2322,9 @@ fn tool_get_snapshot_details(args: &Value, c: &AWRSCollection) -> Value {
         "schema_version": JASMIN_TOOLS_SCHEMA_VERSION,
         "snap_info": awr.snap_info,
         "file_name": awr.file_name,
+        "data_availability": awr.data_availability,
+        "host_cpu_available": crate::measurements::host_cpu_available(awr),
+        "interval_seconds": crate::measurements::seconds(awr),
         "note": if sections.is_some() {
             "Output limited to requested sections."
         } else {
@@ -2181,7 +2339,7 @@ fn tool_get_snapshot_details(args: &Value, c: &AWRSCollection) -> Value {
         out["instance_efficiency"] = json!(awr.instance_efficiency);
     }
     if include("host_cpu") {
-        out["host_cpu"] = json!(awr.host_cpu);
+        out["host_cpu"] = crate::measurements::host_cpu_json(awr);
     }
     if include("time_model") {
         out["time_model"] = json!(awr.time_model_stats);
@@ -4103,18 +4261,33 @@ fn tool_get_metric_time_series(args: &Value, c: &AWRSCollection) -> Value {
         .awrs
         .iter()
         .filter_map(|a| {
+            let domain = match kind {
+                "instance_stat" => "instance_stats",
+                "wait_event_fg" => "foreground_wait_events",
+                "wait_event_bg" => "background_wait_events",
+                "time_model" => "time_model_stats",
+                other => other,
+            };
+            let db_load_metric = (kind == "load_profile")
+                .then(|| DbLoadMetric::from_name(name))
+                .flatten();
+            if db_load_metric.is_none() && a.data_availability.get(domain) == Some(&false) {
+                return None;
+            }
             let value = match kind {
-                "load_profile" => a
-                    .load_profile
-                    .iter()
-                    .find(|lp| lp.stat_name.eq_ignore_ascii_case(name))
-                    .map(|lp| lp.per_second),
+                "load_profile" => measurements::load_profile_rate(a, name),
 
                 "instance_stat" => a
                     .instance_stats
                     .iter()
                     .find(|s| s.statname.eq_ignore_ascii_case(name))
-                    .map(|s| s.total as f64),
+                    .and_then(|s| {
+                        if field == "per_second" && !s.statname.ends_with(" current") {
+                            crate::measurements::seconds(a).map(|d| s.total as f64 / d)
+                        } else {
+                            Some(s.total as f64)
+                        }
+                    }),
 
                 "wait_event_fg" => a
                     .foreground_wait_events
@@ -4147,6 +4320,7 @@ fn tool_get_metric_time_series(args: &Value, c: &AWRSCollection) -> Value {
                         _ => t.time_s,
                     }),
 
+                "host_cpu" if !crate::measurements::host_cpu_available(a) => None,
                 "host_cpu" => match field {
                     "pct_user" | "value" => Some(a.host_cpu.pct_user),
                     "pct_system" => Some(a.host_cpu.pct_system),
@@ -4176,12 +4350,17 @@ fn tool_get_metric_time_series(args: &Value, c: &AWRSCollection) -> Value {
             };
 
             value.map(|v| {
-                json!({
+                let mut point = json!({
                     "snap_id": a.snap_info.begin_snap_id,
                     "begin_snap_time": a.snap_info.begin_snap_time,
                     "end_snap_time": a.snap_info.end_snap_time,
                     "value": v
-                })
+                });
+                if let Some(metric) = db_load_metric {
+                    point["value_source"] =
+                        json!(measurements::db_load_rate(a, metric).map(|r| r.source));
+                }
+                point
             })
         })
         .collect();
@@ -4521,8 +4700,8 @@ fn tool_compare_snapshots(args: &Value, c: &AWRSCollection) -> Value {
 
     if focus.contains("host_cpu") {
         out["host_cpu"] = json!({
-            "a": a.host_cpu,
-            "b": b.host_cpu
+            "a": crate::measurements::host_cpu_json(a),
+            "b": crate::measurements::host_cpu_json(b)
         });
     }
 
@@ -5111,7 +5290,7 @@ LPAR,T0001,9.115,10,40,28,10.00,172,0.00,18.99,32.55,1,0,52.48,4.56,1.19,32.93,5
         .expect("write child cursor reason fixture");
         let stem = stem.to_string_lossy().to_string();
 
-        let schema = tools_schema(&stem);
+        let schema = tools_schema(&stem, false);
         let names = schema
             .as_array()
             .expect("tool schema array")
@@ -5120,6 +5299,17 @@ LPAR,T0001,9.115,10,40,28,10.00,172,0.00,18.99,32.55,1,0,52.48,4.56,1.19,32.93,5
             .collect::<HashSet<_>>();
         assert!(names.contains("list_available_child_cursor_reasons"));
         assert!(names.contains("get_child_cursor_reasons"));
+
+        let nmon_schema = tools_schema(&stem, true);
+        let nmon_names = nmon_schema
+            .as_array()
+            .expect("tool schema array")
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<HashSet<_>>();
+        assert!(nmon_names.contains("get_host_configuration"));
+        assert!(nmon_names.contains("get_host_metric_time_series"));
+        assert!(nmon_names.contains("get_nmon_disk_validation"));
 
         let listed = tool_list_available_child_cursor_reasons(&json!({}), &stem);
         assert_eq!(listed["total_matches"], 1);

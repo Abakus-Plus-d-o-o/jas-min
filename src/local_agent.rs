@@ -6,12 +6,12 @@ use crate::tools::estimate_tokens_from_str;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, fs};
 
-const LOCAL_AGENT_SCHEMA_VERSION: &str = "2026-08-23.4";
+const LOCAL_AGENT_SCHEMA_VERSION: &str = "2026-09-13.3";
 const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 16 * 1024;
 const DEFAULT_CONTEXT_HIGH_WATER_PCT: usize = 72;
 const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 3_072;
@@ -735,7 +735,11 @@ pub async fn analyze_report_local_agent(
     let seed = build_case_seed(report);
     let guidance_library = GuidanceLibrary::load();
     let guidance_catalog = guidance_library.prompt_notice();
-    let tools = local_tools_schema(&stem, guidance_library.is_available());
+    let tools = local_tools_schema(
+        &stem,
+        guidance_library.is_available(),
+        collection.nmon.is_some(),
+    );
     let preflight_client = LocalChatClient::new(cfg.clone());
     debug_note!(
         "Starting local agent analysis: report='{}', model='{}', language='{}', snapshots={}, configured_context={}, max_tool_iterations={}",
@@ -1738,6 +1742,9 @@ pub(crate) fn build_case_seed(report: &ReportForAI) -> Value {
         "performance_peaks": spikes,
         "performance_peaks_total": report.top_spikes_marked.len(),
         "db_time_degradation": compact_degradation(report),
+        "db_load_source_policy": crate::measurements::DB_LOAD_SOURCE_POLICY,
+        "db_load_sources": report.db_load_sources,
+        "performance_hints": crate::performance_hints::index(report.performance_hints.as_ref()),
         "gradients": {
             "db_time_foreground_wait_events": compact_gradient(report.db_time_gradient_fg_wait_events.as_ref()),
             "db_time_instance_stats_counters": compact_gradient(report.db_time_gradient_instance_stats_counters.as_ref()),
@@ -1782,12 +1789,93 @@ fn compact_gradient(section: Option<&DbTimeGradientSection>) -> Value {
 /// which silently capped model rankings at three rows and triangulation at four
 /// rows regardless of the caller's `limit` argument.
 fn detailed_gradient(section: Option<&DbTimeGradientSection>, limit: usize) -> Value {
+    detailed_gradient_query(section, limit, &json!({}))
+}
+
+fn detailed_gradient_query(
+    section: Option<&DbTimeGradientSection>,
+    limit: usize,
+    args: &Value,
+) -> Value {
     let Some(section) = section else {
         return Value::Null;
     };
     let limited = |count: usize| count.min(limit);
+    let contributor = args["contributor"].as_str();
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let metric = args["ranking"].as_str().unwrap_or("selection");
+    let mut full = serde_json::Map::new();
+    let mut pages = serde_json::Map::new();
+    for (model, rows) in &section.model_rankings {
+        let mut rows: Vec<_> = rows
+            .iter()
+            .filter(|r| contributor.is_none_or(|name| r.event_name == name))
+            .collect();
+        if metric != "selection" {
+            let value = |r: &&crate::reasonings::GradientTopItem| match metric {
+                "active" => r.impact_active,
+                "peak" => r.impact_peak,
+                "extreme" => r.impact_extreme,
+                _ => 0.0,
+            };
+            rows.sort_by(|a, b| {
+                (b.gradient_coef > 0.0)
+                    .cmp(&(a.gradient_coef > 0.0))
+                    .then(value(b).total_cmp(&value(a)))
+                    .then(a.event_name.cmp(&b.event_name))
+            });
+        }
+        let total = rows.len();
+        let page: Vec<_> = rows.into_iter().skip(offset).take(limit).collect();
+        pages.insert(model.clone(), json!({"total": total, "offset": offset, "returned": page.len(), "next_offset": if offset.saturating_add(page.len()) < total { Some(offset + page.len()) } else { None }}));
+        full.insert(model.clone(), json!(page));
+    }
+    let mut coverage: Vec<_> = section
+        .predictor_coverage
+        .iter()
+        .filter(|r| contributor.is_none_or(|name| r.event_name == name))
+        .collect();
+    if contributor.is_none() {
+        // Match the displayed ranking page; coverage must not be an unrelated alphabetic slice.
+        let names: HashSet<_> = full
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|r| r["event_name"].as_str())
+            .collect();
+        coverage.retain(|r| names.contains(r.event_name.as_str()));
+    }
+    let mut cross: Vec<_> = section
+        .cross_model_classifications
+        .iter()
+        .filter(|r| contributor.is_none_or(|name| r.event_name == name))
+        .collect();
+    if metric == "peak" {
+        cross.sort_by(|a, b| {
+            b.combined_peak_impact
+                .total_cmp(&a.combined_peak_impact)
+                .then(a.event_name.cmp(&b.event_name))
+        });
+    }
+    let top_page = |rows: &Vec<crate::reasonings::GradientTopItem>| {
+        rows.iter()
+            .filter(|r| contributor.is_none_or(|name| r.event_name == name))
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let ridge = top_page(&section.ridge_top);
+    let en = top_page(&section.elastic_net_top);
+    let huber = top_page(&section.huber_top);
+    let q95 = top_page(&section.quantile95_top);
     json!({
         "settings": section.settings,
+        "full_rankings_available": !section.model_rankings.is_empty(),
+        "ranking": metric,
+        "contributor": contributor,
+        "model_rankings": full,
+        "ranking_pages": pages,
+        "predictor_coverage": coverage,
         "counts": {
             "cross_model_classifications": section.cross_model_classifications.len(),
             "vif_diagnostics": section.vif_diagnostics.len(),
@@ -1798,68 +1886,76 @@ fn detailed_gradient(section: Option<&DbTimeGradientSection>, limit: usize) -> V
             "quantile95": section.quantile95_top.len()
         },
         "returned": {
-            "cross_model_classifications": limited(section.cross_model_classifications.len()),
+            "cross_model_classifications": limited(cross.len()),
             "vif_diagnostics": limited(section.vif_diagnostics.len()),
             "collinear_group_impacts": limited(section.collinear_group_impacts.len()),
-            "ridge": limited(section.ridge_top.len()),
-            "elastic_net": limited(section.elastic_net_top.len()),
-            "huber": limited(section.huber_top.len()),
-            "quantile95": limited(section.quantile95_top.len())
+            "ridge": ridge.len(),
+            "elastic_net": en.len(),
+            "huber": huber.len(),
+            "quantile95": q95.len()
         },
-        "cross_model_classifications": section.cross_model_classifications.iter().take(limit).collect::<Vec<_>>(),
+        "cross_model_classifications": cross.into_iter().take(limit).collect::<Vec<_>>(),
         "vif_diagnostics": section.vif_diagnostics.iter().take(limit).collect::<Vec<_>>(),
         "collinear_group_impacts": section.collinear_group_impacts.iter().take(limit).collect::<Vec<_>>(),
-        "ridge_top": section.ridge_top.iter().take(limit).collect::<Vec<_>>(),
-        "elastic_net_top": section.elastic_net_top.iter().take(limit).collect::<Vec<_>>(),
-        "huber_top": section.huber_top.iter().take(limit).collect::<Vec<_>>(),
-        "quantile95_top": section.quantile95_top.iter().take(limit).collect::<Vec<_>>()
+        "ridge_top": ridge,
+        "elastic_net_top": en,
+        "huber_top": huber,
+        "quantile95_top": q95
     })
 }
 
-fn detailed_gradients(report: &ReportForAI, limit: usize) -> Value {
-    json!({
-        "db_time_foreground_wait_events": detailed_gradient(report.db_time_gradient_fg_wait_events.as_ref(), limit),
-        "db_time_instance_stats_counters": detailed_gradient(report.db_time_gradient_instance_stats_counters.as_ref(), limit),
-        "db_time_instance_stats_volumes": detailed_gradient(report.db_time_gradient_instance_stats_volumes.as_ref(), limit),
-        "db_time_instance_stats_time": detailed_gradient(report.db_time_gradient_instance_stats_time.as_ref(), limit),
-        "db_time_sql_elapsed_time": detailed_gradient(report.db_time_gradient_sql_elapsed_time.as_ref(), limit),
-        "db_cpu_instance_stats": detailed_gradient(report.db_cpu_gradient_instance_stats.as_ref(), limit),
-        "db_cpu_sql_cpu_time": detailed_gradient(report.db_cpu_gradient_sql_cpu_time.as_ref(), limit),
-        "custom_wait_events": detailed_gradient(report.custom_gradient_wait_events.as_ref(), limit),
-        "custom_instance_stats": detailed_gradient(report.custom_gradient_instance_stats.as_ref(), limit)
-    })
+fn detailed_gradients(report: &ReportForAI, limit: usize, args: &Value) -> Value {
+    let mut value = json!({
+        "db_time_foreground_wait_events": detailed_gradient_query(report.db_time_gradient_fg_wait_events.as_ref(), limit, args),
+        "db_time_instance_stats_counters": detailed_gradient_query(report.db_time_gradient_instance_stats_counters.as_ref(), limit, args),
+        "db_time_instance_stats_volumes": detailed_gradient_query(report.db_time_gradient_instance_stats_volumes.as_ref(), limit, args),
+        "db_time_instance_stats_time": detailed_gradient_query(report.db_time_gradient_instance_stats_time.as_ref(), limit, args),
+        "db_time_sql_elapsed_time": detailed_gradient_query(report.db_time_gradient_sql_elapsed_time.as_ref(), limit, args),
+        "db_cpu_instance_stats": detailed_gradient_query(report.db_cpu_gradient_instance_stats.as_ref(), limit, args),
+        "db_cpu_sql_cpu_time": detailed_gradient_query(report.db_cpu_gradient_sql_cpu_time.as_ref(), limit, args),
+        "custom_wait_events": detailed_gradient_query(report.custom_gradient_wait_events.as_ref(), limit, args),
+        "custom_instance_stats": detailed_gradient_query(report.custom_gradient_instance_stats.as_ref(), limit, args)
+    });
+    if let Some(family) = args["family"].as_str() {
+        value
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key == family);
+    }
+    value
 }
 
 fn compact_degradation(report: &ReportForAI) -> Value {
+    degradation_query(report, &json!({"limit":3}))
+}
+
+fn degradation_query(report: &ReportForAI, args: &Value) -> Value {
     let Some(degradation) = report.db_time_degradation_report.as_ref() else {
         return Value::Null;
     };
-    json!({
-        "is_degradation_detected": degradation.is_degradation_detected,
-        "verdict": degradation.verdict,
-        "baseline_start": degradation.baseline_start,
-        "baseline_end": degradation.baseline_end,
-        "degraded_start": degradation.degraded_start,
-        "degraded_end": degradation.degraded_end,
-        "baseline_samples": degradation.baseline_samples,
-        "degraded_samples": degradation.degraded_samples,
-        "db_time_baseline_avg": degradation.db_time_baseline_avg,
-        "db_time_degraded_avg": degradation.db_time_degraded_avg,
-        "db_time_delta_avg": degradation.db_time_delta_avg,
-        "db_time_delta_pct": degradation.db_time_delta_pct,
-        "db_time_robust_z_score": degradation.db_time_robust_z_score,
-        "db_cpu_baseline_avg": degradation.db_cpu_baseline_avg,
-        "db_cpu_degraded_avg": degradation.db_cpu_degraded_avg,
-        "db_cpu_delta_avg": degradation.db_cpu_delta_avg,
-        "db_cpu_delta_pct": degradation.db_cpu_delta_pct,
-        "dominant_domains": degradation.dominant_domains,
-        "findings_total": degradation.findings.len(),
-        "findings": degradation.findings.iter().take(10).collect::<Vec<_>>()
-    })
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let mut groups: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+    for finding in &degradation.findings {
+        if args["domain"].as_str().is_none_or(|d| d == finding.domain) {
+            groups.entry(&finding.domain).or_default().push(finding);
+        }
+    }
+    let counts: BTreeMap<_, _> = groups.iter().map(|(k, v)| (*k, v.len())).collect();
+    let rows: Vec<_> = groups
+        .values()
+        .flat_map(|rows| rows.iter().skip(offset).take(limit).copied())
+        .collect();
+    let mut value = serde_json::to_value(degradation).unwrap();
+    value["findings"] = json!(rows);
+    value["findings_total"] = json!(degradation.findings.len());
+    value["domain_counts"] = json!(counts);
+    value["pagination"] = json!({"limit_per_domain":limit,"offset_per_domain":offset});
+    value
 }
 
-fn local_tools_schema(stem: &str, guidance_available: bool) -> Value {
-    let mut schema = tools_schema(stem);
+fn local_tools_schema(stem: &str, guidance_available: bool, include_nmon: bool) -> Value {
+    let mut schema = tools_schema(stem, include_nmon);
     if let Some(tools) = schema.as_array_mut() {
         tools.push(json!({
             "type": "function",
@@ -1876,12 +1972,20 @@ fn local_tools_schema(stem: &str, guidance_available: bool) -> Value {
                                 "io_summary", "latches", "segment_hotspots",
                                 "instance_stat_correlations", "load_profile_anomalies",
                                 "anomaly_clusters", "initialization_parameters",
-                                "full_gradients", "db_time_degradation", "performance_peaks"
+                                "full_gradients", "db_time_degradation", "performance_peaks", "performance_hints"
                             ]
                         },
+                        "family": {"type": "string", "description": "full_gradients only: exact family key, e.g. db_time_sql_elapsed_time"},
+                        "rule_id": {"type":"string","description":"performance_hints only: exact rule filter"},
+                        "hint_id": {"type":"string","description":"performance_hints only: exact episode filter"},
+                        "scope": {"type":"string","description":"performance_hints only: exact assessment scope, e.g. sql:gn3gtqxvucbj8 or instance"},
+                        "domain": {"type":"string","description":"db_time_degradation only: exact domain filter; limit and offset apply per domain"},
+                        "contributor": {"type": "string", "description": "full_gradients only: exact SQL_ID/event/statistic lookup across full fitted rankings"},
+                        "ranking": {"type": "string", "enum": ["selection", "active", "peak", "extreme"]},
+                        "offset": {"type": "integer", "minimum": 0},
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum top-level rows, default 20, max 100"
+                            "description": "Maximum rows per list, default 20, max 100"
                         }
                     },
                     "required": ["section"]
@@ -2050,8 +2154,23 @@ pub(crate) fn dispatch_precomputed_analysis(args: &Value, report: &ReportForAI) 
                 .take(limit)
                 .collect::<HashMap<_, _>>())
         }
-        "full_gradients" => detailed_gradients(report, limit),
-        "db_time_degradation" => compact_degradation(report),
+        "full_gradients" => {
+            if args["ranking"]
+                .as_str()
+                .is_some_and(|r| !["selection", "active", "peak", "extreme"].contains(&r))
+            {
+                return json!({"error": "unknown gradient ranking"});
+            }
+            let result = detailed_gradients(report, limit, args);
+            if result.as_object().is_some_and(|o| o.is_empty()) {
+                return json!({"error": "unknown gradient family"});
+            }
+            result
+        }
+        "db_time_degradation" => degradation_query(report, args),
+        "performance_hints" => {
+            crate::performance_hints::query(report.performance_hints.as_ref(), args)
+        }
         "performance_peaks" => json!(report
             .top_spikes_marked
             .iter()
@@ -2073,10 +2192,14 @@ pub(crate) fn dispatch_precomputed_analysis(args: &Value, report: &ReportForAI) 
 }
 
 fn investigator_system_prompt(language: &str, guidance_catalog: &str) -> String {
+    let access_path_reasoning = crate::reasonings::ACCESS_PATH_REASONING;
     format!(
         r#"You are JAS-MIN Investigator, an expert Oracle Database performance diagnostician.
 
 You receive only a compact, high-signal seed: gradient analyses, DB Time degradation and DB CPU/DB Time ratios for performance peaks. Detailed AWR/STATSPACK evidence is available through read-only tools.
+
+SCAN / ROW-CONTINUATION REASONING:
+{access_path_reasoning}
 
 DIAGNOSTIC GUIDANCE AVAILABILITY:
 {guidance_catalog}
@@ -2111,10 +2234,14 @@ Every important claim must cite evidence_id values and include exact supporting 
 }
 
 fn reviewer_system_prompt(language: &str, guidance_catalog: &str) -> String {
+    let access_path_reasoning = crate::reasonings::ACCESS_PATH_REASONING;
     format!(
         r#"You are JAS-MIN Reviewer, a skeptical senior Oracle performance engineer.
 
 You receive the original compact seed and a structured checkpoint from another investigation session. Do not merely rewrite or endorse it. Try to falsify every material conclusion, search for alternative explanations, verify temporal alignment, and obtain fresh evidence through tools. Re-query important evidence because the prior raw conversation is intentionally unavailable.
+
+SCAN / ROW-CONTINUATION REASONING:
+{access_path_reasoning}
 
 DIAGNOSTIC GUIDANCE AVAILABILITY:
 {guidance_catalog}
@@ -2586,7 +2713,7 @@ mod tests {
 
     #[test]
     fn tool_catalog_expands_by_investigation_round() {
-        let full = local_tools_schema("test", true);
+        let full = local_tools_schema("test", true, false);
         let triage = tools_for_round(&full, 0);
         let investigation = tools_for_round(&full, 1);
         assert!(triage.as_array().unwrap().len() < investigation.as_array().unwrap().len());
@@ -2701,8 +2828,8 @@ TRIGGER: user logons and connection creation spike.
 
     #[test]
     fn guidance_tool_is_only_advertised_when_library_exists() {
-        let with_guidance = local_tools_schema("test", true);
-        let without_guidance = local_tools_schema("test", false);
+        let with_guidance = local_tools_schema("test", true, false);
+        let without_guidance = local_tools_schema("test", false, false);
         let has_tool = |schema: &Value| {
             schema.as_array().is_some_and(|tools| {
                 tools.iter().any(|tool| {
@@ -2726,6 +2853,7 @@ TRIGGER: user logons and connection creation spike.
             initialization_parameters: HashMap::new(),
             awrs: Vec::new(),
             sql_text: HashMap::new(),
+            nmon: None,
         };
         let mut store = EvidenceStore::default();
         let output = store.execute(
@@ -2754,6 +2882,7 @@ TRIGGER: user logons and connection creation spike.
             initialization_parameters: HashMap::new(),
             awrs: Vec::new(),
             sql_text: HashMap::new(),
+            nmon: None,
         };
         let mut store = EvidenceStore::default();
         let first = store.execute(
@@ -2830,6 +2959,7 @@ TRIGGER: user logons and connection creation spike.
             )]),
             awrs: Vec::new(),
             sql_text: HashMap::new(),
+            nmon: None,
         };
         let mut store = EvidenceStore::default();
         store.records.push(EvidenceRecord {
@@ -2901,6 +3031,7 @@ TRIGGER: user logons and connection creation spike.
             )]),
             awrs: Vec::new(),
             sql_text: HashMap::from([("abc".to_string(), "select 1".to_string())]),
+            nmon: None,
         };
         let coverage = build_coverage_summary(1, &EvidenceStore::default(), &collection);
         assert_eq!(
@@ -2935,6 +3066,121 @@ TRIGGER: user logons and connection creation spike.
         assert_eq!(checkpoint["claims"][0]["guidance_refs"][0], "S1-G0001");
         assert_eq!(checkpoint["consulted_guidance_refs"][0], "S1-G0001");
         assert_eq!(checkpoint["raw_model_checkpoint_prefix"], "{\"claims\":[");
+    }
+
+    #[test]
+    fn full_gradient_query_can_find_unselected_coefficients_and_page_peak_ranks() {
+        use crate::reasonings::{DbTimeGradientSection, GradientTopItem};
+        let rows = vec![
+            GradientTopItem {
+                event_name: "steady".into(),
+                gradient_coef: 1.0,
+                impact_active: 50.0,
+                impact_peak: 10.0,
+                ..Default::default()
+            },
+            GradientTopItem {
+                event_name: "rare".into(),
+                gradient_coef: 2.0,
+                impact_active: 0.0,
+                impact_peak: 60.0,
+                ..Default::default()
+            },
+            GradientTopItem {
+                event_name: "zero".into(),
+                gradient_coef: 0.0,
+                ..Default::default()
+            },
+        ];
+        let section = DbTimeGradientSection {
+            ridge_top: vec![rows[0].clone()],
+            model_rankings: std::collections::BTreeMap::from([("ridge".into(), rows)]),
+            ..Default::default()
+        };
+        let report = ReportForAI {
+            db_time_gradient_sql_elapsed_time: Some(section),
+            ..Default::default()
+        };
+        let run = |args| dispatch_precomputed_analysis(&args, &report);
+        let exact = run(
+            json!({"section":"full_gradients", "family":"db_time_sql_elapsed_time", "contributor":"zero", "limit":1}),
+        );
+        let data = &exact["data"]["db_time_sql_elapsed_time"];
+        assert_eq!(data["model_rankings"]["ridge"][0]["gradient_coef"], 0.0);
+        assert_eq!(data["ranking_pages"]["ridge"]["total"], 1);
+        assert_eq!(exact["data"].as_object().unwrap().len(), 1);
+        let peak = run(
+            json!({"section":"full_gradients", "family":"db_time_sql_elapsed_time", "ranking":"peak", "limit":1}),
+        );
+        assert_eq!(
+            peak["data"]["db_time_sql_elapsed_time"]["model_rankings"]["ridge"][0]["event_name"],
+            "rare"
+        );
+        assert_eq!(
+            peak["data"]["db_time_sql_elapsed_time"]["ranking_pages"]["ridge"]["next_offset"],
+            1
+        );
+        let next = run(
+            json!({"section":"full_gradients", "family":"db_time_sql_elapsed_time", "ranking":"peak", "limit":1,"offset":1}),
+        );
+        assert_eq!(
+            next["data"]["db_time_sql_elapsed_time"]["model_rankings"]["ridge"][0]["event_name"],
+            "steady"
+        );
+        let absent = run(
+            json!({"section":"full_gradients", "family":"db_time_sql_elapsed_time", "contributor":"absent"}),
+        );
+        assert_eq!(
+            absent["data"]["db_time_sql_elapsed_time"]["ranking_pages"]["ridge"]["total"],
+            0
+        );
+    }
+
+    #[test]
+    fn degradation_pagination_keeps_independent_domains() {
+        let mut report = ReportForAI::default();
+        let findings = ["Foreground wait events", "Instance statistics"]
+            .into_iter()
+            .flat_map(|domain| {
+                (0..12).map(move |i| crate::reasonings::DbTimeDegradationFinding {
+                    domain: domain.into(),
+                    name: format!("metric_{i}"),
+                    domain_rank: i + 1,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        report.db_time_degradation_report = Some(crate::reasonings::DbTimeDegradationReport {
+            findings,
+            ..Default::default()
+        });
+        let result = dispatch_precomputed_analysis(
+            &json!({"section":"db_time_degradation","limit":2,"offset":1}),
+            &report,
+        );
+        let rows = result["data"]["findings"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["name"], "metric_1");
+        assert_eq!(rows[2]["domain"], "Instance statistics");
+    }
+
+    #[test]
+    fn both_local_sessions_reason_from_existing_signals_without_extra_report() {
+        let policy = crate::reasonings::ACCESS_PATH_REASONING;
+        assert!(investigator_system_prompt("EN", "unavailable").contains(policy));
+        assert!(reviewer_system_prompt("EN", "unavailable").contains(policy));
+        let seed = build_case_seed(&ReportForAI::default());
+        assert!(seed.get("access_path_diagnostics").is_none());
+        assert!(seed.get("gradients").is_some());
+        assert!(seed.get("db_time_degradation").is_some());
+        let schema = local_tools_schema("unused", false, false);
+        let precomputed = schema
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["function"]["name"] == "get_precomputed_analysis")
+            .unwrap();
+        assert!(!precomputed.to_string().contains("access_path_diagnostics"));
     }
 
     #[test]

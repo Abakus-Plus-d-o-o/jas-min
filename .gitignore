@@ -11,6 +11,11 @@
 *.sln.docstates
 *.txt 
 *.html
+# Approved generic measurements in the standalone educational course.
+!/docs/one-more-query/index.html
+!/docs/one-more-query/src/template.html
+/docs/one-more-query/dist/
+!/tests/fixtures/empty_calories/segment_scope.html
 *.pyc
 *.swp
 .rustc_info.json

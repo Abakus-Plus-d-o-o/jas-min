@@ -8,6 +8,7 @@ intentionally uses only Python standard library modules.
 """
 
 import argparse
+import hashlib
 import os
 import platform
 import re
@@ -15,27 +16,49 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 import json
+import math
 from pathlib import Path
 
 
+# Version the standalone collector independently from the Rust application.
+COLLECTOR_VERSION = "0.1.15"
+COLLECTOR_NAME = "jas-min-collector"
+
 DATE_FORMAT = "%Y-%m-%d %H:%M"
-DATE_FORMAT_LABEL = "YYYY-MM-DD HH24:MI"
+SNAPSHOT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+DATE_FORMAT_LABEL = "YYYY-MM-DD HH24:MI[:SS]"
 NLS_LANG = "AMERICAN_AMERICA.AL32UTF8"
-STATSPACK_MIN_INTERVAL_MINUTES = 30
 PACKAGE_REPORTS = "reports"
 PACKAGE_JSON = "json"
 PACKAGE_BOTH = "both"
 SQL_ID_RE = re.compile(r"^[A-Za-z0-9]{1,30}$")
+ORACLE_SQL_ID_RE = re.compile(r"^[0-9a-z]{13}$", re.IGNORECASE)
 SHARED_CURSOR_REASON_SUFFIX = ".shared_cursor_reasons"
+DEFAULT_XPLAN_TIMEOUT_SECONDS = 120
 
 
 class CollectorError(Exception):
     """Expected runtime error shown without a traceback."""
+
+
+def collector_identity():
+    """Identify the release and the exact script copied to the Oracle host."""
+    # Hash the script itself; this also identifies locally modified copies.
+    try:
+        script_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise CollectorError("Could not identify collector script: {}".format(exc))
+    return {
+        "name": COLLECTOR_NAME,
+        "version": COLLECTOR_VERSION,
+        "script_sha256": script_hash,
+    }
 
 
 def tail(text, limit=4000):
@@ -45,10 +68,13 @@ def tail(text, limit=4000):
 
 
 def parse_datetime(value):
-    try:
-        return datetime.strptime(value, DATE_FORMAT)
-    except ValueError:
-        raise CollectorError("Invalid date format. Expected: {}".format(DATE_FORMAT_LABEL))
+    # Accept existing minute inputs and exact snapshot boundaries copied from the menu.
+    for date_format in (DATE_FORMAT, SNAPSHOT_DATE_FORMAT):
+        try:
+            return datetime.strptime(value, date_format)
+        except ValueError:
+            continue
+    raise CollectorError("Invalid date format. Expected: {}".format(DATE_FORMAT_LABEL))
 
 
 def parse_datetime_arg(value):
@@ -59,7 +85,8 @@ def parse_datetime_arg(value):
 
 
 def datetime_sql(value):
-    return value.strftime(DATE_FORMAT)
+    # Preserve seconds when present, while keeping existing minute labels familiar.
+    return value.strftime(SNAPSHOT_DATE_FORMAT if value.second else DATE_FORMAT)
 
 
 def ask_report_type():
@@ -273,6 +300,11 @@ def is_valid_sql_id(value):
     return bool(SQL_ID_RE.match(sql_id))
 
 
+def is_oracle_sql_id(value):
+    """Recognize the fixed-width SQL identifier emitted by Oracle reports."""
+    return bool(ORACLE_SQL_ID_RE.fullmatch(normalize_sql_id(value)))
+
+
 def parse_sql_id_list(value):
     sql_ids = []
     rejected = []
@@ -357,6 +389,16 @@ def parse_security_level_arg(value):
     return level
 
 
+def parse_positive_int_arg(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("Expected a positive integer.")
+    if number <= 0:
+        raise argparse.ArgumentTypeError("Expected a positive integer.")
+    return number
+
+
 def build_arg_parser():
     examples = """examples:
   python3 jas-min-collector.py --report-type awr --start "2026-06-14 00:00" --end "2026-06-15 14:00"
@@ -368,6 +410,11 @@ def build_arg_parser():
         description="Collect Oracle AWR or Statspack reports and package them for JAS-MIN.",
         epilog=examples,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # argparse exits here, so identifying the version needs no Oracle connection.
+    parser.add_argument(
+        "--version", action="version",
+        version="{} {}".format(COLLECTOR_NAME, COLLECTOR_VERSION),
     )
     parser.add_argument(
         "-t",
@@ -432,6 +479,14 @@ def build_arg_parser():
         help="additional SQL_IDs for execution-plan collection; may be repeated",
     )
     parser.add_argument(
+        "--execution-plan-timeout",
+        dest="execution_plan_timeout",
+        metavar="SECONDS",
+        type=parse_positive_int_arg,
+        default=DEFAULT_XPLAN_TIMEOUT_SECONDS,
+        help="maximum time for cursor discovery or one execution plan (default: %(default)s seconds)",
+    )
+    parser.add_argument(
         "-p",
         "--package-content",
         "--package-mode",
@@ -468,6 +523,10 @@ def build_arg_parser():
         metavar="DIR",
         type=parse_existing_dir_arg,
         help="directory containing prepared operating system statistics files",
+    )
+    parser.add_argument(
+        "--access-path-evidence", type=Path, metavar="JSON",
+        help="merge scoped SQL/segment evidence into collected JSON; exact DB/instance/window match required; requires security level 2",
     )
     return parser
 
@@ -523,17 +582,31 @@ def require_oracle_context():
     }
 
 
-def run_sqlplus(ctx, script, cwd=None, check_output_errors=True):
+def run_sqlplus(ctx, script, cwd=None, check_output_errors=True, timeout=None):
     command = [str(ctx["sqlplus"]), "-S", "/ as sysdba"]
-    proc = subprocess.run(
-        command,
-        input=script,
-        universal_newlines=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(cwd) if cwd else None,
-        env=ctx["env"],
-    )
+    try:
+        proc = subprocess.run(
+            command,
+            input=script,
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd) if cwd else None,
+            env=ctx["env"],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output_parts = []
+        for value in (exc.stdout, exc.stderr):
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            if value:
+                output_parts.append(value)
+        output = "".join(output_parts)
+        detail = "\n{}".format(tail(output).strip()) if output.strip() else ""
+        raise CollectorError(
+            "sqlplus timed out after {} second(s){}".format(timeout, detail)
+        )
     output = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         raise CollectorError("sqlplus failed:\n{}".format(tail(output).strip()))
@@ -658,22 +731,189 @@ def infer_sql_type(sql_text):
     return "SELECT"
 
 
-IDLE_EVENTS = set([
-    "SQL*Net message from client",
-    "SQL*Net message to client",
-    "rdbms ipc message",
-    "pmon timer",
-    "smon timer",
+# Keep this catalog aligned with src/staticdata.rs so collector JSON and
+# jas-min -d classify foreground/background waits the same way.
+IDLE_EVENT_PREFIXES = (
+    "cached session",
     "VKTM Logical Idle Wait",
+    "VKTM Init Wait for GSGA",
+    "IORM Scheduler Slave Idle Wait",
+    "rdbms ipc message",
+    "i/o slave wait",
+    "OFS Receive Queue",
+    "OFS idle",
+    "Generic Process Pool Dispatcher: idle",
+    "Generic Process Pool Worker: sleep",
+    "VKRM Idle",
+    "wait for unread message on broadcast channel",
+    "wait for unread message on multiple broadcast channels",
     "class slave wait",
+    "idle class spare wait event 1",
+    "idle class spare wait event 2",
+    "idle class spare wait event 3",
+    "idle class spare wait event 4",
+    "idle class spare wait event 5",
+    "idle class spare wait event 6",
+    "idle class spare wait event 7",
+    "idle class spare wait event 8",
+    "idle class spare wait event 9",
+    "idle class spare wait event 10",
+    "RMA: IPC0 completion sync",
+    "PING",
+    "spawn request deferred",
+    "watchdog main loop",
+    "process in prespawned state",
+    "pmon timer",
+    "pman timer",
+    "DNFS disp IO slave idle",
+    "NVM disp IO slave idle",
+    "BRDG: bridge controller idle",
+    "Network Retrans by Server",
+    "Network Retrans by Client",
+    "Distributed Trace: Archival Worker Idle",
+    "DIAG idle wait",
+    "ges remote message",
+    "SCM slave idle",
+    "LMS CR slave timer",
+    "gcs remote message",
+    "gcs yield cpu",
+    "heartbeat monitor sleep",
+    "GCR sleep",
+    "Shutdown completion due to error",
+    "SGA: MMAN sleep for component shrink",
+    "DBWR timer",
+    "Data Guard: Gap Manager",
+    "Data Guard: controlfile update",
+    "MRP redo arrival",
+    "Data Guard: Timer",
+    "LNS ASYNC archive log",
+    "LNS ASYNC dest activation",
+    "LNS ASYNC end of log",
+    "Archiver: redo logs",
+    "simulated log write delay",
+    "heartbeat redo informer",
+    "LGWR real time apply sync",
+    "LGWR worker group idle",
+    "parallel recovery slave idle wait",
+    "Backup Appliance waiting for work",
+    "Backup Appliance waiting restore start",
+    "Backup Appliance Surrogate wait",
+    "Backup Appliance Servlet wait",
+    "Backup Appliance Comm SGA setup wait",
+    "LogMiner builder: idle",
+    "LogMiner builder: branch",
+    "LogMiner preparer: idle",
+    "LogMiner reader: log (idle)",
+    "LogMiner reader: redo (idle)",
+    "LogMiner merger: idle",
+    "LogMiner client: transaction",
+    "LogMiner: other",
+    "LogMiner: activate",
+    "LogMiner: reset",
+    "LogMiner: find session",
+    "LogMiner: internal",
+    "Logical Standby Apply Delay",
+    "parallel recovery coordinator waits for slave cleanup",
+    "parallel recovery coordinator idle wait",
+    "parallel recovery control message reply",
+    "parallel recovery slave next change",
+    "nologging fetch slave idle",
+    "recovery sender idle",
+    "recovery receiver idle",
+    "recovery coordinator idle",
+    "recovery logmerger idle",
+    "block compare coord process idle",
+    "Data Guard PDB query SCN service idle",
+    "True Cache: background process idle",
+    "PX Deq: Txn Recovery Start",
+    "PX Deq: Txn Recovery Reply",
+    "fbar timer",
+    "smon timer",
+    "PX Deq: Metadata Update",
     "Space Manager: slave idle wait",
+    "PX Deq: Index Merge Reply",
+    "PX Deq: Index Merge Execute",
+    "PX Deq: Index Merge Close",
+    "PX Deq: kdcph_mai",
+    "PX Deq: kdcphc_ack",
+    "imco timer",
+    "IMFS defer writes scheduler",
+    "memoptimize write drain idle",
+    "MLE sleep",
+    "virtual circuit next request",
+    "shared server idle wait",
+    "dispatcher timer",
+    "cmon timer",
+    "pool server timer",
+    "lreg timer",
+    "JOX Jit Process Sleep",
+    "jobq slave wait",
+    "pipe get",
+    "PX Deque wait",
+    "PX Idle Wait",
+    "PX Deq Credit: need buffer",
+    "PX Deq Credit: send blkd",
+    "PX Deq: Msg Fragment",
+    "PX Deq: Parse Reply",
+    "PX Deq: Execute Reply",
+    "PX Deq: Execution Msg",
+    "PX Deq: Table Q Normal",
+    "PX Deq: Table Q Sample",
+    "REPL Apply: txns",
+    "REPL Capture/Apply: messages",
+    "REPL Capture: archive log",
+    "single-task message",
+    "SQL*Net message from client",
+    "SQL*Net vector message from client",
+    "SQL*Net vector message from dblink",
+    "PL/SQL lock timer",
+    "Streams AQ: emn coordinator idle wait",
+    "EMON slave idle wait",
+    "Emon coordinator main loop",
+    "Emon slave main loop",
     "Streams AQ: waiting for messages in the queue",
+    "Streams AQ: waiting for time management or cleanup tasks",
+    "Streams AQ: delete acknowledged messages",
+    "Streams AQ: deallocate messages from Streams Pool",
     "Streams AQ: qmn coordinator idle wait",
-])
+    "Streams AQ: qmn slave idle wait",
+    "AQ: 12c message cache init wait",
+    "AQ Cross Master idle",
+    "AQPC idle",
+    "Streams AQ: load balancer idle",
+    "Sharded  Queues : Part Maintenance idle",
+    "Sharded  Queues : Part Truncate idle",
+    "REPL Capture/Apply: RAC AQ qmn coordinator",
+    "Streams AQ: opt idle",
+    "HS message to agent",
+    "ASM background timer",
+    "ASM cluster membership changes",
+    "AUTO access ASM_CLIENT registration",
+    "iowp msg",
+    "iowp file id",
+    "netp network",
+    "gopp msg",
+    "auto-sqltune: wait graph update",
+    "WCR: replay client notify",
+    "WCR: replay clock",
+    "WCR: replay paused",
+    "JS external job",
+    "cell worker idle",
+    "Multi-Tenant Redo File Server - Flush Header Interval",
+    "Sharding replication",
+    "Consensus service idle",
+    "Blockchain apply clean",
+    "blockchain apply short",
+    "blockchain apply long",
+    "Blockchain reader process idle",
+)
 
 
 def is_idle_event(name):
-    return normalize_cell(name) in IDLE_EVENTS
+    # STATSPACK truncates names to 28 characters, so match the Rust parser's
+    # full-name prefix rule instead of requiring an exact string.
+    event = normalize_cell(name)
+    return any(idle.startswith(event) for idle in IDLE_EVENT_PREFIXES)
 
 
 class AWRHTMLTableParser(HTMLParser):
@@ -769,6 +1009,8 @@ def default_awr(path):
             "end_snap_time": "",
         },
         "status": "OK",
+        "data_availability": {},
+        "access_path_observations": [],
         "load_profile": [],
         "instance_efficiency": [],
         "redo_log": {"stat_name": "", "per_hour": 0.0},
@@ -800,6 +1042,118 @@ def default_awr(path):
         "latch_activity": [],
         "segment_stats": {},
     }
+
+
+def mark_data_availability(awr):
+    """Empty sections remain unknown; legacy numeric placeholders are not measurements."""
+    domains = ("load_profile", "instance_stats", "sql_elapsed_time", "sql_gets",
+               "time_model_stats", "foreground_wait_events", "segment_stats")
+    mask = {key: bool(awr.get(key)) for key in domains}
+    host = awr["host_cpu"]
+    percentages = [host[key] for key in ("pct_user", "pct_system", "pct_wio", "pct_idle")]
+    mask["host_cpu"] = all(0 <= x <= 100 for x in percentages) and 95 <= sum(percentages) <= 105
+    mask["ash"] = bool(awr["top_sql_with_top_events"])
+    mask["access_path_observations"] = bool(awr["access_path_observations"])
+    awr["data_availability"] = mask
+
+
+def evidence_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def validate_evidence_scope(scope):
+    for name in ("dbid", "inst_id", "con_id"):
+        if not evidence_integer(scope.get(name)):
+            raise CollectorError("Invalid scope identity: " + name)
+    for name in ("child_number", "plan_hash_value", "object_id", "data_object_id"):
+        if scope.get(name) is not None and not evidence_integer(scope[name]):
+            raise CollectorError("Invalid optional scope identity: " + name)
+    if not isinstance(scope.get("sql_id"), str) or not SQL_ID_RE.fullmatch(scope["sql_id"]):
+        raise CollectorError("Invalid SQL_ID")
+
+
+def merge_access_path_evidence(json_path, evidence_path):
+    """Validate every window before writing; no ordinal, nearest-time or cross-RAC joins."""
+    try:
+        collection = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+        dbi = collection["db_instance_information"]
+        if evidence["schema_version"] != "2026-09-13.1":
+            raise CollectorError("Unsupported access-path evidence schema_version")
+        if evidence["dbid"] != dbi["db_id"] or evidence["inst_id"] != dbi["instance_num"]:
+            raise CollectorError("Access-path evidence DBID/INST_ID does not match collection")
+        index = {}
+        keys = ("begin_snap_id", "end_snap_id", "begin_snap_time", "end_snap_time")
+        for awr in collection["awrs"]:
+            key = tuple(awr["snap_info"][k] for k in keys)
+            if key in index:
+                raise CollectorError("Ambiguous duplicate collection window")
+            index[key] = awr
+        seen = set()
+        for window in evidence["windows"]:
+            key = tuple(window["snap_info"][k] for k in keys)
+            if key in seen or key not in index:
+                raise CollectorError("Evidence window must match exactly one DB/instance/snapshot/time interval")
+            seen.add(key)
+            awr = index[key]
+            if awr.get("access_path_observations"):
+                raise CollectorError("Refusing to overwrite existing access-path observations")
+            identities = set()
+            for observation in window["observations"]:
+                scope = observation["scope"]
+                validate_evidence_scope(scope)
+                if scope["dbid"] != evidence["dbid"] or scope["inst_id"] != evidence["inst_id"]:
+                    raise CollectorError("Observation identity does not match evidence DBID/INST_ID")
+                identity = tuple(scope.get(k) for k in ("dbid", "inst_id", "con_id", "sql_id", "child_number", "plan_hash_value", "object_id", "data_object_id"))
+                if identity in identities:
+                    raise CollectorError("Duplicate SQL/child/plan/segment observation in one window")
+                identities.add(identity)
+                if not isinstance(scope.get("con_id"), int) or scope["con_id"] < 0 or not SQL_ID_RE.fullmatch(scope["sql_id"]):
+                    raise CollectorError("Invalid SQL/container identity")
+                if not observation["evidence_ref"].strip() or not evidence_integer(observation["executions"]) or observation["executions"] <= 0:
+                    raise CollectorError("Observation requires an evidence reference and positive execution delta")
+                for metric in ("buffer_gets", "elapsed_s", "scan_blocks", "continued_rows"):
+                    value = observation.get(metric)
+                    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0):
+                        raise CollectorError("Invalid or reset delta: " + metric)
+                    if metric in ("scan_blocks", "continued_rows") and value is not None and not evidence_integer(value):
+                        raise CollectorError("Expected integer delta: " + metric)
+                work = observation.get("useful_work")
+                if work is not None:
+                    completed = work.get("completed")
+                    if not work["name"].strip() or not work["unit"].strip() or isinstance(completed, bool) or not isinstance(completed, (int, float)) or not math.isfinite(completed) or completed <= 0:
+                        raise CollectorError("Useful work requires a name, unit and positive measured count")
+                structure = observation.get("structure")
+                if structure is not None:
+                    for field in ("evidence_ref", "observed_at", "method"):
+                        if not isinstance(structure.get(field), str) or not structure[field].strip():
+                            raise CollectorError("Structural evidence requires " + field)
+                    for field in ("blocks_below_hwm", "verified_empty_blocks_below_hwm", "fs4_blocks", "chained_rows"):
+                        if structure.get(field) is not None and not evidence_integer(structure[field]):
+                            raise CollectorError("Structural counts must be nonnegative integers")
+                intervention = observation.get("intervention")
+                if intervention is not None:
+                    validate_evidence_scope(intervention["after_scope"])
+                    for field in ("before_begin_snap_id", "after_begin_snap_id"):
+                        if not evidence_integer(intervention.get(field)):
+                            raise CollectorError("Intervention requires snapshot identity: " + field)
+                    for field in ("same_plan", "same_logical_data", "comparable_cache_and_concurrency", "equivalent_work"):
+                        if not isinstance(intervention.get(field), bool):
+                            raise CollectorError("Intervention controls must be explicit booleans")
+                    for field in ("evidence_ref", "controls_evidence_ref"):
+                        if not isinstance(intervention.get(field), str) or not intervention[field].strip():
+                            raise CollectorError("Intervention requires " + field)
+            awr["access_path_observations"] = window["observations"]
+            mask = window.get("data_availability", {})
+            if any(not isinstance(v, bool) for v in mask.values()):
+                raise CollectorError("Availability masks must contain booleans")
+            awr.setdefault("data_availability", {}).update(mask)
+            awr["data_availability"]["access_path_observations"] = bool(window["observations"])
+        Path(json_path).write_text(json.dumps(collection, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    except CollectorError:
+        raise
+    except (OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise CollectorError("Invalid access-path evidence: {}".format(exc))
 
 
 def merge_db_instance(target, source):
@@ -1003,8 +1357,9 @@ def parse_sql_gets(table):
                 "executions": parse_int(row[1]),
                 "gets_per_exec": parse_float(row[2]),
                 "pct_total": parse_float(row[3]),
-                "pct_cpu": parse_float(row[5]),
-                "pct_io": parse_float(row[6]),
+                # Some AWR releases emit these two percentages with a decimal comma.
+                "pct_cpu": parse_float(row[5].replace(",", ".")),
+                "pct_io": parse_float(row[6].replace(",", ".")),
                 "sql_module": row[8],
             }
     return result
@@ -1061,7 +1416,7 @@ def parse_io_stats(table):
                 "writes_req_s": parse_float(row[5]),
                 "writes_data_s": parse_size_mb(row[6]),
                 "waits_count": parse_count(row[7]),
-                "avg_time": parse_wait_ms(row[8]) if normalize_cell(row[8]) else None,
+                "avg_time": round(parse_wait_ms(row[8]), 6) if normalize_cell(row[8]) else None,
             }
     return result
 
@@ -1128,17 +1483,39 @@ SEGMENT_SUMMARIES = {
 
 def parse_segment_stats(table, stat_name, security_level):
     result = []
+    headers = [normalize_cell(cell).lower() for row in header_rows(table) for cell in row]
+
+    def field(row, names, fallback=None):
+        index = next((headers.index(name) for name in names if name in headers), fallback)
+        return (row[index] or None) if index is not None and index < len(row) else None
+
+    def identifier(value):
+        value = (value or "").replace(",", "")
+        return int(value) if value.isdigit() else None
+
     for row in data_rows(table):
-        if len(row) >= 7:
-            version_modifier = 1 if len(row) == 7 else 0
-            result.append({
-                "obj": parse_int(row[5]) if version_modifier == 0 and len(row) > 5 else 0,
-                "objd": parse_int(row[6]) if version_modifier == 0 and len(row) > 6 else 0,
-                "object_name": row[2] if security_level > 0 and len(row) > 2 else "#",
-                "object_type": row[4] if len(row) > 4 else "",
-                "stat_name": stat_name,
-                "stat_vlalue": parse_float(row[7 - version_modifier]) if len(row) > 7 - version_modifier else 0.0,
-            })
+        if len(row) < 7:
+            continue
+        legacy = len(row) == 7
+        raw_value = field(row, [stat_name.lower()], 5 if legacy else 7)
+        try:
+            value = float((raw_value or "").replace(",", ""))
+        except ValueError:
+            continue
+        if not math.isfinite(value) or value < 0:
+            continue
+        result.append({
+            "owner": field(row, ["owner"]) if security_level > 0 else None,
+            "pdb_name": field(row, ["pdb name", "container name"]) if security_level > 0 else None,
+            "con_id": identifier(field(row, ["con_id", "con id", "container id"])),
+            "subobject_name": field(row, ["subobject name", "subobject"]) if security_level > 0 else None,
+            "obj": identifier(field(row, ["obj#", "object id"], None if legacy else 5)) or 0,
+            "objd": identifier(field(row, ["dataobj#", "data object id"], None if legacy else 6)) or 0,
+            "object_name": (field(row, ["object name"], 2) or "") if security_level > 0 else "#",
+            "object_type": field(row, ["obj. type", "object type"], 4) or "",
+            "stat_name": stat_name,
+            "stat_vlalue": value,
+        })
     return result
 
 
@@ -1174,8 +1551,13 @@ def parse_sql_text(table):
 def parse_initialization_parameters(table):
     result = {}
     for row in data_rows(table):
-        if len(row) >= 2:
-            result[row[0]] = row[1]
+        if len(row) < 2 or not row[0].strip():
+            continue
+        name, value = row[0].strip(), row[1].strip()
+        # Preserve ordered multi-valued rows in the existing string schema.
+        previous = result.setdefault(name, "")
+        if value:
+            result[name] = previous + ", " + value if previous else value
     return result
 
 
@@ -1265,6 +1647,7 @@ def parse_html_report(path, security_level):
         elif summary == "This table displays total number of waits, and information about total wait time, for each wait event":
             apply_wait_histogram(awr, parse_wait_histogram(table))
 
+    mark_data_availability(awr)
     return awr, sql_text, parameters, db_instance
 
 
@@ -1295,10 +1678,16 @@ def parse_text_snap_info(path, lines):
             nums = re.findall(r"\d+", line)
             if nums:
                 result["begin_snap_id"] = int(nums[0])
+            date = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{2,4}\s+\d{2}:\d{2}:\d{2}", line)
+            if date:
+                result["begin_snap_time"] = date.group(0)
         elif "End Snap:" in line or re.search(r"\bEnd\s+Snap", line):
             nums = re.findall(r"\d+", line)
             if nums:
                 result["end_snap_id"] = int(nums[0])
+            date = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{2,4}\s+\d{2}:\d{2}:\d{2}", line)
+            if date:
+                result["end_snap_time"] = date.group(0)
     return result
 
 
@@ -1324,18 +1713,36 @@ def parse_text_wait_events(lines):
         if len(line) < 45 or line.strip().startswith("-"):
             continue
         event = line[:28].strip()
-        waits = parse_int(line[29:41] if len(line) > 41 else "")
-        if not event or not waits or is_idle_event(event):
+        raw_waits = line[29:41].strip() if len(line) > 41 else ""
+        if not event or not re.fullmatch(r"[\d,]+", raw_waits) or is_idle_event(event):
             continue
+        waits = parse_int(raw_waits)
         result.append({
             "event": event,
             "waits": waits,
             "total_wait_time_s": parse_float(line[46:57] if len(line) > 57 else ""),
             "avg_wait": parse_wait_ms(line[57:64] if len(line) > 64 else ""),
-            "pct_dbtime": parse_float(line[73:80] if len(line) > 80 else ""),
+            "pct_dbtime": parse_float(line[73:80] if len(line) >= 80 else ""),
             "waitevent_histogram_ms": {},
         })
     return result
+
+
+def is_statspack_sql_row(fields):
+    """Reject wrapped SQL text that happens to contain seven whitespace fields."""
+    sql_key = normalize_sql_id(fields[6]) if len(fields) == 7 else ""
+    if len(fields) != 7 or not (5 <= len(sql_key) <= 20 and sql_key.isalnum()):
+        return False
+
+    # A real TOP SQL row has six numeric metrics before its Oracle SQL_ID.
+    for value in fields[:6]:
+        normalized = normalize_cell(value).replace(",", "").replace("%", "")
+        try:
+            if not math.isfinite(float(normalized)):
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def parse_text_sql_section(lines, kind):
@@ -1343,8 +1750,8 @@ def parse_text_sql_section(lines, kind):
     last_sql_id = ""
     for line in lines:
         fields = line.split()
-        if len(fields) == 7:
-            sql_id = fields[6]
+        if is_statspack_sql_row(fields):
+            sql_id = normalize_sql_id(fields[6])
             if kind == "elapsed":
                 item = {
                     "sql_id": sql_id,
@@ -1401,19 +1808,444 @@ def parse_text_sql_section(lines, kind):
     return items
 
 
+def parse_text_instance_efficiency(lines):
+    """Read both percentage pairs and stop before Shared Pool statistics."""
+    start = next((idx for idx, line in enumerate(lines) if "Instance Efficiency" in line), None)
+    if start is None:
+        return []
+
+    result = []
+    pair = re.compile(r"([^:]+):\s*(\S+)")
+    for raw_line in lines[start + 1:]:
+        line = raw_line.strip()
+        if not line:
+            if result:
+                break
+            continue
+        if line.startswith("Shared Pool") or line.startswith("Top "):
+            break
+        for match in pair.finditer(line):
+            value = parse_float(match.group(2), None)
+            result.append({
+                "eff_stat": normalize_cell(match.group(1)),
+                "eff_pct": value if value is None or value >= 0 else None,
+            })
+    return result
+
+
+def parse_text_host_cpu(lines):
+    """Parse the Host CPU header and the first numeric data row below it."""
+    result = default_awr("")["host_cpu"]
+    section = find_text_section(lines, "Host CPU", ["Instance CPU"])
+    header = next((line for line in lines if "Host CPU" in line), "")
+    match = re.search(r"CPUs:\s*(\d+)\s*Cores:\s*(\d+)\s*Sockets:\s*(\d+)", header)
+    if match:
+        result["cpus"], result["cores"], result["sockets"] = map(int, match.groups())
+
+    for line in section:
+        columns = line.split()
+        if len(columns) >= 6 and all(re.fullmatch(r"[\d.,]+", value) for value in columns[:6]):
+            result.update({
+                "load_avg_begin": parse_float(columns[0]),
+                "load_avg_end": parse_float(columns[1]),
+                "pct_user": parse_float(columns[2]),
+                "pct_system": parse_float(columns[3]),
+                "pct_idle": parse_float(columns[4]),
+                "pct_wio": parse_float(columns[5]),
+            })
+            break
+    return result
+
+
+def parse_text_redo_log(lines):
+    """Extract the derived log-switch rate from the load-profile area."""
+    for line in lines:
+        if "log switches (derived)" in line:
+            values = line.split()
+            return {
+                "stat_name": "log switches (derived)",
+                "per_hour": parse_float(values[-1]) if values else 0.0,
+            }
+    return default_awr("")["redo_log"]
+
+
+def parse_text_time_model(lines):
+    """Read the fixed-width Time Model rows used by STATSPACK."""
+    result = []
+    for line in lines:
+        if len(line) < 56:
+            continue
+        stat_name = line[:35].strip()
+        raw_time = line[35:56].strip()
+        if not stat_name or stat_name.startswith("-") or not re.fullmatch(r"[\d,.]+", raw_time):
+            continue
+        result.append({
+            "stat_name": stat_name,
+            "time_s": parse_float(raw_time),
+            "pct_dbtime": parse_float(line[56:66]) if len(line) >= 66 else 0.0,
+        })
+    return result
+
+
+def parse_text_instance_stats(lines):
+    """Read fixed-width instance counters while discarding page headers."""
+    result = []
+    for line in lines:
+        if len(line) < 52:
+            continue
+        stat_name = line[:35].strip()
+        raw_total = line[35:52].strip()
+        if stat_name and re.fullmatch(r"[\d,]+", raw_total):
+            result.append({"statname": stat_name, "total": parse_int(raw_total)})
+    return result
+
+
+def parse_text_dictionary_cache(lines):
+    """Read dictionary-cache request and final-usage counters by column."""
+    result = []
+    for line in lines:
+        if len(line) < 77:
+            continue
+        raw_gets = line[26:38].strip()
+        raw_usage = line[69:79].strip()
+        if re.fullmatch(r"[\d,]+", raw_gets) and re.fullmatch(r"[\d,]+", raw_usage):
+            result.append({
+                "statname": line[:25].strip(),
+                "get_requests": parse_int(raw_gets),
+                "final_usage": parse_int(raw_usage),
+            })
+    return result
+
+
+def parse_text_library_cache(lines):
+    """Join each namespace row with its wrapped continuation row."""
+    data_lines = []
+    header_words = {"Get", "Pct", "Pin", "Requests", "Miss", "Reloads", "DB/Inst:"}
+    for line in lines:
+        trimmed = line.strip()
+        tokens = trimmed.split()
+        if (not trimmed or trimmed.startswith("---") or trimmed.startswith("Library Cache")
+                or trimmed.startswith("->") or "Namespace" in trimmed
+                or "Invali-" in trimmed or "dations" in trimmed
+                or (tokens and all(token in header_words for token in tokens))):
+            continue
+        data_lines.append(line)
+
+    result = []
+    idx = 0
+    while idx < len(data_lines):
+        first = data_lines[idx]
+        if first and not first[0].isspace():
+            boundary = re.search(r"\s{2,}(?=[\d-])", first)
+            if boundary:
+                values = first[boundary.end():].split()
+                if idx + 1 < len(data_lines) and data_lines[idx + 1][:1].isspace():
+                    idx += 1
+                    values.extend(data_lines[idx].split())
+                if len(values) >= 2:
+                    result.append({
+                        "statname": first[:boundary.start()].strip(),
+                        "get_requests": parse_int(values[0]),
+                        "get_pct_miss": parse_float(values[1]),
+                        "pin_requests": parse_int(values[2]) if len(values) > 2 else 0,
+                    })
+        idx += 1
+    return result
+
+
+def parse_text_latch_activity(lines):
+    """Read latch activity using the same stable columns as awr.rs."""
+    result = []
+    for line in lines:
+        if len(line) < 72 or line.startswith(" "):
+            continue
+        raw_gets = line[25:39].strip()
+        raw_miss = line[40:46].strip()
+        raw_wait = line[54:60].strip()
+        if (re.fullmatch(r"[\d,]+", raw_gets)
+                and re.fullmatch(r"[\d,.]+", raw_miss)
+                and re.fullmatch(r"[\d,.]+", raw_wait)):
+            result.append({
+                "statname": line[:24].strip(),
+                "get_requests": parse_int(raw_gets),
+                "get_pct_miss": parse_float(raw_miss),
+                "wait_time": parse_float(raw_wait),
+            })
+    return result
+
+
+def parse_text_io_stats(lines):
+    """Parse STATSPACK I/O summary tokens, including K/M/G/T/P suffixes."""
+    result = {}
+    in_data = False
+
+    def is_numeric_or_volume(value):
+        if value in ("", "."):
+            return True
+        number = value[:-1] if value[-1:].isalpha() else value
+        try:
+            float(number)
+            return True
+        except ValueError:
+            return False
+
+    def text_data_size(value):
+        value = value.strip().replace(",", ".")
+        if not value or value == ".":
+            return 0.0
+        unit = value[-1]
+        try:
+            number = float(value[:-1])
+        except ValueError:
+            return 0.0
+        return number * {"K": 1 / 1024.0, "M": 1.0, "G": 1024.0,
+                         "T": 1024.0 * 1024.0}.get(unit, 1.0)
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("->") or line.startswith("IO Stat"):
+            continue
+        if "Function" in line and "Volume" in line:
+            in_data = True
+            continue
+        if line.startswith(("---", "===")) or "-----" in line or not in_data:
+            continue
+
+        parts = line.split()
+        data_start = next((idx for idx, value in enumerate(parts) if is_numeric_or_volume(value)), len(parts))
+        name = " ".join(parts[:data_start])
+        if name == "Buffer Cache Re":
+            name = "Buffer Cache Reads"
+        values = parts[data_start:]
+        values.extend([""] * (8 - len(values)))
+        if not name or name == "TOTAL:":
+            continue
+        avg_time = None if values[7] in ("", ".") else round(parse_wait_ms(values[7]), 6)
+        result[name] = {
+            "reads_data": text_data_size(values[0]),
+            "reads_req_s": parse_float(values[1].replace(",", ".")),
+            "reads_data_s": text_data_size(values[2]),
+            "writes_data": text_data_size(values[3]),
+            "writes_req_s": parse_float(values[4].replace(",", ".")),
+            "writes_data_s": text_data_size(values[5]),
+            "waits_count": parse_count(values[6]),
+            "avg_time": avg_time,
+        }
+    return result
+
+
+def parse_text_wait_histogram(lines, event_names):
+    """Attach fixed-width histogram percentages to full wait-event names."""
+    result = {}
+    name_map = {(name[:26] if len(name) >= 26 else name): name for name in event_names}
+    bucket_names = ("1: <1ms", "2: <2ms", "3: <4ms", "4: <8ms",
+                    "5: <16ms", "6: <32ms", "7: <=1s", "8: >1s")
+    for line in lines:
+        if len(line) <= 26:
+            continue
+        short_name = line[:26].strip()
+        if short_name not in name_map:
+            continue
+        values = {}
+        for idx, start in enumerate(range(33, 81, 6)):
+            values[bucket_names[idx]] = parse_float(line[start:start + 5])
+        result[name_map[short_name]] = values
+    return result
+
+
+def parse_text_sql_text(lines):
+    """Collect wrapped SQL text and ignore repeated STATSPACK page headers."""
+    result = {}
+    current_key = ""
+    current_sql = []
+    collecting = False
+    sql_start = re.compile(r"^(SELECT|INSERT|UPDATE|DELETE|MERGE|DECLARE|BEGIN)\b", re.I)
+
+    def flush():
+        if current_key and current_sql:
+            value = "\n".join(current_sql)
+            if len(value) > len(result.get(current_key, "")):
+                result[current_key] = value
+
+    def page_header(line):
+        stripped = line.strip()
+        return (not stripped or stripped.startswith((
+            "SQL ordered by ", "-> ", "------", "CPU ", "Time (s)",
+            "Elapsed", "Elap per", "Buffer Gets", "Physical Rds",
+            "Executions", "Parse Calls", "Max", "Cluster", "Memory (KB)",
+            "Version", "%Total", "% Total", "Sharable", "CPU per", "Old",
+        )) or "Hash Value" in stripped or "DB/Inst:" in stripped or "Snaps:" in stripped)
+
+    for line in lines:
+        stripped = line.strip()
+        if page_header(line):
+            continue
+        fields = stripped.split()
+        if len(fields) >= 7:
+            candidate = fields[-1]
+            first_is_number = bool(re.fullmatch(r"[\d,.]+", fields[0]))
+            if 5 <= len(candidate) <= 20 and candidate.isalnum() and first_is_number:
+                flush()
+                current_key = normalize_sql_id(candidate)
+                current_sql = []
+                collecting = False
+                continue
+        if stripped.startswith("Module:"):
+            continue
+        if current_key and not collecting and sql_start.match(stripped):
+            collecting = True
+            current_sql = []
+        if collecting and stripped:
+            current_sql.append(stripped)
+    flush()
+    return result
+
+
+def parse_text_initialization_parameters(lines):
+    """Join wrapped begin/end values from the fixed-width parameter table."""
+    result = {}
+    current_name = None
+    begin_value = ""
+    end_value = ""
+    has_end_value = False
+
+    def append_wrapped(value, continuation):
+        continuation = continuation.strip()
+        if not continuation:
+            return value
+        no_space = (value and value[-1] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789,./:+-_()"
+                    and continuation[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789,./:+-_()")
+        return value + ("" if no_space else " ") + continuation
+
+    def finish():
+        if current_name is not None:
+            result.setdefault(current_name, end_value.strip() if has_end_value and end_value.strip()
+                              else begin_value.strip())
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if (not line or line.startswith("Parameter Name") or line.strip().startswith("----")
+                or "init.ora Parameters" in line or "End value" in line):
+            continue
+        continuation = not raw_line or raw_line[0].isspace()
+        if not continuation:
+            finish()
+            current_name = line[:29].strip()
+            begin_value = line[30:63].strip()
+            raw_end = line[64:].strip() if len(line) > 64 else ""
+            end_value = ""
+            has_end_value = False
+            if raw_end:
+                if len(line) > 63:
+                    begin_value = append_wrapped(begin_value, raw_end)
+                else:
+                    end_value = raw_end
+                    has_end_value = True
+        elif current_name is not None:
+            begin_part = raw_line[30:63].strip() if len(raw_line) > 30 else ""
+            end_part = raw_line[64:].strip() if len(raw_line) > 64 else ""
+            if has_end_value:
+                end_value = append_wrapped(end_value, end_part or begin_part)
+            else:
+                begin_value = append_wrapped(begin_value, begin_part)
+                begin_value = append_wrapped(begin_value, end_part)
+    finish()
+    return result
+
+
+def parse_text_db_instance(lines):
+    """Read database, host and block-size metadata from a STATSPACK header."""
+    result = default_db_instance()
+    database_line = ""
+    host_line = ""
+    for idx, line in enumerate(lines):
+        if "Database" in line and "DB Id" in line:
+            database_line = next((candidate for candidate in lines[idx + 1:]
+                                  if re.match(r"\s*\d+\s+\S+\s+\d+\s+", candidate)), "")
+        if (line.lstrip().startswith("Host") and "Platform" in line) or line.strip() == "Host":
+            host_line = next((candidate for candidate in lines[idx + 1:]
+                              if re.search(r"\s\d+\s+\d+\s+\d+\s+[\d.]+\s*$", candidate)), "")
+        if line.startswith("db_block_size"):
+            result["db_block_size"] = parse_int(line.split()[-1], 8192)
+
+    db_values = database_line.split()
+    if len(db_values) >= 7:
+        result.update({
+            "db_id": parse_int(db_values[0]),
+            "instance_num": parse_int(db_values[2]),
+            "startup_time": "{} {}".format(db_values[3], db_values[4]),
+            "release": db_values[5],
+            "rac": db_values[6],
+        })
+    host_values = host_line.split()
+    if len(host_values) >= 8:
+        result.update({
+            "platform": " ".join(host_values[1:4]),
+            "cpus": parse_int(host_values[4]),
+            "cores": parse_int(host_values[5]),
+            "sockets": parse_int(host_values[6]),
+            "memory": int(round(parse_float(host_values[7]))),
+        })
+    if not result["db_block_size"]:
+        result["db_block_size"] = 8192
+    return result
+
+
 def parse_text_report(path, security_level):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     awr = default_awr(path.name)
     awr["snap_info"] = parse_text_snap_info(path, lines)
     awr["load_profile"] = parse_text_load_profile(find_text_section(lines, "Load Profile", ["Instance Efficiency", "Instance Efficiency Percentages"]))
-    awr["foreground_wait_events"] = parse_text_wait_events(find_text_section(lines, "Foreground Wait Events", ["Background Wait Events"]))
-    awr["background_wait_events"] = parse_text_wait_events(find_text_section(lines, "Background Wait Events", ["Wait Events", "SQL ordered by"]))
-    awr["sql_elapsed_time"] = parse_text_sql_section(find_text_section(lines, "SQL ordered by Elapsed", ["SQL ordered by Gets", "SQL ordered by CPU", "SQL ordered by Reads"]), "elapsed")
-    awr["sql_cpu_time"] = parse_text_sql_section(find_text_section(lines, "SQL ordered by CPU", ["SQL ordered by Elapsed", "SQL ordered by Gets"]), "cpu")
-    awr["sql_gets"] = parse_text_sql_section(find_text_section(lines, "SQL ordered by Gets", ["SQL ordered by Reads", "SQL ordered by Executions"]), "gets")
-    awr["sql_reads"] = parse_text_sql_section(find_text_section(lines, "SQL ordered by Reads", ["SQL ordered by Executions", "SQL ordered by Parse"]), "reads")
-    db_instance = default_db_instance()
-    return awr, {}, {}, db_instance
+    awr["instance_efficiency"] = parse_text_instance_efficiency(lines)
+    awr["redo_log"] = parse_text_redo_log(lines)
+    awr["host_cpu"] = parse_text_host_cpu(lines)
+    awr["time_model_stats"] = parse_text_time_model(
+        find_text_section(lines, "Time Model", ["Foreground Wait Events"]))
+
+    foreground = find_text_section(lines, "Foreground Wait Events", ["Background Wait Events"])
+    background = find_text_section(lines, "Background Wait Events", ["Wait Events (fg and bg)", "SQL ordered by"])
+    awr["foreground_wait_events"] = parse_text_wait_events(foreground)
+    awr["background_wait_events"] = parse_text_wait_events(background)
+
+    elapsed_sql = find_text_section(lines, "SQL ordered by Elapsed", ["SQL ordered by Gets", "SQL ordered by CPU", "SQL ordered by Reads"])
+    cpu_sql = find_text_section(lines, "SQL ordered by CPU", ["SQL ordered by Elapsed", "SQL ordered by Gets"])
+    gets_sql = find_text_section(lines, "SQL ordered by Gets", ["SQL ordered by Reads", "SQL ordered by Executions"])
+    reads_sql = find_text_section(lines, "SQL ordered by Reads", ["SQL ordered by Executions", "SQL ordered by Parse"])
+    awr["sql_elapsed_time"] = parse_text_sql_section(elapsed_sql, "elapsed")
+    awr["sql_cpu_time"] = parse_text_sql_section(cpu_sql, "cpu")
+    awr["sql_gets"] = parse_text_sql_section(gets_sql, "gets")
+    awr["sql_reads"] = parse_text_sql_section(reads_sql, "reads")
+
+    instance_lines = find_text_section(
+        lines, "Instance Activity Stats", ["workarea executions - optimal"])
+    final_instance_line = next(
+        (line for line in lines if line[:35].strip() == "workarea executions - optimal"), None)
+    if final_instance_line:
+        # awr.rs includes this boundary row because it is also a real counter.
+        instance_lines.append(final_instance_line)
+    awr["instance_stats"] = parse_text_instance_stats(instance_lines)
+    awr["io_stats_byfunc"] = parse_text_io_stats(
+        find_text_section(lines, "IO Stat by Function - summary", ["IO Stat by Function - detail"]))
+    awr["dictionary_cache"] = parse_text_dictionary_cache(
+        find_text_section(lines, "Dictionary Cache Stats", ["Library Cache Activity"]))
+    awr["library_cache"] = parse_text_library_cache(
+        find_text_section(lines, "Library Cache Activity", ["Rule Sets", "Rule Set", "Shared Pool Advisory", "Latch Activity"]))
+    awr["latch_activity"] = parse_text_latch_activity(
+        find_text_section(lines, "Latch Activity", ["Latch Sleep breakdown"]))
+
+    histogram_lines = find_text_section(lines, "Wait Event Histogram", ["SQL ordered by"])
+    histogram = parse_text_wait_histogram(
+        histogram_lines,
+        [event["event"] for event in awr["foreground_wait_events"] + awr["background_wait_events"]],
+    )
+    apply_wait_histogram(awr, histogram)
+
+    parameter_lines = find_text_section(lines, "init.ora Parameters", ["End of Report"])
+    parameters = parse_text_initialization_parameters(parameter_lines)
+    sql_text = parse_text_sql_text(cpu_sql + elapsed_sql + gets_sql + reads_sql) if security_level >= 2 else {}
+    db_instance = parse_text_db_instance(lines)
+    mark_data_availability(awr)
+    return awr, sql_text, parameters, db_instance
 
 
 def parse_reports_to_json(reports, output_dir, stem, security_level):
@@ -1434,7 +2266,14 @@ def parse_reports_to_json(reports, output_dir, stem, security_level):
         merge_db_instance(db_instance, dbi)
 
     awrs.sort(key=lambda item: item.get("snap_info", {}).get("begin_snap_id", 0))
+    # Keep provenance first for readers; existing JSON consumers ignore this field.
+    collector_info = collector_identity()
+    collector_info.update({
+        "parser": "python-collector",
+        "parsed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    })
     collection = {
+        "collector_info": collector_info,
         "db_instance_information": db_instance,
         "initialization_parameters": parameters,
         "awrs": awrs,
@@ -1459,7 +2298,8 @@ def top_elapsed_sql_id_counts_from_json(json_path, limit=10):
     for awr in collection.get("awrs", []):
         for sql in awr.get("sql_elapsed_time", []) or []:
             sql_id = normalize_sql_id(sql.get("sql_id", ""))
-            if not is_valid_sql_id(sql_id):
+            # Old JSON remains readable, but malformed parser artifacts are never selected.
+            if not is_oracle_sql_id(sql_id):
                 continue
             if sql_id not in first_seen:
                 first_seen[sql_id] = ordinal
@@ -1502,7 +2342,58 @@ def sql_literal(value):
     return value.replace("'", "''")
 
 
-def xplan_sql(sql_id, filename):
+def execution_plan_cursors_sql(sql_ids):
+    literals = ", ".join("'{}'".format(sql_literal(sql_id)) for sql_id in sql_ids)
+    return """
+whenever oserror exit failure
+whenever sqlerror exit failure
+set heading off feedback off verify off echo off pagesize 0 linesize 32767 trimspool on trimout on tab off
+with ranked_cursors as (
+    select lower(sql_id) as sql_id,
+           child_number,
+           count(*) over (partition by sql_id) as child_count,
+           row_number() over (
+               partition by sql_id
+               order by case when is_shareable = 'Y' then 0 else 1 end,
+                        last_active_time desc nulls last,
+                        executions desc nulls last,
+                        child_number desc
+           ) as cursor_rank
+      from v$sql
+     where sql_id in ({sql_ids})
+)
+select sql_id || '|' || child_number || '|' || child_count
+  from ranked_cursors
+ where cursor_rank = 1
+ order by sql_id;
+exit
+""".format(sql_ids=literals)
+
+
+def discover_execution_plan_cursors(ctx, sql_ids, timeout):
+    if not sql_ids:
+        return []
+    output = run_sqlplus(
+        ctx,
+        execution_plan_cursors_sql(sql_ids),
+        timeout=timeout,
+    )
+    rows = []
+    for sql_id, child_number, child_count in parse_delimited_rows(output, 3):
+        try:
+            rows.append(
+                {
+                    "sql_id": sql_id.lower(),
+                    "child_number": int(child_number),
+                    "child_count": int(child_count),
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def xplan_sql(sql_id, filename, child_number=0):
     return """
 whenever oserror exit failure
 whenever sqlerror exit failure
@@ -1510,13 +2401,14 @@ set heading off feedback off verify off echo off pagesize 50000 linesize 32767 t
 set long 100000000 longchunksize 10000000
 set termout off
 spool {filename}
-select * from table(dbms_xplan.display_cursor('{sql_id}',null));
+select * from table(dbms_xplan.display_cursor('{sql_id}',{child_number},'TYPICAL'));
 spool off
 set termout on
 exit
 """.format(
         filename=filename,
         sql_id=sql_literal(sql_id),
+        child_number=int(child_number),
     )
 
 
@@ -1556,434 +2448,440 @@ def discover_multi_child_cursor_sqls(ctx, sql_ids):
     return rows
 
 
+SHARED_CURSOR_REASON_CATALOG = {
+    1: ("Unbound cursor (not fully parsed)", "The candidate cursor was not fully parsed and is not shareable."),
+    2: ("SQL type mismatch", "The statement or cursor SQL type differs."),
+    3: ("Optimizer mismatch", "The optimizer environment snapshots differ; fields identify the differing attributes."),
+    4: ("SQL Tune Base Object Different", "The SQL Tuning Base object context differs."),
+    5: ("Max Long Length Different", "The maximum LONG value length used by the cursor differs."),
+    6: ("error_on_overlap_time parameter mismatch", "The ERROR_ON_OVERLAP_TIME session setting differs."),
+    7: ("Top Level RPI Cursor", "The top-level recursive program interface cursor context differs."),
+    8: ("Flashback Archive mismatch", "The Flashback Data Archive context differs."),
+    9: ("PQ Slave mismatch", "The parallel-query slave compilation or execution context differs."),
+    10: ("Top-level DDL", "The top-level DDL cursor context differs."),
+    11: ("Multi-PX and slave-compiled cursor", "The multi-PX or slave-compiled cursor context differs."),
+    12: ("Bind-peeked PQ cursor", "The bind-peeking context used for parallel query differs."),
+    13: ("ANYDATA transformation", "The ANYDATA transformation context differs."),
+    14: ("Stored outline mismatch", "The stored-outline context differs."),
+    15: ("LogMiner attributes mismatch", "The LogMiner session or statement attributes differ."),
+    16: ("Statistics row-source mismatch", "The statistics row-source context differs."),
+    17: ("Literal replacement settings mismatch", "Cursor-sharing literal-replacement settings differ."),
+    18: ("Literal replacement compilation", "The literal-replacement compilation context differs."),
+    19: ("SQL Analyze", "The SQL Analyze cursor context differs."),
+    20: ("Explain Plan cursor", "One cursor was compiled for EXPLAIN PLAN or its explain context differs."),
+    21: ("Flashback cursor", "The flashback-query cursor context differs."),
+    22: ("Buffered DML mismatch", "The buffered-DML context differs."),
+    23: ("No Trigger Indicated mismatch", "The no-trigger indicator differs."),
+    24: ("Parallel DML environment mismatch", "The parallel-DML environment differs."),
+    25: ("Insert Direct Load mismatch", "The insert direct-load context differs."),
+    26: ("Logical Standby Apply", "The logical-standby apply context differs."),
+    27: ("Not Typechecked", "The candidate cursor has not completed compatible type checking."),
+    28: ("Different Call Duration", "The call-duration cursor attribute differs."),
+    29: ("Bind UACs mismatch", "Internal bind user-argument descriptors differ."),
+    30: ("User Bind Peek settings mismatch", "User bind-peeking settings differ."),
+    31: ("PL/SQL Compiler Switches", "PL/SQL compiler settings differ."),
+    32: ("Materialized View Rewrite cursor", "The materialized-view rewrite context differs."),
+    33: ("Rolling Invalidate Window Exceeded", "The rolling invalidation window was exceeded."),
+    34: ("Editions mismatch", "Edition-based redefinition context differs."),
+    35: ("Incarnation number mismatch", "An object or cursor incarnation number differs."),
+    36: ("Authorization Check failed", "Authorization objects, schemas, synonyms, or translation entries differ."),
+    37: ("Describe Cursor mismatch", "The describe-cursor context differs."),
+    38: ("ACL Check mismatch", "The access-control-list check context differs."),
+    39: ("Bind mismatch", "Bind metadata differs; fields identify position, datatype, length, or descriptor flags."),
+    40: ("Session Cached Cursor", "The session-cached-cursor context differs."),
+    41: ("Marked for Purge", "The cursor was marked unsafe or selected for purge."),
+    42: ("Code Address Relocation", "A code-address relocation attribute differs."),
+    43: ("Parallel DDL environment mismatch", "The parallel-DDL environment differs."),
+    44: ("NLS Settings", "NLS environment snapshots differ; decoded text can be equal when raw handle bytes differ."),
+    45: ("XDS Privilege Check mismatch", "The XDS privilege-check context differs."),
+    46: ("Session Specific Cursor Session Mismatch", "A cursor restricted to a session was compared from a different session context."),
+    47: ("Remote PDB ID Mismatch", "The remote pluggable-database identifier differs."),
+    48: ("Auto Reoptimization Mismatch", "Automatic reoptimization or feedback state differs."),
+    49: ("Show Invisible Columns Session Mismatch", "The session setting controlling invisible-column visibility differs."),
+    50: ("Target CON_ID mismatch for CONTAINERS()", "The target container identifier for a CONTAINERS() cursor differs."),
+    51: ("Permanent X$ attributes mismatch", "Attributes of an internal permanent X$ object differ."),
+    52: ("Preplugin backup X$ attributes mismatch", "Attributes of an internal preplugin-backup X$ object differ."),
+    53: ("COMMON_SCHEMA_ACCESS lockdown mismatch", "The COMMON_SCHEMA_ACCESS lockdown context differs."),
+    54: ("EXEMPT REDACTION POLICY mismatch", "The EXEMPT REDACTION POLICY privilege context differs."),
+    55: ("ADG redirected-statement sharing check", "The sharing context for a statement redirected from Active Data Guard differs."),
+    56: ("Statistics Query Transformation sharing check", "The sharing context for Statistics Query Transformation differs."),
+    57: ("Cross-container object DOP mismatch", "The degree of parallelism for a cross-container object differs."),
+}
+
+SHARED_CURSOR_DATATYPES = {
+    1: "VARCHAR2",
+    2: "NUMBER",
+    8: "LONG",
+    9: "VARCHAR",
+    12: "DATE",
+    23: "RAW",
+    24: "LONG RAW",
+    69: "ROWID",
+    96: "CHAR",
+    100: "BINARY_FLOAT",
+    101: "BINARY_DOUBLE",
+    102: "CURSOR / REF CURSOR",
+    104: "UROWID",
+    112: "CLOB",
+    113: "BLOB",
+    114: "BFILE",
+    180: "TIMESTAMP",
+    181: "TIMESTAMP WITH TIME ZONE",
+    182: "INTERVAL YEAR TO MONTH",
+    183: "INTERVAL DAY TO SECOND",
+    231: "TIMESTAMP WITH LOCAL TIME ZONE",
+}
+
+SHARED_CURSOR_TRANSPORT_BEGIN = "JASMIN_REASON_BEGIN|"
+SHARED_CURSOR_TRANSPORT_DATA = "JASMIN_REASON_DATA|"
+SHARED_CURSOR_TRANSPORT_END = "JASMIN_REASON_END|"
+
+
 def shared_cursor_reasons_sql(sql_id):
-    """Decode every XML reason node currently exposed for one SQL_ID."""
+    """Fetch REASON CLOBs as ordered UTF-8 hex chunks without SQL*Plus wrapping."""
     return r"""
 whenever oserror exit failure
 whenever sqlerror exit failure
-set heading off feedback off verify off echo off pagesize 0 linesize 4000
-set long 1000000 longchunksize 1000000 trimspool on trimout on tab off recsep off
+set heading off feedback off verify off echo off pagesize 0 linesize 32767
+set trimspool on trimout on tab off recsep off
+set serveroutput on size unlimited format wrapped
 
-prompt V$SQL_SHARED_CURSOR.REASON
-prompt SQL_ID: __SQL_ID__
-prompt A/B denote comparison-vector sides, never chronological old/new values.
+declare
+  l_position  pls_integer;
+  l_sequence  pls_integer;
+  l_length    pls_integer;
+  l_chunk     varchar2(2000);
+begin
+  for cursor_row in (
+    select child_number, reason
+      from v$sql_shared_cursor
+     where sql_id = '__SQL_ID__'
+       and reason is not null
+       and dbms_lob.getlength(reason) > 0
+     order by child_number
+  ) loop
+    l_position := 1;
+    l_sequence := 0;
+    l_length := dbms_lob.getlength(cursor_row.reason);
+    dbms_output.put_line(
+      'JASMIN_REASON_BEGIN|' || cursor_row.child_number || '|' || l_length
+    );
 
-with
-  reason_catalog (reason_id, canonical_reason, reason_meaning) as (
-    select  1, 'Unbound cursor (not fully parsed)',
-               'The candidate cursor was not fully parsed and is not shareable.' from dual union all
-    select  2, 'SQL type mismatch',
-               'The statement or cursor SQL type differs.' from dual union all
-    select  3, 'Optimizer mismatch',
-               'The optimizer environment snapshots differ; fields identify the differing attributes.' from dual union all
-    select  4, 'SQL Tune Base Object Different',
-               'The SQL Tuning Base object context differs.' from dual union all
-    select  5, 'Max Long Length Different',
-               'The maximum LONG value length used by the cursor differs.' from dual union all
-    select  6, 'error_on_overlap_time parameter mismatch',
-               'The ERROR_ON_OVERLAP_TIME session setting differs.' from dual union all
-    select  7, 'Top Level RPI Cursor',
-               'The top-level recursive program interface cursor context differs.' from dual union all
-    select  8, 'Flashback Archive mismatch',
-               'The Flashback Data Archive context differs.' from dual union all
-    select  9, 'PQ Slave mismatch',
-               'The parallel-query slave compilation or execution context differs.' from dual union all
-    select 10, 'Top-level DDL',
-               'The top-level DDL cursor context differs.' from dual union all
-    select 11, 'Multi-PX and slave-compiled cursor',
-               'The multi-PX or slave-compiled cursor context differs.' from dual union all
-    select 12, 'Bind-peeked PQ cursor',
-               'The bind-peeking context used for parallel query differs.' from dual union all
-    select 13, 'ANYDATA transformation',
-               'The ANYDATA transformation context differs.' from dual union all
-    select 14, 'Stored outline mismatch',
-               'The stored-outline context differs.' from dual union all
-    select 15, 'LogMiner attributes mismatch',
-               'The LogMiner session or statement attributes differ.' from dual union all
-    select 16, 'Statistics row-source mismatch',
-               'The statistics row-source context differs.' from dual union all
-    select 17, 'Literal replacement settings mismatch',
-               'Cursor-sharing literal-replacement settings differ.' from dual union all
-    select 18, 'Literal replacement compilation',
-               'The literal-replacement compilation context differs.' from dual union all
-    select 19, 'SQL Analyze',
-               'The SQL Analyze cursor context differs.' from dual union all
-    select 20, 'Explain Plan cursor',
-               'One cursor was compiled for EXPLAIN PLAN or its explain context differs.' from dual union all
-    select 21, 'Flashback cursor',
-               'The flashback-query cursor context differs.' from dual union all
-    select 22, 'Buffered DML mismatch',
-               'The buffered-DML context differs.' from dual union all
-    select 23, 'No Trigger Indicated mismatch',
-               'The no-trigger indicator differs.' from dual union all
-    select 24, 'Parallel DML environment mismatch',
-               'The parallel-DML environment differs.' from dual union all
-    select 25, 'Insert Direct Load mismatch',
-               'The insert direct-load context differs.' from dual union all
-    select 26, 'Logical Standby Apply',
-               'The logical-standby apply context differs.' from dual union all
-    select 27, 'Not Typechecked',
-               'The candidate cursor has not completed compatible type checking.' from dual union all
-    select 28, 'Different Call Duration',
-               'The call-duration cursor attribute differs.' from dual union all
-    select 29, 'Bind UACs mismatch',
-               'Internal bind user-argument descriptors differ.' from dual union all
-    select 30, 'User Bind Peek settings mismatch',
-               'User bind-peeking settings differ.' from dual union all
-    select 31, 'PL/SQL Compiler Switches',
-               'PL/SQL compiler settings differ.' from dual union all
-    select 32, 'Materialized View Rewrite cursor',
-               'The materialized-view rewrite context differs.' from dual union all
-    select 33, 'Rolling Invalidate Window Exceeded',
-               'The rolling invalidation window was exceeded.' from dual union all
-    select 34, 'Editions mismatch',
-               'Edition-based redefinition context differs.' from dual union all
-    select 35, 'Incarnation number mismatch',
-               'An object or cursor incarnation number differs.' from dual union all
-    select 36, 'Authorization Check failed',
-               'Authorization objects, schemas, synonyms, or translation entries differ.' from dual union all
-    select 37, 'Describe Cursor mismatch',
-               'The describe-cursor context differs.' from dual union all
-    select 38, 'ACL Check mismatch',
-               'The access-control-list check context differs.' from dual union all
-    select 39, 'Bind mismatch',
-               'Bind metadata differs; fields identify position, datatype, length, or descriptor flags.' from dual union all
-    select 40, 'Session Cached Cursor',
-               'The session-cached-cursor context differs.' from dual union all
-    select 41, 'Marked for Purge',
-               'The cursor was marked unsafe or selected for purge.' from dual union all
-    select 42, 'Code Address Relocation',
-               'A code-address relocation attribute differs.' from dual union all
-    select 43, 'Parallel DDL environment mismatch',
-               'The parallel-DDL environment differs.' from dual union all
-    select 44, 'NLS Settings',
-               'NLS environment snapshots differ; decoded text can be equal when raw handle bytes differ.' from dual union all
-    select 45, 'XDS Privilege Check mismatch',
-               'The XDS privilege-check context differs.' from dual union all
-    select 46, 'Session Specific Cursor Session Mismatch',
-               'A cursor restricted to a session was compared from a different session context.' from dual union all
-    select 47, 'Remote PDB ID Mismatch',
-               'The remote pluggable-database identifier differs.' from dual union all
-    select 48, 'Auto Reoptimization Mismatch',
-               'Automatic reoptimization or feedback state differs.' from dual union all
-    select 49, 'Show Invisible Columns Session Mismatch',
-               'The session setting controlling invisible-column visibility differs.' from dual union all
-    select 50, 'Target CON_ID mismatch for CONTAINERS()',
-               'The target container identifier for a CONTAINERS() cursor differs.' from dual union all
-    select 51, 'Permanent X$ attributes mismatch',
-               'Attributes of an internal permanent X$ object differ.' from dual union all
-    select 52, 'Preplugin backup X$ attributes mismatch',
-               'Attributes of an internal preplugin-backup X$ object differ.' from dual union all
-    select 53, 'COMMON_SCHEMA_ACCESS lockdown mismatch',
-               'The COMMON_SCHEMA_ACCESS lockdown context differs.' from dual union all
-    select 54, 'EXEMPT REDACTION POLICY mismatch',
-               'The EXEMPT REDACTION POLICY privilege context differs.' from dual union all
-    select 55, 'ADG redirected-statement sharing check',
-               'The sharing context for a statement redirected from Active Data Guard differs.' from dual union all
-    select 56, 'Statistics Query Transformation sharing check',
-               'The sharing context for Statistics Query Transformation differs.' from dual union all
-    select 57, 'Cross-container object DOP mismatch',
-               'The degree of parallelism for a cross-container object differs.' from dual
-  ),
-  source_rows as (
-    select s.child_number as view_child,
-           s.reason
-      from v$sql_shared_cursor s
-     where s.sql_id = '__SQL_ID__'
-       and s.reason is not null
-       and dbms_lob.getlength(s.reason) > 0
-  ),
-  reason_nodes as (
-    select s.view_child,
-           x.node_no,
-           x.xml_child,
-           x.reason_id,
-           x.reason_text,
-           x.payload_shape,
-           x.node_xml
-      from source_rows s
-      cross apply xmltable(
-        '/ReasonRoot/ChildNode'
-        passing xmltype(
-          to_clob('<ReasonRoot>') || s.reason || to_clob('</ReasonRoot>')
+    while l_position <= l_length loop
+      l_chunk := dbms_lob.substr(cursor_row.reason, 500, l_position);
+      if l_chunk is null then
+        raise_application_error(-20001, 'Unexpected empty REASON CLOB chunk');
+      end if;
+      l_sequence := l_sequence + 1;
+      dbms_output.put_line(
+        'JASMIN_REASON_DATA|' || cursor_row.child_number || '|' ||
+        l_sequence || '|' || rawtohex(
+          utl_i18n.string_to_raw(l_chunk, 'AL32UTF8')
         )
-        columns
-          node_no       for ordinality,
-          xml_child     number         path 'ChildNumber',
-          reason_id     number         path 'ID',
-          reason_text   varchar2(4000) path 'reason',
-          payload_shape varchar2(30)   path 'size',
-          node_xml      xmltype        path '.'
-      ) x
-  ),
-  payload_fields as (
-    select n.view_child,
-           n.node_no,
-           n.xml_child,
-           n.reason_id,
-           n.reason_text,
-           n.payload_shape,
-           f.field_no,
-           f.field_name,
-           f.raw_value
-      from reason_nodes n
-      outer apply xmltable(
-        '/ChildNode/*[
-           not(self::ChildNumber or self::ID or self::reason or self::size)
-         ]'
-        passing n.node_xml
-        columns
-          field_no   for ordinality,
-          field_name varchar2(128)  path 'local-name(.)',
-          raw_value  varchar2(4000) path 'string(.)'
-      ) f
-  ),
-  explained as (
-    select p.*,
-           regexp_replace(p.reason_text, '\([[:digit:]]+\)$') as reason_name,
-           case
-             when regexp_like(p.reason_text, '\([[:digit:]]+\)$') then
-               to_number(rtrim(
-                 regexp_substr(p.reason_text, '[[:digit:]]+\)$'), ')'
-               ))
-           end as reason_detail_code,
-           case
-             when p.field_name is null then 'NO_FIELD_PAYLOAD'
-             when p.reason_id = 44 and instr(p.raw_value, '->') > 0
-               then 'NLS_PAIR'
-             when p.reason_id = 3 and length(p.raw_value) = 42
-               then 'OPTIMIZER_PAIR'
-             when p.reason_id = 3
-               then 'OPTIMIZER_RAW'
-             when p.field_name like 'original\_%' escape '\'
-               then 'ORIGINAL_SCALAR'
-             when p.field_name like 'new\_%' escape '\'
-               or p.field_name like 'upgradeable\_new\_%' escape '\'
-               then 'NEW_SCALAR'
-             else 'SCALAR'
-           end as value_format,
-           case
-             when p.reason_id = 44 and instr(p.raw_value, '->') > 0
-               then substr(p.raw_value, 2, instr(p.raw_value, '->') - 3)
-             when p.reason_id = 3 and length(p.raw_value) = 42
-               then rtrim(substr(p.raw_value, 2, 20))
-             else p.raw_value
-           end as value_a,
-           case
-             when p.reason_id = 44 and instr(p.raw_value, '->') > 0
-               then substr(
-                      p.raw_value,
-                      instr(p.raw_value, '->') + 3,
-                      length(p.raw_value) - instr(p.raw_value, '->') - 3
-                    )
-             when p.reason_id = 3 and length(p.raw_value) = 42
-               then rtrim(substr(p.raw_value, 23, 20))
-           end as value_b,
-           case
-             when p.field_name is null then
-               'This reason has no field-level payload.'
-             when p.reason_id = 44 then
-               'NLS environment setting; A/B are comparison-vector sides.'
-             when p.reason_id = 3 or p.field_name like '\_%' escape '\' then
-               'Optimizer environment attribute or hidden parameter; A/B are comparison-vector sides.'
-             when lower(p.field_name) in ('bind_position', 'pos') then
-               'Internal zero-based bind position.'
-             when lower(p.field_name) in
-                    ('dty', 'oacdty', 'original_oacdty', 'new_oacdty') then
-               'Oracle internal bind datatype code.'
-             when lower(p.field_name) like '%oacmxl%' then
-               'Maximum bind value or buffer length.'
-             when regexp_like(lower(p.field_name), '(flg|flags)[[:digit:]_]*$') then
-               'Oracle internal flag bit mask; preserve the raw value unless the target-build enum is known.'
-             when regexp_like(lower(p.field_name), 'sig$') then
-               'Oracle internal signature or hash used by the sharing comparison.'
-             else
-               'Oracle criterion-specific diagnostic field; the raw value is authoritative.'
-           end as field_meaning
-      from payload_fields p
-  ),
-  decoded as (
-    select e.*,
-           case
-             when lower(e.field_name) in
-                    ('dty', 'oacdty', 'original_oacdty', 'new_oacdty')
-              and regexp_like(trim(e.value_a), '^[[:digit:]]+$')
-             then case to_number(trim(e.value_a))
-               when   1 then 'VARCHAR2'
-               when   2 then 'NUMBER'
-               when   8 then 'LONG'
-               when   9 then 'VARCHAR'
-               when  12 then 'DATE'
-               when  23 then 'RAW'
-               when  24 then 'LONG RAW'
-               when  69 then 'ROWID'
-               when  96 then 'CHAR'
-               when 100 then 'BINARY_FLOAT'
-               when 101 then 'BINARY_DOUBLE'
-               when 102 then 'CURSOR / REF CURSOR'
-               when 104 then 'UROWID'
-               when 112 then 'CLOB'
-               when 113 then 'BLOB'
-               when 114 then 'BFILE'
-               when 180 then 'TIMESTAMP'
-               when 181 then 'TIMESTAMP WITH TIME ZONE'
-               when 182 then 'INTERVAL YEAR TO MONTH'
-               when 183 then 'INTERVAL DAY TO SECOND'
-               when 231 then 'TIMESTAMP WITH LOCAL TIME ZONE'
-               else 'datatype code ' || trim(e.value_a)
-             end
-           end as value_a_decoded,
-           case
-             when lower(e.field_name) in
-                    ('dty', 'oacdty', 'original_oacdty', 'new_oacdty')
-              and regexp_like(trim(e.value_b), '^[[:digit:]]+$')
-             then case to_number(trim(e.value_b))
-               when   1 then 'VARCHAR2'
-               when   2 then 'NUMBER'
-               when   8 then 'LONG'
-               when   9 then 'VARCHAR'
-               when  12 then 'DATE'
-               when  23 then 'RAW'
-               when  24 then 'LONG RAW'
-               when  69 then 'ROWID'
-               when  96 then 'CHAR'
-               when 100 then 'BINARY_FLOAT'
-               when 101 then 'BINARY_DOUBLE'
-               when 102 then 'CURSOR / REF CURSOR'
-               when 104 then 'UROWID'
-               when 112 then 'CLOB'
-               when 113 then 'BLOB'
-               when 114 then 'BFILE'
-               when 180 then 'TIMESTAMP'
-               when 181 then 'TIMESTAMP WITH TIME ZONE'
-               when 182 then 'INTERVAL YEAR TO MONTH'
-               when 183 then 'INTERVAL DAY TO SECOND'
-               when 231 then 'TIMESTAMP WITH LOCAL TIME ZONE'
-               else 'datatype code ' || trim(e.value_b)
-             end
-           end as value_b_decoded
-      from explained e
-  ),
-  node_headers as (
-    select d.view_child,
-           d.node_no,
-           d.xml_child,
-           d.reason_id,
-           max(coalesce(d.reason_name, c.canonical_reason)) as reason_name,
-           d.reason_detail_code,
-           d.payload_shape,
-           max(coalesce(
-                 c.reason_meaning,
-                 'Unknown or release-specific sharing criterion; inspect the raw field values.'
-               )) as reason_meaning
-      from decoded d
-      left join reason_catalog c
-        on c.reason_id = d.reason_id
-     group by d.view_child,
-              d.node_no,
-              d.xml_child,
-              d.reason_id,
-              d.reason_detail_code,
-              d.payload_shape
-  ),
-  child_numbers as (
-    select distinct view_child
-      from node_headers
-  ),
-  report_rows (
-    report_group, view_child, node_no, section_no, field_no, subline_no,
-    report_line
-  ) as (
-    select 0, c.view_child, 0, 0, 0, 0, ' '
-      from child_numbers c
-    union all
-    select 0, c.view_child, 0, 1, 0, 0, rpad('=', 100, '=')
-      from child_numbers c
-    union all
-    select 0, c.view_child, 0, 2, 0, 0,
-           'CHILD CURSOR ' || to_char(c.view_child, 'FM9999990')
-      from child_numbers c
-    union all
-    select 0, c.view_child, 0, 3, 0, 0, rpad('=', 100, '=')
-      from child_numbers c
-    union all
-    select 0, n.view_child, n.node_no, 0, 0, 0, ' '
-      from node_headers n
-    union all
-    select 0, n.view_child, n.node_no, 1, 0, 0,
-           '+-- [' || lpad(to_char(n.node_no, 'FM9990'), 2, '0') || '] ' ||
-           n.reason_name ||
-           '  {ID=' || to_char(n.reason_id, 'FM9990') ||
-           ', subcode=' || coalesce(
-                             to_char(n.reason_detail_code, 'FM99990'), '?'
-                           ) ||
-           ', payload=' || coalesce(n.payload_shape, '?') || '}' ||
-           case
-             when n.xml_child <> n.view_child then
-               '  [XML child=' || to_char(n.xml_child, 'FM9999990') || ']'
-           end
-      from node_headers n
-    union all
-    select 0, n.view_child, n.node_no, 2, 0, 0,
-           '|   Why: ' || n.reason_meaning
-      from node_headers n
-    union all
-    select 0, d.view_child, d.node_no, 10, coalesce(d.field_no, 0), 0,
-           '|   ' || lpad(to_char(coalesce(d.field_no, 0), 'FM9990'), 2, '0') ||
-           '. ' || coalesce(d.field_name, '<no field payload>') || '  ' ||
-           case d.value_format
-             when 'NLS_PAIR' then
-               'A=[' || coalesce(d.value_a, '<null>') || '] | ' ||
-               'B=[' || coalesce(d.value_b, '<null>') || ']'
-             when 'OPTIMIZER_PAIR' then
-               'A=[' || coalesce(d.value_a, '<null>') || '] | ' ||
-               'B=[' || coalesce(d.value_b, '<null>') || ']'
-             when 'OPTIMIZER_RAW' then
-               '[raw; pair not safely separable] = ' || d.raw_value
-             when 'ORIGINAL_SCALAR' then
-               '[original] = ' || coalesce(d.value_a, '<null>') ||
-               case when d.value_a_decoded is not null
-                    then ' (' || d.value_a_decoded || ')' end
-             when 'NEW_SCALAR' then
-               '[new] = ' || coalesce(d.value_a, '<null>') ||
-               case when d.value_a_decoded is not null
-                    then ' (' || d.value_a_decoded || ')' end
-             when 'NO_FIELD_PAYLOAD' then
-               '<no field-level payload>'
-             else
-               '= ' || coalesce(d.value_a, '<null>') ||
-               case when d.value_a_decoded is not null
-                    then ' (' || d.value_a_decoded || ')' end
-           end
-      from decoded d
-    union all
-    select 0, d.view_child, d.node_no, 10, coalesce(d.field_no, 0), 1,
-           '|       Meaning: ' || d.field_meaning
-      from decoded d
-    union all
-    select 1, 0, 0, 0, 0, 0, ' '
-      from dual
-    union all
-    select 1, 0, 0, 1, 0, 0, rpad('-', 100, '-')
-      from dual
-    union all
-    select 1, 0, 0, 2, 0, 0,
-           'SUMMARY: ' ||
-           (select count(*) from child_numbers) || ' child cursor(s), ' ||
-           (select count(*) from node_headers) || ' reason node(s), ' ||
-           (select count(field_name) from decoded) || ' diagnostic field(s).'
-      from dual
-  )
-select report_line
-  from report_rows
- order by report_group,
-          view_child,
-          node_no,
-          section_no,
-          field_no,
-          subline_no;
+      );
+      l_position := l_position + length(l_chunk);
+    end loop;
+
+    dbms_output.put_line(
+      'JASMIN_REASON_END|' || cursor_row.child_number || '|' || l_sequence
+    );
+  end loop;
+end;
+/
 exit
 """.replace("__SQL_ID__", sql_literal(sql_id))
+
+
+def parse_shared_cursor_reason_transport(output):
+    """Reassemble and validate the hex-framed CLOB records emitted by SQL*Plus."""
+    records = []
+    active = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith(SHARED_CURSOR_TRANSPORT_BEGIN):
+            parts = line.split("|")
+            if len(parts) != 3 or active is not None:
+                raise CollectorError("Malformed child cursor reason BEGIN record")
+            try:
+                active = {
+                    "view_child": int(parts[1]),
+                    "declared_length": int(parts[2]),
+                    "chunks": [],
+                }
+            except ValueError as exc:
+                raise CollectorError("Invalid child cursor reason BEGIN record") from exc
+            continue
+
+        if line.startswith(SHARED_CURSOR_TRANSPORT_DATA):
+            parts = line.split("|", 3)
+            if len(parts) != 4 or active is None:
+                raise CollectorError("Malformed child cursor reason DATA record")
+            try:
+                child_number = int(parts[1])
+                sequence = int(parts[2])
+                chunk = bytes.fromhex(parts[3])
+            except ValueError as exc:
+                raise CollectorError("Invalid child cursor reason DATA record") from exc
+            if child_number != active["view_child"]:
+                raise CollectorError("Child cursor number changed inside REASON transport")
+            if sequence != len(active["chunks"]) + 1:
+                raise CollectorError("Child cursor REASON chunks are out of sequence")
+            active["chunks"].append(chunk)
+            continue
+
+        if line.startswith(SHARED_CURSOR_TRANSPORT_END):
+            parts = line.split("|")
+            if len(parts) != 3 or active is None:
+                raise CollectorError("Malformed child cursor reason END record")
+            try:
+                child_number = int(parts[1])
+                chunk_count = int(parts[2])
+            except ValueError as exc:
+                raise CollectorError("Invalid child cursor reason END record") from exc
+            if child_number != active["view_child"]:
+                raise CollectorError("Child cursor number changed at REASON transport end")
+            if chunk_count != len(active["chunks"]):
+                raise CollectorError("Child cursor REASON transport is incomplete")
+            try:
+                reason = b"".join(active["chunks"]).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise CollectorError("Child cursor REASON is not valid UTF-8") from exc
+            if len(reason) != active["declared_length"]:
+                raise CollectorError("Child cursor REASON length does not match its CLOB length")
+            records.append({"view_child": active["view_child"], "reason": reason})
+            active = None
+
+    if active is not None:
+        raise CollectorError("Child cursor REASON transport ended before its END record")
+    return records
+
+
+def xml_element_text(element):
+    """Match XMLTABLE string(.) while treating an empty Oracle string as null."""
+    if element is None:
+        return None
+    value = "".join(element.itertext())
+    return value if value else None
+
+
+def parse_shared_cursor_reason_integer(value, label):
+    """Keep malformed internal identifiers visible as a collection failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise CollectorError("Invalid {} in V$SQL_SHARED_CURSOR.REASON".format(label)) from exc
+
+
+def shared_cursor_field_details(reason_id, field_name, raw_value):
+    """Decode comparison pairs and explain Oracle's diagnostic payload fields."""
+    if field_name is None:
+        return {
+            "value_format": "NO_FIELD_PAYLOAD",
+            "value_a": None,
+            "value_b": None,
+            "meaning": "This reason has no field-level payload.",
+        }
+
+    value_format = "SCALAR"
+    value_a = raw_value
+    value_b = None
+    arrow = raw_value.find("->") if raw_value is not None else -1
+
+    if reason_id == 44 and arrow >= 0:
+        value_format = "NLS_PAIR"
+        value_a = raw_value[1:max(1, arrow - 1)]
+        value_b = raw_value[arrow + 3:-1]
+    elif reason_id == 3 and raw_value is not None and len(raw_value) == 42:
+        value_format = "OPTIMIZER_PAIR"
+        value_a = raw_value[1:21].rstrip()
+        value_b = raw_value[22:42].rstrip()
+    elif reason_id == 3:
+        value_format = "OPTIMIZER_RAW"
+    elif field_name.startswith("original_"):
+        value_format = "ORIGINAL_SCALAR"
+    elif field_name.startswith("new_") or field_name.startswith("upgradeable_new_"):
+        value_format = "NEW_SCALAR"
+
+    lower_name = field_name.lower()
+    if reason_id == 44:
+        meaning = "NLS environment setting; A/B are comparison-vector sides."
+    elif reason_id == 3 or field_name.startswith("_"):
+        meaning = "Optimizer environment attribute or hidden parameter; A/B are comparison-vector sides."
+    elif lower_name in ("bind_position", "pos"):
+        meaning = "Internal zero-based bind position."
+    elif lower_name in ("dty", "oacdty", "original_oacdty", "new_oacdty"):
+        meaning = "Oracle internal bind datatype code."
+    elif "oacmxl" in lower_name:
+        meaning = "Maximum bind value or buffer length."
+    elif re.search(r"(flg|flags)[0-9_]*$", lower_name):
+        meaning = "Oracle internal flag bit mask; preserve the raw value unless the target-build enum is known."
+    elif lower_name.endswith("sig"):
+        meaning = "Oracle internal signature or hash used by the sharing comparison."
+    else:
+        meaning = "Oracle criterion-specific diagnostic field; the raw value is authoritative."
+
+    return {
+        "value_format": value_format,
+        "value_a": value_a,
+        "value_b": value_b,
+        "meaning": meaning,
+    }
+
+
+def shared_cursor_datatype(value):
+    """Translate the datatype codes previously decoded by the Oracle CASE expression."""
+    if value is None or not re.fullmatch(r"[0-9]+", value.strip()):
+        return None
+    code = int(value.strip())
+    return SHARED_CURSOR_DATATYPES.get(code, "datatype code {}".format(code))
+
+
+def parse_shared_cursor_reason_nodes(records):
+    """Parse every ChildNode while preserving source order and repeated reasons."""
+    nodes = []
+    structural_names = {"ChildNumber", "ID", "reason", "size"}
+
+    for record in records:
+        try:
+            root = ET.fromstring("<ReasonRoot>{}</ReasonRoot>".format(record["reason"]))
+        except ET.ParseError as exc:
+            raise CollectorError(
+                "Malformed V$SQL_SHARED_CURSOR.REASON XML for child {}: {}".format(
+                    record["view_child"], exc
+                )
+            ) from exc
+
+        reason_elements = [element for element in root if element.tag == "ChildNode"]
+        for node_no, element in enumerate(reason_elements, start=1):
+            values = {child.tag: xml_element_text(child) for child in element}
+            reason_id = parse_shared_cursor_reason_integer(values.get("ID"), "reason ID")
+            xml_child = parse_shared_cursor_reason_integer(
+                values.get("ChildNumber"), "XML child number"
+            )
+            reason_text = values.get("reason")
+            detail_match = re.search(r"\(([0-9]+)\)$", reason_text or "")
+            reason_detail_code = int(detail_match.group(1)) if detail_match else None
+            reason_name = re.sub(r"\([0-9]+\)$", "", reason_text or "") or None
+            catalog = SHARED_CURSOR_REASON_CATALOG.get(reason_id)
+
+            fields = []
+            for child in element:
+                if child.tag in structural_names:
+                    continue
+                raw_value = xml_element_text(child)
+                details = shared_cursor_field_details(reason_id, child.tag, raw_value)
+                details.update({
+                    "field_no": len(fields) + 1,
+                    "field_name": child.tag,
+                    "raw_value": raw_value,
+                })
+                fields.append(details)
+
+            nodes.append({
+                "view_child": record["view_child"],
+                "node_no": node_no,
+                "xml_child": xml_child,
+                "reason_id": reason_id,
+                "reason_name": reason_name or (catalog[0] if catalog else None),
+                "reason_detail_code": reason_detail_code,
+                "payload_shape": values.get("size"),
+                "reason_meaning": catalog[1] if catalog else (
+                    "Unknown or release-specific sharing criterion; inspect the raw field values."
+                ),
+                "fields": fields,
+            })
+    return nodes
+
+
+def format_shared_cursor_field(field):
+    """Render one payload field using the collector's established labels."""
+    value_a = field["value_a"]
+    value_b = field["value_b"]
+    value_format = field["value_format"]
+    value_a_decoded = shared_cursor_datatype(value_a) if field["field_name"] and field["field_name"].lower() in (
+        "dty", "oacdty", "original_oacdty", "new_oacdty"
+    ) else None
+
+    if value_format in ("NLS_PAIR", "OPTIMIZER_PAIR"):
+        rendered = "A=[{}] | B=[{}]".format(
+            value_a if value_a is not None else "<null>",
+            value_b if value_b is not None else "<null>",
+        )
+    elif value_format == "OPTIMIZER_RAW":
+        rendered = "[raw; pair not safely separable] = {}".format(field["raw_value"])
+    elif value_format == "ORIGINAL_SCALAR":
+        rendered = "[original] = {}".format(value_a if value_a is not None else "<null>")
+        if value_a_decoded is not None:
+            rendered += " ({})".format(value_a_decoded)
+    elif value_format == "NEW_SCALAR":
+        rendered = "[new] = {}".format(value_a if value_a is not None else "<null>")
+        if value_a_decoded is not None:
+            rendered += " ({})".format(value_a_decoded)
+    elif value_format == "NO_FIELD_PAYLOAD":
+        rendered = "<no field-level payload>"
+    else:
+        rendered = "= {}".format(value_a if value_a is not None else "<null>")
+        if value_a_decoded is not None:
+            rendered += " ({})".format(value_a_decoded)
+    return rendered
+
+
+def format_shared_cursor_reasons(sql_id, records):
+    """Produce the same human-readable attachment previously formatted in SQL."""
+    nodes = parse_shared_cursor_reason_nodes(records)
+    children = sorted({node["view_child"] for node in nodes})
+    lines = [
+        "V$SQL_SHARED_CURSOR.REASON",
+        "SQL_ID: {}".format(sql_id),
+        "A/B denote comparison-vector sides, never chronological old/new values.",
+    ]
+
+    for view_child in children:
+        lines.extend(["", "=" * 100, "CHILD CURSOR {}".format(view_child), "=" * 100])
+        child_nodes = [node for node in nodes if node["view_child"] == view_child]
+        for node in child_nodes:
+            reason_name = node["reason_name"] or ""
+            subcode = node["reason_detail_code"]
+            payload_shape = node["payload_shape"] or "?"
+            header = "+-- [{:02d}] {}  {{ID={}, subcode={}, payload={}}}".format(
+                node["node_no"],
+                reason_name,
+                node["reason_id"] if node["reason_id"] is not None else "",
+                subcode if subcode is not None else "?",
+                payload_shape,
+            )
+            if node["xml_child"] is not None and node["xml_child"] != view_child:
+                header += "  [XML child={}]".format(node["xml_child"])
+            lines.extend(["", header, "|   Why: {}".format(node["reason_meaning"])])
+
+            fields = node["fields"] or [{
+                "field_no": 0,
+                "field_name": None,
+                "raw_value": None,
+                **shared_cursor_field_details(node["reason_id"], None, None),
+            }]
+            for field in fields:
+                lines.append(
+                    "|   {:02d}. {}  {}".format(
+                        field["field_no"],
+                        field["field_name"] or "<no field payload>",
+                        format_shared_cursor_field(field),
+                    )
+                )
+                lines.append("|       Meaning: {}".format(field["meaning"]))
+
+    field_count = sum(len(node["fields"]) for node in nodes)
+    lines.extend([
+        "",
+        "-" * 100,
+        "SUMMARY: {} child cursor(s), {} reason node(s), {} diagnostic field(s).".format(
+            len(children), len(nodes), field_count
+        ),
+    ])
+    return "\n".join(lines)
 
 
 def collect_shared_cursor_reasons(ctx, target_dir, multi_child_sqls):
@@ -2004,13 +2902,14 @@ def collect_shared_cursor_reasons(ctx, target_dir, multi_child_sqls):
             output = run_sqlplus(
                 ctx,
                 shared_cursor_reasons_sql(sql_id),
-                check_output_errors=False,
             )
-            if not output.strip():
+            records = parse_shared_cursor_reason_transport(output)
+            if not records:
                 raise CollectorError(
                     "V$SQL_SHARED_CURSOR returned no decoded reasons for {}".format(sql_id)
                 )
-            target.write_text(output.rstrip() + "\n", encoding="utf-8")
+            rendered = format_shared_cursor_reasons(sql_id, records)
+            target.write_text(rendered.rstrip() + "\n", encoding="utf-8")
             ensure_generated(target)
             generated.append(target)
         except (CollectorError, OSError) as exc:
@@ -2024,94 +2923,307 @@ def collect_shared_cursor_reasons(ctx, target_dir, multi_child_sqls):
     return generated, failures
 
 
-def collect_sql_execution_plans(ctx, target_dir, sql_ids):
+def collect_sql_execution_plans(
+    ctx, target_dir, sql_ids, selected_cursors=None,
+    timeout=DEFAULT_XPLAN_TIMEOUT_SECONDS,
+):
     target_dir.mkdir(parents=True, exist_ok=True)
     generated = []
     failures = []
+    selected_cursors = selected_cursors or {}
 
     for idx, sql_id in enumerate(sql_ids, start=1):
         filename = "{}.xplan".format(sql_id)
         target = target_dir / filename
-        print("Collecting execution plan {}/{}: {}".format(idx, len(sql_ids), filename))
+        child_number = selected_cursors.get(sql_id)
+        if child_number is None:
+            message = "No current child cursor found in V$SQL"
+            failures.append((sql_id, message))
+            print(
+                "WARNING: Could not collect execution plan for {}: {}".format(
+                    sql_id, message
+                )
+            )
+            continue
+        print(
+            "Collecting execution plan {}/{}: {} (child {})".format(
+                idx, len(sql_ids), filename, child_number
+            )
+        )
         try:
-            run_sqlplus(ctx, xplan_sql(sql_id, filename), cwd=target_dir)
+            run_sqlplus(
+                ctx,
+                xplan_sql(sql_id, filename, child_number),
+                cwd=target_dir,
+                timeout=timeout,
+            )
             ensure_generated(target)
             generated.append(target)
-        except CollectorError as exc:
+        except (CollectorError, OSError) as exc:
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError as cleanup_exc:
+                exc = CollectorError(
+                    "{}; could not remove partial file: {}".format(exc, cleanup_exc)
+                )
             failures.append((sql_id, str(exc)))
             print("WARNING: Could not collect execution plan for {}: {}".format(sql_id, exc))
 
     return generated, failures
 
 
-def awr_pairs_sql(start_dt, end_dt):
-    start_value = datetime_sql(start_dt)
-    end_value = datetime_sql(end_dt)
+def awr_pairs_sql(start_dt, end_dt, startup_time=None):
+    """Pair consecutive AWR snapshots inside the selected instance startup."""
+    start_value = start_dt.strftime(SNAPSHOT_DATE_FORMAT)
+    end_value = end_dt.strftime(SNAPSHOT_DATE_FORMAT)
+    # Pin generation to the reviewed startup so report pairs cannot cross a restart.
+    startup_filter = ""
+    if startup_time is not None:
+        startup_filter = "and s.startup_time = to_timestamp('{}', 'YYYY-MM-DD HH24:MI:SS')".format(
+            startup_time.strftime(SNAPSHOT_DATE_FORMAT)
+        )
     return """
 whenever oserror exit failure
 whenever sqlerror exit failure
 set heading off feedback off verify off echo off pagesize 0 trimspool on linesize 32767 tab off
 with snapshots as (
-    select d.dbid,
+    select s.dbid,
            s.instance_number,
            s.snap_id as begin_snap,
+           s.end_interval_time as begin_time,
            lead(s.snap_id, 1, null) over (
-               partition by s.instance_number
+               partition by s.dbid, s.instance_number, s.startup_time
                order by s.snap_id
-           ) as end_snap
+           ) as end_snap,
+           lead(s.end_interval_time, 1, null) over (
+               partition by s.dbid, s.instance_number, s.startup_time
+               order by s.snap_id
+           ) as end_time
       from dba_hist_snapshot s
-      join v$database d on d.dbid = s.dbid
-     where s.end_interval_time >= to_date('{start_value}', 'YYYY-MM-DD HH24:MI')
-       and s.end_interval_time <= to_date('{end_value}', 'YYYY-MM-DD HH24:MI')
+     where s.dbid = (select dbid from v$database)
        and s.instance_number = (select instance_number from v$instance)
+       and s.end_interval_time >= to_timestamp('{start_value}', 'YYYY-MM-DD HH24:MI:SS')
+       and s.end_interval_time <= to_timestamp('{end_value}', 'YYYY-MM-DD HH24:MI:SS')
+       {startup_filter}
 )
 select dbid || '|' || instance_number || '|' || begin_snap || '|' || end_snap
   from snapshots
  where end_snap is not null
+   and end_time > begin_time
  order by instance_number, begin_snap;
 exit
-""".format(start_value=start_value, end_value=end_value)
+""".format(start_value=start_value, end_value=end_value, startup_filter=startup_filter)
 
 
-def statspack_pairs_sql(start_dt, end_dt):
-    start_value = datetime_sql(start_dt)
-    end_value = datetime_sql(end_dt)
+def awr_startup_periods_sql(start_dt, end_dt):
+    """List AWR startup periods represented by snapshots in the requested range."""
+    # Use snapshot end times because those are the boundaries accepted by AWR pairing.
+    return """
+whenever oserror exit failure
+whenever sqlerror exit failure
+set heading off feedback off verify off echo off pagesize 0 trimspool on linesize 32767 tab off
+with period_snaps as (
+    select startup_time, end_interval_time as snap_time,
+           lead(end_interval_time) over (
+               partition by dbid, instance_number, startup_time
+               order by snap_id
+           ) as next_time
+      from dba_hist_snapshot
+     where dbid = (select dbid from v$database)
+       and instance_number = (select instance_number from v$instance)
+       and end_interval_time >= to_timestamp('{start}', 'YYYY-MM-DD HH24:MI:SS')
+       and end_interval_time <= to_timestamp('{end}', 'YYYY-MM-DD HH24:MI:SS')
+)
+select nvl(to_char(startup_time, 'YYYY-MM-DD HH24:MI:SS'), 'UNKNOWN') || '|' ||
+       to_char(min(snap_time), 'YYYY-MM-DD HH24:MI:SS') || '|' ||
+       to_char(max(snap_time), 'YYYY-MM-DD HH24:MI:SS') || '|' ||
+       count(*) || '|' ||
+       sum(case when next_time > snap_time then 1 else 0 end)
+  from period_snaps
+ group by startup_time
+ order by startup_time;
+exit
+""".format(start=start_dt.strftime(SNAPSHOT_DATE_FORMAT), end=end_dt.strftime(SNAPSHOT_DATE_FORMAT))
+
+
+def statspack_pairs_sql(start_dt, end_dt, startup_time=None):
+    """Pair consecutive snapshots inside each startup, including manual captures."""
+    start_value = start_dt.strftime(SNAPSHOT_DATE_FORMAT)
+    end_value = end_dt.strftime(SNAPSHOT_DATE_FORMAT)
+    # Pin generation to the selected startup even if new snapshots arrive after discovery.
+    startup_filter = ""
+    if startup_time is not None:
+        startup_filter = "and startup_time = to_date('{}', 'YYYY-MM-DD HH24:MI:SS')".format(
+            startup_time.strftime(SNAPSHOT_DATE_FORMAT)
+        )
+    # Partition before pairing so a requested period can safely include restarts.
+    # Compare timestamps directly: scheduled intervals may differ by a second.
     return """
 whenever oserror exit failure
 whenever sqlerror exit failure
 set heading off feedback off verify off echo off pagesize 0 trimspool on linesize 32767 tab off
 with v_snaps as (
     select snap_id as begin_snap,
-           lead(snap_id, 1, null) over (order by snap_id) as end_snap,
-           (lead(snap_time, 1, null) over (order by snap_id) - snap_time) * 24 * 60
-               as snap_interval_minutes
+           snap_time as begin_time,
+           lead(snap_id, 1, null) over (
+               partition by dbid, instance_number, startup_time
+               order by snap_id
+           ) as end_snap,
+           lead(snap_time, 1, null) over (
+               partition by dbid, instance_number, startup_time
+               order by snap_id
+           ) as end_time
       from perfstat.STATS$SNAPSHOT
-     where startup_time = (
-               select max(startup_time)
-                 from perfstat.STATS$SNAPSHOT
-                where dbid = (select dbid from v$database)
-                  and instance_number = (select instance_number from v$instance)
-           )
-       and dbid = (select dbid from v$database)
+     where dbid = (select dbid from v$database)
        and instance_number = (select instance_number from v$instance)
-       and snap_time >= to_date('{start_value}', 'YYYY-MM-DD HH24:MI')
-       and snap_time <= to_date('{end_value}', 'YYYY-MM-DD HH24:MI')
+       and snap_time >= to_date('{start_value}', 'YYYY-MM-DD HH24:MI:SS')
+       and snap_time <= to_date('{end_value}', 'YYYY-MM-DD HH24:MI:SS')
+       {startup_filter}
 )
 select begin_snap || '|' || end_snap
   from v_snaps
  where end_snap is not null
-   and snap_interval_minutes >= {min_interval}
+   and end_time > begin_time
  order by begin_snap;
 exit
 """.format(
         start_value=start_value,
         end_value=end_value,
-        min_interval=STATSPACK_MIN_INTERVAL_MINUTES,
+        startup_filter=startup_filter,
     )
 
 
-def discover_awr_pairs(ctx, start_dt, end_dt):
-    output = run_sqlplus(ctx, awr_pairs_sql(start_dt, end_dt))
+def statspack_startup_periods_sql(start_dt, end_dt):
+    """List observed startups, including groups too small to produce a report."""
+    # Count valid adjacent pairs so the menu never offers an unusable period.
+    return """
+whenever oserror exit failure
+whenever sqlerror exit failure
+set heading off feedback off verify off echo off pagesize 0 trimspool on linesize 32767 tab off
+with period_snaps as (
+    select startup_time, snap_time,
+           lead(snap_time) over (
+               partition by dbid, instance_number, startup_time
+               order by snap_id
+           ) as next_time
+      from perfstat.STATS$SNAPSHOT
+     where dbid = (select dbid from v$database)
+       and instance_number = (select instance_number from v$instance)
+       and snap_time >= to_date('{start}', 'YYYY-MM-DD HH24:MI:SS')
+       and snap_time <= to_date('{end}', 'YYYY-MM-DD HH24:MI:SS')
+)
+select nvl(to_char(startup_time, 'YYYY-MM-DD HH24:MI:SS'), 'UNKNOWN') || '|' ||
+       to_char(min(snap_time), 'YYYY-MM-DD HH24:MI:SS') || '|' ||
+       to_char(max(snap_time), 'YYYY-MM-DD HH24:MI:SS') || '|' ||
+       count(*) || '|' ||
+       sum(case when next_time > snap_time then 1 else 0 end)
+  from period_snaps
+ group by startup_time
+ order by startup_time;
+exit
+""".format(start=start_dt.strftime(SNAPSHOT_DATE_FORMAT), end=end_dt.strftime(SNAPSHOT_DATE_FORMAT))
+
+
+def parse_startup_periods(output, report_type):
+    """Decode the common period inventory returned by AWR and STATSPACK queries."""
+    periods = []
+    # Reject malformed identity data instead of silently collecting an ambiguous group.
+    for startup, first, last, count, pairs in parse_delimited_rows(output, 5):
+        try:
+            period = {
+                "startup_time": datetime.strptime(startup, SNAPSHOT_DATE_FORMAT),
+                "start": datetime.strptime(first, SNAPSHOT_DATE_FORMAT),
+                "end": datetime.strptime(last, SNAPSHOT_DATE_FORMAT),
+                "snapshot_count": int(count),
+                "pair_count": int(pairs),
+            }
+        except ValueError as exc:
+            raise CollectorError("Could not read {} startup period: {}".format(report_type, exc))
+        periods.append(period)
+    return periods
+
+
+def discover_awr_startup_periods(ctx, start_dt, end_dt):
+    """Read AWR periods before creating output files or generating reports."""
+    return parse_startup_periods(run_sqlplus(ctx, awr_startup_periods_sql(start_dt, end_dt)), "AWR")
+
+
+def discover_statspack_startup_periods(ctx, start_dt, end_dt):
+    """Read STATSPACK periods before creating output files or patching templates."""
+    return parse_startup_periods(run_sqlplus(ctx, statspack_startup_periods_sql(start_dt, end_dt)), "STATSPACK")
+
+
+def startup_selection_can_prompt(args):
+    """Respect unattended runs, including a fully specified command in a terminal."""
+    # Missing collection choices indicate interactive or mixed use; redirected input never prompts.
+    json_needed = (args.package_mode != PACKAGE_REPORTS or args.include_sql_plans
+                   or args.access_path_evidence is not None)
+    choices = (args.report_type, args.start_dt, args.end_dt, args.include_alert,
+               args.include_sql_plans, args.include_os_stats, args.package_mode)
+    return sys.stdin.isatty() and (
+        any(value is None for value in choices)
+        or (json_needed and args.security_level is None)
+    )
+
+
+def select_startup_period(periods, allow_prompt, report_type):
+    """Require one observed startup per package, with stable numbered choices."""
+    if not periods:
+        raise CollectorError("No {} snapshots found for the requested date range.".format(report_type))
+
+    # Single-startup ranges continue automatically, including historical startups.
+    if len(periods) == 1:
+        if periods[0]["pair_count"] == 0:
+            raise CollectorError("No valid {} pairs in this startup; two snapshots with increasing timestamps are required.".format(report_type))
+        return periods[0]
+
+    print("INFO: The requested range contains snapshots from {} instance startups.".format(len(periods)))
+    print("INFO: Mixing startup periods in one analysis can affect statistics, anomalies and findings.")
+    print("INFO: We recommend a separate analysis for each startup. Select one period for this package.")
+    print("INFO: Only startups recorded in snapshots are listed; restarts without snapshots cannot be detected.")
+    print(" No.  Instance startup      First snapshot        Last snapshot         Snapshots  Reports")
+    # Keep unavailable groups numbered too, so all observed restarts remain visible.
+    for number, period in enumerate(periods, 1):
+        print(" {:>3}  {}   {}   {}   {:>9}  {:>7}{}".format(
+            number, period["startup_time"].strftime(SNAPSHOT_DATE_FORMAT),
+            period["start"].strftime(SNAPSHOT_DATE_FORMAT), period["end"].strftime(SNAPSHOT_DATE_FORMAT),
+            period["snapshot_count"], period["pair_count"],
+            " (unavailable: no valid pairs)" if not period["pair_count"] else "",
+        ))
+        if period["pair_count"]:
+            print('      Range {}: --start "{}" --end "{}"'.format(
+                number, period["start"].strftime(SNAPSHOT_DATE_FORMAT),
+                period["end"].strftime(SNAPSHOT_DATE_FORMAT),
+            ))
+
+    # No default is chosen: a batch run must be retried with one of the printed ranges.
+    if not any(period["pair_count"] for period in periods):
+        raise CollectorError("None of the startup periods contains a valid {} pair.".format(report_type))
+    if not allow_prompt:
+        raise CollectorError("Multiple {} startups require a selection. Rerun with START and END from one available numbered range above.".format(report_type))
+    while True:
+        try:
+            choice = input("Choose startup period [1-{}]: ".format(len(periods))).strip()
+        except EOFError:
+            raise CollectorError("No startup period selected. Rerun with one of the available ranges above.")
+        if not choice.isascii() or not choice.isdigit() or not 1 <= int(choice) <= len(periods):
+            print("Please enter an available period number from 1 to {}.".format(len(periods)))
+            continue
+        selected = periods[int(choice) - 1]
+        if not selected["pair_count"]:
+            print("This period has no valid report pairs. Please choose another number.")
+            continue
+        return selected
+
+
+def select_statspack_startup_period(periods, allow_prompt):
+    """Keep the public helper explicit for existing callers and tests."""
+    return select_startup_period(periods, allow_prompt, "STATSPACK")
+
+
+def discover_awr_pairs(ctx, start_dt, end_dt, startup_time=None):
+    output = run_sqlplus(ctx, awr_pairs_sql(start_dt, end_dt, startup_time))
     rows = parse_delimited_rows(output, 4)
     pairs = []
     for dbid, inst_num, begin_snap, end_snap in rows:
@@ -2126,8 +3238,8 @@ def discover_awr_pairs(ctx, start_dt, end_dt):
     return pairs
 
 
-def discover_statspack_pairs(ctx, start_dt, end_dt):
-    output = run_sqlplus(ctx, statspack_pairs_sql(start_dt, end_dt))
+def discover_statspack_pairs(ctx, start_dt, end_dt, startup_time=None):
+    output = run_sqlplus(ctx, statspack_pairs_sql(start_dt, end_dt, startup_time))
     rows = parse_delimited_rows(output, 2)
     return [{"begin_snap": begin_snap, "end_snap": end_snap} for begin_snap, end_snap in rows]
 
@@ -2435,6 +3547,7 @@ def write_manifest(
     security_level,
     xplan_info,
     os_stats_info=None,
+    startup_selection=None,
 ):
     manifest = output_dir / "manifest.txt"
     mask_manifest = should_mask_manifest(package_mode, security_level)
@@ -2461,14 +3574,23 @@ def write_manifest(
         )
     packaged_files.append(manifest.name)
 
+    # Include identity even in reports-only packages, without exposing host paths.
+    identity = collector_identity()
     with manifest.open("w", encoding="utf-8") as fh:
         fh.write("JAS-MIN collector manifest\n")
         fh.write("==========================\n")
+        fh.write("collector_name={}\n".format(identity["name"]))
+        fh.write("collector_version={}\n".format(identity["version"]))
+        fh.write("collector_script_sha256={}\n".format(identity["script_sha256"]))
         fh.write("ORACLE_SID={}\n".format("masked by security level 0" if mask_manifest else ctx["oracle_sid"]))
         fh.write("ORACLE_HOME={}\n".format("masked by security level 0" if mask_manifest else ctx["oracle_home"]))
         fh.write("report_type={}\n".format(report_type))
         fh.write("start={}\n".format(datetime_sql(start_dt)))
         fh.write("end={}\n".format(datetime_sql(end_dt)))
+        # Preserve both the original request and the exact chosen snapshot period.
+        if startup_selection:
+            for key, value in startup_selection.items():
+                fh.write("{}={}\n".format(key, value.strftime(SNAPSHOT_DATE_FORMAT)))
         fh.write("generated_at={}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         fh.write("report_count={}\n".format(len(reports)))
         fh.write("package_content={}\n".format(package_mode_label(package_mode)))
@@ -2527,6 +3649,22 @@ def write_manifest(
                     ", ".join(manual_sql_ids) if manual_sql_ids else "none"
                 )
             )
+            fh.write(
+                "  per-plan timeout: {} second(s)\n".format(
+                    xplan_info.get(
+                        "execution_plan_timeout", DEFAULT_XPLAN_TIMEOUT_SECONDS
+                    )
+                )
+            )
+
+            selected_child_cursors = xplan_info.get("selected_child_cursors", [])
+            if selected_child_cursors:
+                fh.write("  selected current child cursors:\n")
+                for item in selected_child_cursors:
+                    fh.write(
+                        "    {sql_id} - child_number={child_number}, "
+                        "child_count={child_count}\n".format(**item)
+                    )
 
             files = xplan_info.get("files", [])
             if files:
@@ -2621,6 +3759,8 @@ def create_zip_package(
 def main(argv=None):
     try:
         args = parse_collector_args(argv)
+        # Make copied terminal logs identify the collector release too.
+        print("{} {}".format(COLLECTOR_NAME, COLLECTOR_VERSION))
         ctx = require_oracle_context()
         print("Detected database from environment:")
         print("  ORACLE_SID={}".format(ctx["oracle_sid"]))
@@ -2628,6 +3768,36 @@ def main(argv=None):
 
         report_type = args.report_type if args.report_type is not None else ask_report_type()
         start_dt, end_dt = resolve_date_range(args.start_dt, args.end_dt)
+        # Resolve startup ambiguity before any collection side effects or attachment prompts.
+        startup_selection = None
+        pairs = None
+        requested_start, requested_end = start_dt, end_dt
+        periods = (
+            discover_awr_startup_periods(ctx, start_dt, end_dt)
+            if report_type == "AWR"
+            else discover_statspack_startup_periods(ctx, start_dt, end_dt)
+        )
+        selected = select_startup_period(
+            periods, startup_selection_can_prompt(args), report_type
+        )
+        startup_selection = {
+            "requested_start": requested_start,
+            "requested_end": requested_end,
+            "selected_startup": selected["startup_time"],
+        }
+        start_dt, end_dt = selected["start"], selected["end"]
+        print("INFO: Selected startup {}. Report range: {} to {}.".format(
+            selected["startup_time"].strftime(SNAPSHOT_DATE_FORMAT),
+            start_dt.strftime(SNAPSHOT_DATE_FORMAT), end_dt.strftime(SNAPSHOT_DATE_FORMAT),
+        ))
+        if report_type == "AWR":
+            pairs = discover_awr_pairs(ctx, start_dt, end_dt, selected["startup_time"])
+        else:
+            pairs = discover_statspack_pairs(ctx, start_dt, end_dt, selected["startup_time"])
+        if not pairs:
+            raise CollectorError(
+                "No {} pairs remain in the selected startup. Snapshots may have been purged; rerun collection.".format(report_type)
+            )
         include_alert = (
             args.include_alert
             if args.include_alert is not None
@@ -2643,7 +3813,7 @@ def main(argv=None):
             args.os_stats_dir,
         )
         package_mode = args.package_mode if args.package_mode is not None else ask_package_mode()
-        json_required = package_includes_json(package_mode) or include_sql_plans
+        json_required = package_includes_json(package_mode) or include_sql_plans or args.access_path_evidence is not None
         security_level = args.security_level
         if json_required:
             security_level = security_level if security_level is not None else ask_security_level()
@@ -2656,23 +3826,18 @@ def main(argv=None):
         print("Reports directory: {}".format(reports_dir))
 
         if report_type == "AWR":
-            pairs = discover_awr_pairs(ctx, start_dt, end_dt)
-            if not pairs:
-                raise CollectorError("No AWR snapshot pairs found for the selected date range.")
             reports = generate_awr_reports(ctx, pairs, reports_dir)
         else:
-            pairs = discover_statspack_pairs(ctx, start_dt, end_dt)
-            if not pairs:
-                raise CollectorError(
-                    "No Statspack snapshot pairs found for the selected date range "
-                    "(minimum interval: {} minutes).".format(STATSPACK_MIN_INTERVAL_MINUTES)
-                )
             reports = generate_statspack_reports(ctx, pairs, reports_dir)
 
         json_path = None
         if json_required:
             print("Parsing generated reports to JAS-MIN JSON...")
             json_path = parse_reports_to_json(reports, output_dir, stem, security_level)
+            if args.access_path_evidence is not None:
+                if security_level != 2:
+                    raise CollectorError("--access-path-evidence requires --security-level 2 to preserve explicit evidence references")
+                merge_access_path_evidence(json_path, args.access_path_evidence)
             print("JSON file: {}".format(json_path))
 
         xplan_info = {
@@ -2682,6 +3847,8 @@ def main(argv=None):
             "sql_ids": [],
             "files": [],
             "failures": [],
+            "selected_child_cursors": [],
+            "execution_plan_timeout": args.execution_plan_timeout,
             "multi_child_sqls": [],
             "child_cursor_reason_files": [],
             "child_cursor_reason_failures": [],
@@ -2708,24 +3875,45 @@ def main(argv=None):
 
             if plan_sql_ids:
                 xplan_target_dir = json_attachments_dir(output_dir, json_path)
-                xplan_files, xplan_failures = collect_sql_execution_plans(ctx, xplan_target_dir, plan_sql_ids)
-                xplan_info["files"] = xplan_files
-                xplan_info["failures"] = xplan_failures
-                print("Execution plan attachment(s): {}".format(len(xplan_files)))
-
-                top_sql_ids = [item["sql_id"] for item in top_sqls]
                 try:
-                    multi_child_sqls = discover_multi_child_cursor_sqls(
-                        ctx, top_sql_ids
+                    cursor_rows = discover_execution_plan_cursors(
+                        ctx, plan_sql_ids, args.execution_plan_timeout
                     )
+                    xplan_info["selected_child_cursors"] = cursor_rows
+                    selected_cursors = {
+                        item["sql_id"]: item["child_number"]
+                        for item in cursor_rows
+                    }
+                    top_sql_id_set = {item["sql_id"] for item in top_sqls}
+                    multi_child_sqls = [
+                        {
+                            "sql_id": item["sql_id"],
+                            "child_count": item["child_count"],
+                        }
+                        for item in cursor_rows
+                        if item["sql_id"] in top_sql_id_set
+                        and item["child_count"] > 1
+                    ]
                     xplan_info["multi_child_sqls"] = multi_child_sqls
                 except CollectorError as exc:
                     xplan_info["child_cursor_discovery_failure"] = str(exc)
+                    selected_cursors = {sql_id: 0 for sql_id in plan_sql_ids}
                     multi_child_sqls = []
                     print(
-                        "WARNING: Could not discover TOP SQL_IDs with multiple "
-                        "child cursors: {}".format(exc)
+                        "WARNING: Could not select current child cursors; "
+                        "falling back to child 0: {}".format(exc)
                     )
+
+                xplan_files, xplan_failures = collect_sql_execution_plans(
+                    ctx,
+                    xplan_target_dir,
+                    plan_sql_ids,
+                    selected_cursors,
+                    args.execution_plan_timeout,
+                )
+                xplan_info["files"] = xplan_files
+                xplan_info["failures"] = xplan_failures
+                print("Execution plan attachment(s): {}".format(len(xplan_files)))
 
                 if multi_child_sqls:
                     print("TOP SQL_IDs with multiple current child cursors:")
@@ -2784,6 +3972,7 @@ def main(argv=None):
             security_level,
             xplan_info,
             os_stats_info,
+            startup_selection=startup_selection,
         )
         zip_path = create_zip_package(
             output_dir,

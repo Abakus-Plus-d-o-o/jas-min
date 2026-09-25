@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str;
 
+mod access_path;
 mod ai_tools;
 mod analyze;
 mod anomalies;
@@ -21,6 +22,10 @@ mod gradient;
 mod local_agent;
 mod macros;
 mod mcp_server;
+mod measurements;
+mod nmon;
+mod performance_hints;
+mod quantile;
 mod reasonings;
 mod report_issues;
 mod report_signals;
@@ -82,6 +87,10 @@ struct Args {
     ///Filter snapshots, based on SNAP IDs in format BEGIN_ID- END_ID
     #[clap(short, long, default_value = "0-666666666")]
     snap_range: String,
+
+    ///Optional JSON policy for deterministic HINTS (thresholds and explicit baseline).
+    #[clap(long, default_value = "")]
+    hints_policy: String,
 
     ///Should I be quiet? This mode suppresses terminal output but still writes to log file
     #[clap(short, long)]
@@ -155,7 +164,7 @@ struct Args {
     #[clap(long, default_value_t = 1e-6)]
     en_tol: f64,
 
-    /// Keep only top N results per regression model.
+    /// Select top N active, peak and extreme candidates per model; retain full rankings.
     #[arg(long, default_value_t = 10)]
     pub top_gradient: usize,
 
@@ -181,6 +190,11 @@ struct Args {
     /// Example: --mcp 127.0.0.1:4242/mcp
     #[arg(long, value_name = "ADDRESS/PATH")]
     pub mcp: Option<McpEndpoint>,
+
+    ///Optional directory containing one or more IBM AIX/Linux *.nmon captures.
+    ///NMON data is parsed once and embedded in the generated JAS-MIN dataset.
+    #[arg(long, value_name = "DIRECTORY", verbatim_doc_comment)]
+    pub nmon: Option<PathBuf>,
 }
 
 impl Args {
@@ -245,7 +259,23 @@ fn load_env() -> Result<(), String> {
 }
 
 fn validate_cli_inputs(args: &Args) -> Result<(), String> {
+    performance_hints::Policy::load(&args.hints_policy)?;
     let project_source_count = args.directory.len() + args.json_file.len();
+
+    if let Some(nmon) = args.nmon.as_ref() {
+        if !nmon.is_dir() {
+            return Err(format!(
+                "NMON source '{}' is not a directory",
+                nmon.display()
+            ));
+        }
+        if project_source_count != 1 || !args.file.is_empty() {
+            return Err(
+                "--nmon requires exactly one --directory or --json-file project source"
+                    .to_string(),
+            );
+        }
+    }
 
     if args.mcp.is_some() {
         if project_source_count == 0 {
@@ -475,7 +505,7 @@ fn load_mcp_projects(args: &Args) -> Result<Vec<AnalysisProject>, String> {
             args.outfile.clone()
         };
         debug_note!("Starting to parse MCP project directory: {}", directory);
-        let parsed = awr::parse_awr_dir(project_args, &mut report_links, &json_output);
+        let parsed = awr::parse_awr_dir(project_args, &mut report_links, &json_output)?;
         debug_note!(
             "MCP directory project parsed: source='{}', snapshots={}, report_link_groups={}",
             directory,
@@ -505,7 +535,7 @@ fn load_mcp_projects(args: &Args) -> Result<Vec<AnalysisProject>, String> {
         let project_args = args.for_json_file(json_file.clone());
         let mut report_links = HashMap::new();
         debug_note!("Starting to load MCP project JSON: {}", json_file);
-        let parsed = awr::prarse_json_file(project_args, &mut report_links);
+        let parsed = awr::prarse_json_file(project_args, &mut report_links)?;
         debug_note!(
             "MCP JSON project parsed: source='{}', snapshots={}, report_link_groups={}",
             json_file,
@@ -624,7 +654,12 @@ fn main() {
                 fname = args.outfile.clone();
             }
             debug_note!("Starting to parse directory: {}", args.directory());
-            let parsed = awr::parse_awr_dir(args.clone(), events_sqls, &fname);
+            let parsed = awr::parse_awr_dir(args.clone(), events_sqls, &fname).unwrap_or_else(
+                |error| {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                },
+            );
             report_for_ai = parsed.report_for_ai;
         } else {
             eprintln!("ERROR: Directory: '{}' does not exists!", args.directory());
@@ -633,7 +668,12 @@ fn main() {
     } else if !args.json_file().is_empty() {
         debug_note!("Entering JSON analysis mode: file='{}'", args.json_file());
         if PathBuf::from(args.json_file()).exists() {
-            let parsed = awr::prarse_json_file(args.clone(), events_sqls);
+            let parsed = awr::prarse_json_file(args.clone(), events_sqls).unwrap_or_else(
+                |error| {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                },
+            );
             report_for_ai = parsed.report_for_ai;
             //let file_and_ext: Vec<&str> = args.json_file.split('.').collect();
             reportfile = match PathBuf::from(args.json_file()).file_stem() {
@@ -652,7 +692,12 @@ fn main() {
         }
     }
 
-    let j = rounded_json_for_toon(serde_json::to_value(&report_for_ai).unwrap());
+    fs::write(
+        "report_for_ai.full.json",
+        serde_json::to_vec(&report_for_ai).unwrap(),
+    )
+    .unwrap();
+    let j = rounded_json_for_toon(gradient_prompt_value(&report_for_ai));
     let toon_str = encode(&j, None);
     if toon_str.len() > 128 {
         let mut f = fs::File::create("report_for_ai.toon").unwrap();
@@ -799,6 +844,22 @@ mod cli_tests {
             Args::try_parse_from(["jas-min", "--file", "report.html", "--en-lambda", "0.125"])
                 .unwrap();
         assert_eq!(args.en_lambda, Some(0.125));
+    }
+
+    #[test]
+    fn nmon_is_an_optional_directory_argument() {
+        let without_nmon = Args::try_parse_from(["jas-min", "--file", "report.html"]).unwrap();
+        assert!(without_nmon.nmon.is_none());
+
+        let with_nmon = Args::try_parse_from([
+            "jas-min",
+            "--directory",
+            "reports",
+            "--nmon",
+            "host-captures",
+        ])
+        .unwrap();
+        assert_eq!(with_nmon.nmon, Some(PathBuf::from("host-captures")));
     }
 
     #[test]

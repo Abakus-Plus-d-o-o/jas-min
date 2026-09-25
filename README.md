@@ -20,6 +20,12 @@ JAS-MIN is a Rust command-line tool for mining Oracle AWR and STATSPACK performa
 
 The tool can also send a compact `ReportForAI` representation to supported AI providers and convert the resulting Markdown analysis to linked HTML.
 
+## Learn the regression models — ONE MORE QUERY
+
+[Open the interactive PL/EN course](https://ora600pl.github.io/jas-min/) · [Source, offline build and upload package](docs/one-more-query/README.md)
+
+Five interactive chapters take you from Oracle performance charts through Ridge, Elastic Net, Huber and Q95 to a focused evidence request. Includes worked calculations, beer-shaped explainers, percentile comparisons and step-by-step Gaussian elimination. Authentic anonymized measurements; no accounts, data uploads or live AI/Oracle calls. The course distinguishes fitted associations from causes and explicitly retains data-quality limitations.
+
 ## Current Capabilities
 
 | Area | What JAS-MIN does |
@@ -27,12 +33,14 @@ The tool can also send a compact `ReportForAI` representation to supported AI pr
 | Parsing | Parses a single report with `--file`, or a directory of `.html` and `.txt` reports with `--directory`. |
 | Collection helper | Uses `jas-min-collector.py` to generate AWR/STATSPACK reports from a local Oracle environment and package reports, JSON, alert logs, optional SQL execution plans, child-cursor diagnostics, and prepared AIX/Linux statistics. |
 | Cached analysis | Re-analyzes an existing JAS-MIN JSON file with `--json-file`. |
+| Optional NMON | With `--nmon DIRECTORY`, parses and merges AIX/Linux `*.nmon` captures into the same dataset, precomputing raw series, statistics, 5/15/60-minute aggregates and sustained peak periods for HTML and MCP. |
 | HTML dashboard | Generates `<input>.html_reports/jasmin_main.html` and detail pages for waits, SQL IDs, statistics, I/O, latches, segments, anomalies, and gradients. |
 | Peak detection | Marks snapshots where `DB CPU / DB Time` is below `--time-cpu-ratio`, optionally requiring DB Time above `--filter-db-time`. |
 | Snap filtering | Limits analysis to a snapshot range with `--snap-range BEGIN-END`. |
 | Anomalies | Uses MAD-based anomaly detection with configurable threshold, sliding-window percentage, and optional trimming to the largest anomaly clusters. |
 | Correlation | Computes Pearson correlations between DB Time and wait events, SQL elapsed time, and instance statistics. |
 | Gradient analysis | Runs Ridge, Elastic Net, Huber, and Quantile-95 regression models over DB Time and DB CPU drivers. |
+| Performance hints | **HINTS** separates scan, SQL-read and row-continuation work growth from CPU/elapsed support. Cards show observed history, latest supplied state, scoped context and material segment candidates; physical causes remain unconfirmed. HTML, classic AI and MCP share the same result. See [policy, coverage and interpretation](docs/performance-hints.md). |
 | Custom gradient | Builds extra gradient pages for a selected SQL ID or wait event with `--gradient-custom`. |
 | AI reports | Supports OpenAI, Google Gemini, OpenRouter, and a two-session local agent served by LM Studio. |
 | Analytical report atlas | Linked active/peak bubble plots, four-model selection matrices, per-instance synthesis and scoped anomaly windows in MCP/API reports. See [the report atlas guide](docs/report-signal-atlas.md). |
@@ -109,6 +117,14 @@ This parses all non-hidden `.html` and `.txt` files in `./awr_reports`, writes `
 ```bash
 jas-min -j awr_reports.json
 ```
+
+### Add optional AIX/Linux NMON host data
+
+```bash
+jas-min -d ./statspack_reports --nmon ./nmon/oraprod
+```
+
+`--nmon` is optional. When omitted, parsing and output remain compatible with existing JAS-MIN datasets. The directory is scanned deterministically for `*.nmon` files; timestamps come from `ZZZZ` records rather than filenames. Prepared NMON data is embedded in the generated JSON, exposed through bounded MCP drill-down tools, and rendered at `./statspack_reports.html_reports/nmon/nmon_overview.html`.
 
 ### Parse one report to JSON on stdout
 
@@ -311,7 +327,9 @@ Each gradient section contains:
 | `ridge_top` | Top Ridge regression rows. |
 | `elastic_net_top` | Top non-zero Elastic Net rows. |
 | `huber_top` | Top Huber robust regression rows. |
-| `quantile95_top` | Top Quantile-95 tail-risk rows. |
+| `quantile95_top` | Converged Q95 active/peak/extreme selection union. |
+| `model_rankings` | Complete signed fits, including zero and negative coefficients. |
+| `predictor_coverage` | Source membership, missingness and transition/percentile support. |
 | `cross_model_classifications` | Cross-model labels such as `CONFIRMED_BOTTLENECK` and `TAIL_RISK`. |
 | `vif_diagnostics` | Predictors with elevated VIF and interpretation labels. |
 | `collinear_group_impacts` | Combined impact for groups of strongly correlated predictors. |
@@ -443,7 +461,7 @@ JAS-MIN then fits four complementary regression models:
 | Ridge | Dense linear solve with sample-normalized L2 regularization: `(X'X/n + lambda I) beta = X'y/n` | Stable ranking when predictors are numerous or correlated. |
 | Elastic Net | Coordinate descent with L1 and L2 penalties | Sparse ranking that highlights dominant drivers and suppresses redundant correlated predictors. |
 | Huber | Iteratively Reweighted Least Squares with Huber loss | Robust ranking that downweights extreme outlier snapshots. |
-| Quantile 95 | Quantile regression focused on the 95th percentile | Tail-risk analysis for the worst periods rather than average behavior. |
+| Quantile 95 | ADMM pinball + L2, free intercept, standardized target, convergence certificate | Conditional upper quantile of target changes using all observations. |
 
 The configurable parameters are:
 
@@ -454,7 +472,7 @@ The configurable parameters are:
 | `-A, --en-alpha` | Elastic Net L1/L2 mix; `1.0` is Lasso, `0.0` is Ridge-like | `0.2` |
 | `-I, --en-max-iter` | Coordinate descent iteration limit | `5000` |
 | `--en-tol` | Elastic Net convergence tolerance | `0.000001` |
-| `--top-gradient` | Number of top rows kept per regression model | `10` |
+| `--top-gradient` | TOP N per independent active, peak and extreme ranking; full fits retained | `10` |
 
 Models are fitted on standardized predictor deltas. Elastic Net also standardizes the target delta, then converts its coefficients back to DB Time or DB CPU units after fitting. JAS-MIN converts each fitted coefficient back to the raw predictor scale before combining it with the MAD or percentile of raw deltas:
 
@@ -477,6 +495,13 @@ When `--en-lambda` is omitted, Elastic Net selects lambda independently for ever
 Collections with fewer than 12 target deltas, insufficient variable training folds, or no usable validation folds use the deterministic fallback `0.05 * lambda_max`. A constant or entirely unrelated standardized target produces a zero Elastic Net model. Automatic selection requires `alpha > 0`; use an explicit `--en-lambda` for the pure-L2 `alpha=0` case.
 
 Every gradient section records `elastic_net_lambda_mode`, selected `elastic_net_lambda`, `elastic_net_lambda_max`, `elastic_net_lambda_ratio`, the CV rule and fold count, validation loss when available, target-standardization status, and the final number of non-zero coefficients. Explicit `--en-lambda` values operate on the standardized-target objective and are therefore not numerically compatible with fixed lambdas from releases that fitted Elastic Net against the unstandardized target.
+
+[Gradient methodology v2](docs/gradient-methodology-v2.md) documents independent P90/P99/max
+selection, the corrected Q95 objective, convergence diagnostics and AWR membership masks.
+A zero active score no longer suppresses a large peak score. The Q95 normalized lambda is fixed
+at 0.0005 independently of Ridge, with 20,000 iterations maximum and primal/dual/gap checks.
+Regenerate source analyses and restart MCP to use the new calculations; converting old Markdown
+alone does not recompute fits.
 
 The sign is preserved. Positive values indicate metrics associated with DB Time increases; negative values indicate metrics associated with DB Time decreases. This prevents idle or anti-correlated metrics from being reported as bottlenecks simply because their absolute coefficient is large.
 
@@ -550,6 +575,16 @@ After fitting Ridge, Elastic Net, Huber, and Quantile-95, JAS-MIN compares which
 | `ROBUST_ONLY` | Huber only | Visible after downweighting outliers. |
 
 The VIF diagnostics and collinear group impact should be read together with these labels: classification says *what looks important*, while VIF and group impact help explain whether the importance is individually attributable or group-level.
+
+### Instance Efficiency
+
+STATSPACK text reports and AWR HTML reports populate `instance_efficiency` in
+parsed JSON. The STATSPACK parser reads both metric/value pairs per line and
+normalizes padding in metric names, stopping before Shared Pool Statistics.
+Unavailable, non-finite, or negative STATSPACK percentages are stored as `null`,
+consistent with the existing AWR convention for negative percentages.
+The efficiency chart discovers metrics across the selected snapshots and keeps
+missing measurements as gaps so values remain aligned with their timestamps.
 
 ### Descriptive Statistics
 
@@ -700,6 +735,101 @@ For useful statistics, collect a meaningful run of consecutive reports. A week o
 
 ### Interactive Collector
 
+#### Collector version and provenance
+
+The standalone Python collector has its own version, independent of the Rust
+application. Run `python3 jas-min-collector.py --version` without an Oracle
+environment to identify the release. The version is also printed at startup.
+
+Every manifest records `collector_name`, `collector_version` and
+`collector_script_sha256`. The hash identifies the exact script file, including
+local edits. Generated JSON starts with an optional `collector_info` object
+containing `name`, `version`, `script_sha256`, `parser` (`python-collector`) and
+`parsed_at_utc` (UTC). This describes parsing provenance, not the report period
+or the version used for later analysis. No host paths are added to this metadata.
+
+Existing JAS-MIN and JAS-MIN PRO readers ignore the additional field; old JSON
+files remain valid. Those readers do not yet retain or display this metadata.
+Files without it have unknown collector provenance.
+
+Collector releases use `MAJOR.MINOR.PATCH`: increase PATCH for bug fixes, MINOR
+for compatible features, and MAJOR for incompatible CLI or data-contract changes.
+Version `0.1.9` is the first explicitly versioned collector, not a change to the
+Rust application's version. Update the version whenever collector behavior changes.
+
+Since collector `0.1.10`, STATSPACK reports use consecutive available snapshots
+within the selected database, instance and startup. Both endpoints must fall
+inside the requested time range (inclusive). Manual snapshots and intervals
+shorter than 30 minutes are included; missing snapshot IDs do not break pairing.
+Requests spanning restarts require selecting one startup period per package.
+Pairs with equal or decreasing timestamps are skipped. For example, selecting
+13:00 includes snapshots at 13:10 and 13:19, followed by the next at 14:00.
+This replaces the former 30-minute minimum and latest-startup-only restriction.
+
+Since collector `0.1.11`, the same startup boundary and selection behavior also
+applies to AWR snapshots for the current database and instance.
+
+Collector `0.1.12` validates STATSPACK TOP SQL rows as six numeric metrics plus
+a 13-character Oracle SQL ID, preventing wrapped SQL or PL/SQL source from being
+treated as a statement identifier. Collector `0.1.13` transfers
+`V$SQL_SHARED_CURSOR.REASON` CLOBs as ordered UTF-8 hex chunks and decodes their
+XML in Python. This avoids release-specific SQL parser failures while preserving
+the existing child-cursor attachment format and evidence.
+
+Collector `0.1.14` brings its report parser in line with `jas-min -d`. STATSPACK
+JSON now includes instance efficiency, host CPU, time model, wait histograms,
+instance and I/O statistics, dictionary/library cache, latch activity, SQL text,
+initialization parameters and database metadata. Numeric `OLD_HASH_VALUE` keys
+from older STATSPACK releases remain supported without accepting wrapped SQL as
+a statement row. AWR parsing uses the same idle-event classification as the Rust
+parser and accepts decimal commas in SQL buffer-get percentages.
+
+Collector `0.1.15` prevents one `DBMS_XPLAN.DISPLAY_CURSOR` call from blocking
+the collection indefinitely. It selects a concrete current child cursor from
+`V$SQL`, applies a configurable per-plan timeout, removes partial plan files,
+records the failure, and continues with the remaining SQL IDs.
+
+Both HTML parsers retain empty initialization parameter values as empty strings
+and skip rows without a parameter name. Hidden names in continuation rows are
+read as text; multiple nonempty values for the same parameter within a table
+are joined with `, ` in report order. Parameter tables are combined, with a
+later table replacing an earlier value only when the parameter name is repeated.
+
+#### AWR and STATSPACK startup selection
+
+After START and END are entered, the collector checks the recorded startups
+before creating files or generating reports. One startup continues automatically,
+including a historical startup. Multiple startups produce an English INFO notice
+and a numbered list with startup time, first/last snapshot, snapshot count and
+valid report count. Numbers stay the same when an unavailable period is listed.
+
+```text
+INFO: The requested range contains snapshots from 2 instance startups.
+INFO: Mixing startup periods in one analysis can affect statistics, anomalies and findings.
+INFO: We recommend a separate analysis for each startup. Select one period for this package.
+ No.  Instance startup      First snapshot        Last snapshot         Snapshots  Reports
+   1  2026-09-09 08:15:00   2026-09-10 13:10:15   2026-09-12 22:30:00         116      115
+   2  2026-09-12 23:05:12   2026-09-12 23:30:00   2026-09-15 15:00:00         128      127
+Choose startup period [1-2]:
+```
+
+The choice must identify a period with at least one valid pair; blank input has
+no default. A period with no valid pairs is listed but cannot be selected.
+The collector pins the report query to the selected startup and uses that group's
+first/last snapshot times for collection. The manifest records `requested_start`,
+`requested_end`, `selected_startup` and the effective `start`/`end`.
+
+When stdin is not a terminal, or all collection choices were supplied through
+CLI arguments, multiple startups produce an error instead of a prompt. The list
+includes numbered `--start`/`--end` suggestions for rerunning one period at a time.
+Date arguments accept `YYYY-MM-DD HH24:MI` and `YYYY-MM-DD HH24:MI:SS`, so the
+suggested boundaries can be copied exactly. Only startups represented by stored
+snapshots can be discovered; this is not a complete restart audit.
+
+AIX/Linux files are still copied in full from the supplied directory; select OS
+evidence from the same period during analysis. The startup menu does not filter
+their contents.
+
 `jas-min-collector.py` is a Python standard-library helper for environments where the reports should be generated directly from the target Oracle host. It expects `ORACLE_HOME`, `ORACLE_SID`, and a working `$ORACLE_HOME/bin/sqlplus` connection as `/ as sysdba`.
 
 ```bash
@@ -736,6 +866,7 @@ Run `python3 jas-min-collector.py --help` for the generated CLI help. The comple
 | `--include-execution-plans`, `--execution-plans` | Attach current cursor plans for the automatically selected top elapsed SQL IDs and any IDs supplied with `--sql-id`. Mutually exclusive with `--no-execution-plans`. |
 | `--no-execution-plans` | Do not collect SQL execution plans. |
 | `--sql-id SQL_ID[,SQL_ID...]`, `--sql-ids SQL_ID[,SQL_ID...]` | Add one or more SQL IDs; the option may be repeated. It implies `--execution-plans` and cannot be combined with `--no-execution-plans`. Values are normalized to lowercase and duplicates are removed. |
+| `--execution-plan-timeout SECONDS` | Limit current-child discovery and each `DBMS_XPLAN.DISPLAY_CURSOR` call. The default is 120 seconds. A timed-out plan is recorded as a failure and collection continues with the next SQL ID. |
 | `-p`, `--package-content {both,json,reports}`, `--package-mode {both,json,reports}` | Select ZIP content. `both` is the interactive default; `b`, `j`, `r`, `report`, `awr`, and `full` are accepted input aliases. Prompts when omitted. |
 | `-S`, `--security-level {0,1,2}` | Set the [JSON security level](#security-levels). Prompts when JSON is requested or must be generated for execution-plan selection. |
 | `--include-os-stats`, `--os-stats` | Include prepared operating-system statistics. Prompts for their source directory unless `--os-stats-dir` is also supplied. Mutually exclusive with `--no-os-stats`. |
@@ -743,6 +874,11 @@ Run `python3 jas-min-collector.py --help` for the generated CLI help. The comple
 | `--os-stats-dir DIR` | Recursively copy prepared OS-statistics files from `DIR`. It implies `--include-os-stats`, requires a non-empty existing directory, and cannot be combined with `--no-os-stats`. |
 
 When `--execution-plans` is used without `--sql-id`, the collector attaches plans for the top elapsed SQL IDs found in the generated reports and does not ask for manual additions.
+
+STATSPACK TOP SQL rows are accepted only when all metric fields are numeric and
+the final field is a 13-character Oracle SQL ID. This prevents wrapped SQL or
+PL/SQL source text from being mistaken for a statement identifier. Automatic
+plan selection applies the same check to older JSON collections.
 
 Without options, or for required options not provided in a mixed run, the collector asks for:
 
@@ -794,22 +930,38 @@ OS statistics are attachments, not telemetry collected by this script. On AIX th
 
 When execution plans are requested, the collector parses the generated reports to JAS-MIN JSON even if the ZIP package was set to reports-only. It counts SQL IDs found in `SQLs Ordered by Elapsed time`, selects the top 10 by appearance count, allows extra comma-separated SQL IDs, and writes plans to `<collection_stem>_attachments/<sql_id>.xplan`.
 
-For the automatically selected TOP SQL_IDs (not the manually added IDs), the collector also checks:
+Before fetching plans, the collector selects one concrete current child cursor for
+each SQL ID. It prefers a shareable cursor, then the most recently active cursor,
+and records the selected child number and current child count in the manifest.
+For the automatically selected TOP SQL_IDs (not the manually added IDs), the
+child count is also used to decide whether cursor-sharing reasons should be
+collected.
 
 ```sql
-select sql_id, count(distinct child_number)
-from v$sql
-where sql_id in (...)
-group by sql_id
-having count(distinct child_number) > 1;
+select lower(sql_id), child_number, child_count
+from (
+  select sql_id,
+         child_number,
+         count(*) over (partition by sql_id) child_count,
+         row_number() over (
+           partition by sql_id
+           order by case when is_shareable = 'Y' then 0 else 1 end,
+                    last_active_time desc nulls last,
+                    executions desc nulls last,
+                    child_number desc
+         ) cursor_rank
+  from v$sql
+  where sql_id in (...)
+)
+where cursor_rank = 1;
 ```
 
-Each match is decoded from `V$SQL_SHARED_CURSOR.REASON` into `<collection_stem>_attachments/<sql_id>.shared_cursor_reasons`. Collection is best-effort: a missing/evicted cursor or an unavailable view does not prevent execution plans and the remaining package from being created; the manifest records discovery or per-SQL failures.
+Each multi-child match is decoded from `V$SQL_SHARED_CURSOR.REASON` into `<collection_stem>_attachments/<sql_id>.shared_cursor_reasons`. The collector transports each CLOB as validated, ordered UTF-8 hex chunks so SQL*Plus line wrapping cannot corrupt XML element names, then preserves every `ChildNode`, repeated reason, payload field and comparison value while formatting the attachment in Python. Collection is best-effort: a missing/evicted cursor, malformed or incomplete transport, invalid XML, unavailable view, or execution-plan timeout does not prevent the remaining package from being created; the manifest records discovery or per-SQL failures. A partial `.xplan` created before a timeout or SQL error is removed.
 
 Execution plans are fetched with:
 
 ```sql
-select * from table(dbms_xplan.display_cursor('sqlid',null));
+select * from table(dbms_xplan.display_cursor('sqlid',child_number,'TYPICAL'));
 ```
 
 The collector creates `jasmin_collect_<collection_stem>/` in the current directory, adding `_2`, `_3`, and so on instead of overwriting an existing collection. The directory contains the generated reports, optional JSON and attachment directory, `manifest.txt`, and `jasmin_package_<collection_stem>.zip`.
@@ -832,10 +984,14 @@ In every mode, requested alert-log and OS-statistics attachments, available exec
 
 ## Authors
 
-- Kamil Stawiarski - [kamil@ora-600.pl](mailto:kamil@ora-600.pl) - [blog.ora-600.pl](https://blog.ora-600.pl)
-- Radoslaw Kut - [radek@ora-600.pl](mailto:radek@ora-600.pl) - [blog.struktuur.pl](https://blog.struktuur.pl)
+- Kamil Stawiarski - [blog](https://blog.ora-600.pl)
+- Radoslaw Kut - [blog](https://blog.struktuur.pl)
 
-Built by [ORA-600 | Database Whisperers](https://www.ora-600.pl/en/).
+Built by [ORA-600 | Database Whisperers](https://www.ora-600.pl/en/).  
+
+## Contact
+
+jas-min(at)ora-600.pl
 
 ## License
 
@@ -867,3 +1023,5 @@ a durable fix. Updating a member finding requires reviewing its issue summary
 again. Classic APIs and the local reviewer use the same validated decision
 metadata and renderer. See [issue authoring and migration](docs/report-issues.md)
 for required fields, legacy compatibility and export validation.
+
+- [Scan and row-continuation reasoning](docs/access-path-diagnostics.md): AI hypotheses from existing gradients, degradation and SQL costs; optional confirmation evidence.

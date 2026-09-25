@@ -233,6 +233,14 @@ pub struct LatchActivity {
 
 #[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct SegmentStats {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub pdb_name: Option<String>,
+    #[serde(default)]
+    pub con_id: Option<u32>,
+    #[serde(default)]
+    pub subobject_name: Option<String>,
     pub obj: u64,
     pub objd: u64,
     pub object_name: String,
@@ -255,6 +263,11 @@ pub struct TopSQLWithTopEvents {
 
 #[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct AWR {
+    /// False means not collected, even when a legacy numeric field contains zero.
+    #[serde(default)]
+    pub data_availability: HashMap<String, bool>,
+    #[serde(default)]
+    pub access_path_observations: Vec<crate::access_path::SqlObservation>,
     pub file_name: String,
     pub snap_info: SnapInfo,
     status: String,
@@ -286,6 +299,8 @@ pub struct AWRSCollection {
     pub initialization_parameters: HashMap<String, String>,
     pub awrs: Vec<AWR>,
     pub sql_text: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nmon: Option<crate::nmon::NmonDataset>,
 }
 
 /// Keeps the detailed collection and its compact AI summary together.
@@ -643,13 +658,23 @@ fn initialization_parameters(table: ElementRef) -> HashMap<String, String> {
     for row in table.select(&row_selector) {
         let columns: Vec<ElementRef> = row.select(&column_selector).collect::<Vec<_>>();
         if columns.len() > 1 {
-            let pname: Vec<&str> = columns[0].text().collect::<Vec<_>>();
-            let pname = pname[0].trim().to_string();
+            // Continuation rows may put the name inside a hidden div, preceded
+            // by whitespace. Empty cells have no text nodes at all.
+            let pname = columns[0].text().collect::<String>().trim().to_string();
+            if pname.is_empty() {
+                continue;
+            }
+            let pvalue = columns[1].text().collect::<String>().trim().to_string();
 
-            let pvalue: Vec<&str> = columns[1].text().collect::<Vec<_>>();
-            let pvalue = pvalue[0].trim().to_string();
-
-            params.entry(pname).or_insert(pvalue);
+            // Keep the existing string-valued schema while preserving every
+            // nonempty value of a multi-valued parameter in report order.
+            let value = params.entry(pname).or_default();
+            if !pvalue.is_empty() {
+                if !value.is_empty() {
+                    value.push_str(", ");
+                }
+                value.push_str(&pvalue);
+            }
         }
     }
     params
@@ -854,54 +879,67 @@ fn top_sql_with_top_events(table: ElementRef) -> HashMap<String, TopSQLWithTopEv
 }
 
 fn segment_stats(table: ElementRef, stat_name: &str, args: &Args) -> Vec<SegmentStats> {
-    let mut segment_stats: Vec<SegmentStats> = Vec::new();
-    let row_selector = Selector::parse("tr").unwrap();
-    let column_selector = Selector::parse("td").unwrap();
-
-    for row in table.select(&row_selector) {
-        let columns: Vec<ElementRef> = row.select(&column_selector).collect::<Vec<_>>();
-        if columns.len() >= 7 {
-            let mut version_modificator = 0;
-
-            if columns.len() == 7 {
-                //this is for older AWR format (like 11g)
-                version_modificator = 1;
-            }
-
-            let mut segment_name = "#".to_string();
-            if args.security_level > 0 {
-                let sname = columns[2].text().collect::<Vec<_>>();
-                segment_name = sname[0].trim().to_string();
-            }
-
-            let segment_type = columns[4].text().collect::<Vec<_>>();
-            let segment_type = segment_type[0].trim().to_string();
-
-            let mut obj = 0;
-            let mut objd = 0;
-            if version_modificator == 0 {
-                let vobj = columns[5].text().collect::<Vec<_>>();
-                obj = u64::from_str(&vobj[0].trim().replace(",", "")).unwrap_or(0);
-
-                let vobjd = columns[6].text().collect::<Vec<_>>();
-                objd = u64::from_str(&vobjd[0].trim().replace(",", "")).unwrap_or(0);
-            }
-
-            let stat_value = columns[7 - version_modificator].text().collect::<Vec<_>>();
-            let stat_value = f64::from_str(&stat_value[0].trim().replace(",", "")).unwrap_or(0.0);
-
-            segment_stats.push(SegmentStats {
-                obj: obj,
-                objd: objd,
-                object_name: segment_name,
-                object_type: segment_type,
-                stat_name: stat_name.to_string(),
-                stat_vlalue: stat_value,
-            });
+    let rows = Selector::parse("tr").unwrap();
+    let cells = Selector::parse("td").unwrap();
+    let heads = Selector::parse("th").unwrap();
+    let headers: Vec<String> = table
+        .select(&heads)
+        .map(|h| h.text().collect::<String>().trim().to_ascii_lowercase())
+        .collect();
+    let index = |names: &[&str]| headers.iter().position(|h| names.contains(&h.as_str()));
+    let mut result = Vec::new();
+    for row in table.select(&rows) {
+        let columns: Vec<_> = row
+            .select(&cells)
+            .map(|c| c.text().collect::<String>().trim().to_string())
+            .collect();
+        if columns.len() < 7 {
+            continue;
         }
+        let field = |names: &[&str], fallback: Option<usize>| -> Option<String> {
+            let value = columns.get(index(names).or(fallback)?)?;
+            (!value.is_empty()).then(|| value.clone())
+        };
+        let visible = |names: &[&str]| {
+            if args.security_level > 0 {
+                field(names, None)
+            } else {
+                None
+            }
+        };
+        let legacy = columns.len() == 7;
+        let metric_index =
+            index(&[stat_name.to_ascii_lowercase().as_str()]).unwrap_or(if legacy { 5 } else { 7 });
+        let Some(value) = columns
+            .get(metric_index)
+            .and_then(|s| s.replace(',', "").parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        else {
+            continue;
+        };
+        result.push(SegmentStats {
+            owner: visible(&["owner"]),
+            pdb_name: visible(&["pdb name", "container name"]),
+            con_id: field(&["con_id", "con id", "container id"], None)
+                .and_then(|s| s.replace(',', "").parse().ok()),
+            subobject_name: visible(&["subobject name", "subobject"]),
+            obj: field(&["obj#", "object id"], (!legacy).then_some(5))
+                .and_then(|s| s.replace(',', "").parse().ok())
+                .unwrap_or(0),
+            objd: field(&["dataobj#", "data object id"], (!legacy).then_some(6))
+                .and_then(|s| s.replace(',', "").parse().ok())
+                .unwrap_or(0),
+            object_name: if args.security_level > 0 {
+                field(&["object name"], Some(2)).unwrap_or_default()
+            } else {
+                "#".into()
+            },
+            object_type: field(&["obj. type", "object type"], Some(4)).unwrap_or_default(),
+            stat_name: stat_name.into(),
+            stat_vlalue: value,
+        });
     }
-
-    segment_stats
+    result
 }
 
 fn dictionary_cache_stats(table: ElementRef) -> Vec<DictionaryCache> {
@@ -1884,7 +1922,12 @@ fn time_model_stats(table: ElementRef) -> Vec<TimeModelStats> {
             let stat_name = stat_name[0].trim();
 
             let time_s = columns[1].text().collect::<Vec<_>>();
-            let time_s = f64::from_str(&time_s[0].trim().replace(",", "")).unwrap_or(0.0);
+            let Some(time_s) = f64::from_str(&time_s[0].trim().replace(",", ""))
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            else {
+                continue;
+            };
 
             let pct_dbtime = columns[2].text().collect::<Vec<_>>();
             let pct_dbtime = f64::from_str(&pct_dbtime[0].trim().replace(",", "")).unwrap_or(0.0);
@@ -2573,6 +2616,31 @@ fn load_profile_txt(load_section: Vec<&str>) -> Vec<LoadProfile> {
     lp
 }
 
+/// Read both name/value pairs without including the following shared-pool table.
+fn instance_efficiency_txt(lines: &[&str]) -> Vec<InstanceEfficiency> {
+    let Some(start) = lines.iter().position(|line| line.contains("Instance Efficiency")) else {
+        return Vec::new();
+    };
+    let pair = regex::Regex::new(r"([^:]+):\s*(\S+)").unwrap();
+    let mut result = Vec::new();
+    for line in &lines[start + 1..] {
+        let line = line.trim();
+        if line.is_empty() {
+            if !result.is_empty() { break; }
+            continue;
+        }
+        if line.starts_with("Shared Pool") || line.starts_with("Top ") { break; }
+        for captures in pair.captures_iter(line) {
+            // Collapse report padding; an unavailable percentage stays null, never zero.
+            let name = captures[1].split_whitespace().collect::<Vec<_>>().join(" ");
+            let value = captures[2].replace(',', "").parse::<f32>().ok()
+                .filter(|value| value.is_finite() && *value >= 0.0);
+            result.push(InstanceEfficiency { eff_stat: name, eff_pct: value });
+        }
+    }
+    result
+}
+
 fn instance_efficiency(table: ElementRef) -> Vec<InstanceEfficiency> {
     let row_selector = Selector::parse("tr").unwrap();
     let column_selector = Selector::parse("td").unwrap();
@@ -2900,7 +2968,7 @@ fn parse_awr_report_internal(
 			} else if element.value().attr("summary").unwrap().starts_with("This table displays name and value of the modified initialization parameters") 
 			       || element.value().attr("summary").unwrap().starts_with("This table displays name and value of init.ora parameters")
 				   || element.value().attr("summary").unwrap().starts_with("This table displays name and value of the initialization parametersmodified by the current container"){
-				 parameters = initialization_parameters(element);
+					 parameters.extend(initialization_parameters(element));
 			} else if element.value().attr("summary").unwrap() == "This table displays the Top SQL by Top Wait Events" {
 				awr.top_sql_with_top_events = top_sql_with_top_events(element);
 			} else if element.value().attr("summary").unwrap() == "This table displays total number of waits, and information about total wait time, for each wait event" {
@@ -2979,6 +3047,7 @@ fn parse_awr_report_internal(
         load_profile_lines
             .extend_from_slice(&awr_lines[load_profile_index.begin + 2..load_profile_index.end]);
         awr.load_profile = load_profile_txt(load_profile_lines);
+        awr.instance_efficiency = instance_efficiency_txt(&awr_lines);
 
         let foreground_even_section_start = format!("{}{}", 12u8 as char, "Foreground Wait Events");
 
@@ -3322,7 +3391,7 @@ pub fn parse_awr_dir(
     args: Args,
     events_sqls: &mut HashMap<&str, HashSet<String>>,
     file: &str,
-) -> ParsedAnalysis {
+) -> Result<ParsedAnalysis, String> {
     debug_note!(
         "Starting directory parse: directory='{}', output_json='{}', security_level={}",
         args.directory(),
@@ -3457,12 +3526,21 @@ pub fn parse_awr_dir(
 
     /* ************************* */
 
-    let collection = AWRSCollection {
+    let mut collection = AWRSCollection {
         db_instance_information: is_instance_info.unwrap_or_default(),
         initialization_parameters: parameters_final,
         awrs: awr_vec,
         sql_text: sql_txt_final,
+        nmon: None,
     };
+
+    if let Some(nmon_directory) = args.nmon.as_ref() {
+        debug_note!(
+            "Loading optional NMON dataset from '{}'",
+            nmon_directory.display()
+        );
+        collection.nmon = Some(crate::nmon::load_directory(nmon_directory, args.quiet)?);
+    }
 
     let json_str = serde_json::to_string_pretty(&collection).unwrap();
     let mut f = fs::File::create(file).unwrap();
@@ -3480,10 +3558,10 @@ pub fn parse_awr_dir(
         "Directory analysis completed: directory='{}'",
         args.directory()
     );
-    ParsedAnalysis {
+    Ok(ParsedAnalysis {
         collection,
         report_for_ai,
-    }
+    })
 }
 
 pub fn parse_awr_report(
@@ -3522,7 +3600,7 @@ pub fn parse_awr_report(
 pub fn prarse_json_file(
     args: Args,
     events_sqls: &mut HashMap<&str, HashSet<String>>,
-) -> ParsedAnalysis {
+) -> Result<ParsedAnalysis, String> {
     debug_note!(
         "Starting AWRSCollection JSON analysis: file='{}'",
         args.json_file()
@@ -3532,6 +3610,13 @@ pub fn prarse_json_file(
     let json_file = fs::read_to_string(args.json_file())
         .unwrap_or_else(|_| panic!("Something wrong with a file {} ", args.json_file()));
     let mut collection: AWRSCollection = load_awrs_collection_from_json_str(&json_file).expect("\nJAS-MIN JSON format not known\nConsider running jasmin -d <DIR> before using -j json\n\n");
+    if let Some(nmon_directory) = args.nmon.as_ref() {
+        debug_note!(
+            "Loading optional NMON dataset from '{}'",
+            nmon_directory.display()
+        );
+        collection.nmon = Some(crate::nmon::load_directory(nmon_directory, args.quiet)?);
+    }
     collection
         .awrs
         .clone()
@@ -3574,16 +3659,126 @@ pub fn prarse_json_file(
         "AWRSCollection JSON analysis completed: file='{}'",
         args.json_file()
     );
-    ParsedAnalysis {
+    Ok(ParsedAnalysis {
         collection,
         report_for_ai,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn initialization_parameters_html_report_regressions() {
+        use clap::Parser;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/initialization_parameters.json"
+        ))
+        .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "jas-min-init-parameters-{}-{nonce}.html",
+            std::process::id()
+        ));
+        let args = Args::parse_from(["jas-min", "--security-level", "2"]);
+        for case in cases.as_array().unwrap() {
+            fs::write(&path, case["html"].as_str().unwrap()).unwrap();
+            // Exercise report table dispatch as well as individual cell parsing.
+            let (_, _, parameters) = parse_awr_report_internal(path.to_str().unwrap(), &args);
+            assert_eq!(
+                serde_json::to_value(parameters).unwrap(),
+                case["expected"],
+                "{}",
+                case["name"]
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    // Compare every supplied report section with independently extracted name/value pairs.
+    #[test]
+    fn instance_efficiency_report_fixtures() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/instance_efficiency.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let input = case["input"].as_str().unwrap();
+            let metrics = if case["kind"] == "text" {
+                instance_efficiency_txt(&input.lines().collect::<Vec<_>>())
+            } else {
+                let document = Html::parse_document(input);
+                instance_efficiency(document.select(&Selector::parse("table").unwrap()).next().unwrap())
+            };
+            let expected = case["expected"].as_array().unwrap();
+            assert_eq!(metrics.len(), expected.len(), "{}", case["source"]);
+            for (metric, expected) in metrics.iter().zip(expected) {
+                assert_eq!(metric.eff_stat, expected[0].as_str().unwrap(), "{}", case["source"]);
+                assert!((metric.eff_pct.unwrap() - expected[1].as_f64().unwrap() as f32).abs() < 0.001, "{}", case["source"]);
+            }
+        }
+    }
+
+    // Unavailable and invalid values must not turn into measurements of zero.
+    #[test]
+    fn instance_efficiency_missing_values() {
+        let metrics = instance_efficiency_txt(&[
+            "Instance Efficiency Indicators", "~~~~", "",
+            "Buffer Hit %: N/A Soft Parse %: -1.0",
+            "Latch Hit %: NaN Redo NoWait %: 0.00", "",
+            "Shared Pool Statistics", "Memory Usage %: 99.0",
+        ]);
+        assert_eq!(metrics.len(), 4);
+        assert_eq!(metrics.iter().map(|m| m.eff_pct).collect::<Vec<_>>(), vec![None, None, None, Some(0.0)]);
+        assert!(instance_efficiency_txt(&["No section here"]).is_empty());
+    }
+
+    #[test]
+    fn segment_html_preserves_scope_legacy_values_and_security_mask() {
+        use clap::Parser;
+        let args = Args::parse_from(["jas-min", "--security-level", "1"]);
+        let html = Html::parse_document(include_str!(
+            "../tests/fixtures/empty_calories/segment_scope.html"
+        ));
+        let selector = Selector::parse("table").unwrap();
+        let tables: Vec<_> = html.select(&selector).collect();
+        let scoped = segment_stats(tables[0], "Logical Reads", &args);
+        assert_eq!(scoped.len(), 1);
+        let s = &scoped[0];
+        assert_eq!(s.owner.as_deref(), Some("LAB"));
+        assert_eq!(s.pdb_name.as_deref(), Some("PDB_A"));
+        assert_eq!(s.con_id, Some(3));
+        assert_eq!(s.subobject_name.as_deref(), Some("P_01"));
+        assert_eq!(s.stat_vlalue, 12345.0);
+        let legacy = segment_stats(tables[1], "Logical Reads", &args);
+        assert_eq!(legacy[0].stat_vlalue, 9876.0);
+        assert_eq!(legacy[0].obj, 0);
+        let hidden = segment_stats(
+            tables[0],
+            "Logical Reads",
+            &Args::parse_from(["jas-min", "--security-level", "0"]),
+        );
+        assert_eq!(hidden[0].object_name, "#");
+        assert!(
+            hidden[0].owner.is_none()
+                && hidden[0].pdb_name.is_none()
+                && hidden[0].subobject_name.is_none()
+        );
+    }
+
+    #[test]
+    fn time_model_html_preserves_precision_and_skips_invalid_seconds() {
+        let html = Html::parse_document("<table><tr><td>DB time</td><td>13.32</td><td>100</td></tr><tr><td>DB CPU</td><td>0.00</td><td>0</td></tr><tr><td>invalid</td><td>N/A</td><td>0</td></tr><tr><td>negative</td><td>-1</td><td>0</td></tr><tr><td>nonfinite</td><td>NaN</td><td>0</td></tr></table>");
+        let selector = Selector::parse("table").unwrap();
+        let rows = time_model_stats(html.select(&selector).next().unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].time_s, 13.32);
+        assert_eq!(rows[1].time_s, 0.0);
+    }
 
     #[test]
     fn load_awrs_collection_json_clamps_negative_unsigned_collector_values() {
@@ -3660,5 +3855,7 @@ mod tests {
 
         assert_eq!(collection.awrs[0].library_cache[0].pin_requests, 0);
         assert_eq!(collection.awrs[0].instance_stats[0].total, 0);
+        assert!(collection.nmon.is_none());
+        assert!(serde_json::to_value(&collection).unwrap().get("nmon").is_none());
     }
 }
